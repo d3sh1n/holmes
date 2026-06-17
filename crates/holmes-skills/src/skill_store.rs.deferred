@@ -1,0 +1,209 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use tracing::{debug, warn};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMeta {
+    pub name: String,
+    pub description: String,
+    pub attack_types: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+pub struct SkillStore {
+    skills_dir: PathBuf,
+    index: Vec<SkillMeta>,
+}
+
+impl SkillStore {
+    pub fn load(skills_dir: &Path) -> Result<Self> {
+        let mut index = Vec::new();
+
+        if !skills_dir.exists() {
+            std::fs::create_dir_all(skills_dir)?;
+            return Ok(Self {
+                skills_dir: skills_dir.to_path_buf(),
+                index,
+            });
+        }
+
+        for entry in std::fs::read_dir(skills_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                let skill_md = path.join("SKILL.md");
+                if skill_md.exists() {
+                    match Self::parse_skill_meta(&skill_md) {
+                        Ok(meta) => {
+                            debug!(name = %meta.name, "loaded skill");
+                            index.push(meta);
+                        }
+                        Err(e) => {
+                            warn!(path = %skill_md.display(), error = %e, "failed to parse skill")
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            skills_dir: skills_dir.to_path_buf(),
+            index,
+        })
+    }
+
+    fn parse_skill_meta(path: &Path) -> Result<SkillMeta> {
+        let content = std::fs::read_to_string(path)?;
+        let yaml_start = content.find("---").context("no YAML frontmatter")?;
+        let yaml_end = content[yaml_start + 3..]
+            .find("---")
+            .context("no closing ---")?;
+        let yaml_str = &content[yaml_start + 3..yaml_start + 3 + yaml_end];
+        let meta: SkillMeta = serde_yaml::from_str(yaml_str)?;
+        Ok(meta)
+    }
+
+    pub fn list(&self, filter: Option<&str>) -> Vec<&SkillMeta> {
+        match filter {
+            Some(f) => {
+                let lower = f.to_lowercase();
+                self.index
+                    .iter()
+                    .filter(|s| {
+                        s.name.to_lowercase().contains(&lower)
+                            || s.attack_types
+                                .iter()
+                                .any(|t| t.to_lowercase().contains(&lower))
+                            || s.tags.iter().any(|t| t.to_lowercase().contains(&lower))
+                    })
+                    .collect()
+            }
+            None => self.index.iter().collect(),
+        }
+    }
+
+    pub fn view(&self, name: &str) -> Result<String> {
+        let skill_path = self.skills_dir.join(name).join("SKILL.md");
+        std::fs::read_to_string(&skill_path)
+            .with_context(|| format!("reading skill: {}", skill_path.display()))
+    }
+
+    pub fn view_reference(&self, name: &str, ref_path: &str) -> Result<String> {
+        let full_path = self.skills_dir.join(name).join(ref_path);
+        std::fs::read_to_string(&full_path)
+            .with_context(|| format!("reading skill reference: {}", full_path.display()))
+    }
+
+    pub fn tier1_summary(&self) -> String {
+        if self.index.is_empty() {
+            return "无可用技能".into();
+        }
+        self.index
+            .iter()
+            .map(|s| {
+                format!(
+                    "- {}: {} [{}]",
+                    s.name,
+                    s.description,
+                    s.attack_types.join(",")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn recommend(&self, attack_type: &str, tech_stack: &[String]) -> Vec<&SkillMeta> {
+        let mut scored: Vec<(&SkillMeta, u32)> = self
+            .index
+            .iter()
+            .map(|s| {
+                let mut score = 0u32;
+                if s.attack_types.iter().any(|t| t == attack_type) {
+                    score += 10;
+                }
+                for tech in tech_stack {
+                    if s.tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&tech.to_lowercase()))
+                    {
+                        score += 5;
+                    }
+                }
+                (s, score)
+            })
+            .filter(|(_, score)| *score > 0)
+            .collect();
+
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().take(3).map(|(s, _)| s).collect()
+    }
+
+    pub fn save_skill(&self, name: &str, content: &str) -> Result<()> {
+        let dir = self.skills_dir.join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), content)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn setup_test_skill(dir: &Path) {
+        let skill_dir = dir.join("sqli-bypass");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: sqli-bypass
+description: SQL injection WAF bypass techniques
+attack_types: [sqli]
+tags: [waf, bypass, mysql]
+---
+# SQL Injection WAF Bypass
+Content here...
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_and_list_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_skill(tmp.path());
+        let store = SkillStore::load(tmp.path()).unwrap();
+        assert_eq!(store.list(None).len(), 1);
+        assert_eq!(store.list(None)[0].name, "sqli-bypass");
+    }
+
+    #[test]
+    fn filter_by_attack_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_skill(tmp.path());
+        let store = SkillStore::load(tmp.path()).unwrap();
+        assert_eq!(store.list(Some("sqli")).len(), 1);
+        assert_eq!(store.list(Some("xss")).len(), 0);
+    }
+
+    #[test]
+    fn tier1_summary_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_skill(tmp.path());
+        let store = SkillStore::load(tmp.path()).unwrap();
+        let summary = store.tier1_summary();
+        assert!(summary.contains("sqli-bypass"));
+        assert!(summary.contains("SQL injection"));
+    }
+
+    #[test]
+    fn recommend_by_attack_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_skill(tmp.path());
+        let store = SkillStore::load(tmp.path()).unwrap();
+        let recs = store.recommend("sqli", &["mysql".into()]);
+        assert_eq!(recs.len(), 1);
+    }
+}

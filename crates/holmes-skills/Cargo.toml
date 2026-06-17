@@ -1,0 +1,13 @@
+[package]
+name = "holmes-skills"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+holmes-core = { path = "../holmes-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,107 @@
+use crate::skill_store::SkillStore;
+use anyhow::Result;
+use holmes_llm::client::LlmClient;
+use tracing::info;
+
+const EVOLVER_SYSTEM_PROMPT: &str = r#"你是一个渗透测试技能提取器。从攻击对话历史中提取可复用的攻击方法论。
+
+输出格式（YAML frontmatter + Markdown）：
+---
+name: <skill-name>
+description: <one-line description>
+attack_types: [<type1>, <type2>]
+tags: [<tag1>, <tag2>]
+---
+# <Skill Title>
+
+## 适用场景
+- <when to use>
+
+## 攻击步骤
+1. <step 1>
+2. <step 2>
+
+## 关键命令/Payload
+```
+<exact commands or payloads>
+```
+
+## 注意事项
+- <gotchas>
+
+规则：
+- 保留精确的命令和 payload
+- 包含绕过技巧（WAF、过滤器等）
+- 标注前置条件
+- 中文输出"#;
+
+pub struct SkillEvolver;
+
+impl SkillEvolver {
+    pub async fn evolve(
+        conversation_summary: &str,
+        attack_type: &str,
+        success: bool,
+        llm: &LlmClient,
+        skill_store: &SkillStore,
+    ) -> Result<Option<String>> {
+        if !success {
+            return Ok(None);
+        }
+
+        let user_msg =
+            format!("攻击类型: {attack_type}\n结果: 成功\n\n对话摘要:\n{conversation_summary}");
+
+        let response = llm
+            .chat_completion_oneshot(EVOLVER_SYSTEM_PROMPT, &user_msg, "skill_evolver")
+            .await?;
+
+        if let Some(content) = response.content {
+            if content.contains("---") && content.contains("name:") {
+                let name =
+                    Self::extract_name(&content).unwrap_or_else(|| format!("{attack_type}-auto"));
+                skill_store.save_skill(&name, &content)?;
+                info!(name = %name, "skill evolved and saved");
+                return Ok(Some(name));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn extract_name(content: &str) -> Option<String> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("name:") {
+                return Some(
+                    trimmed[5..]
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string(),
+                );
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_name_from_yaml() {
+        let content = "---\nname: sqli-union-bypass\ndescription: test\n---\n# Content";
+        assert_eq!(
+            SkillEvolver::extract_name(content),
+            Some("sqli-union-bypass".into())
+        );
+    }
+
+    #[test]
+    fn extract_name_quoted() {
+        let content = "---\nname: \"my-skill\"\n---";
+        assert_eq!(SkillEvolver::extract_name(content), Some("my-skill".into()));
+    }
+}

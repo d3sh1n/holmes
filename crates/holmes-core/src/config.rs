@@ -36,30 +36,59 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
-    pub api_base: String,
-    pub api_key_env: String,
+    /// Backend HTTP base URL.
+    #[serde(alias = "api_base")]
+    pub base_url: String,
+    /// Resolved API key (after env-var lookup).
+    #[serde(default)]
+    pub api_key: String,
+    /// Optional environment variable to read the key from at runtime.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     pub model: String,
-    pub format: ApiFormat,
+    /// API wire format (`openai` | `anthropic`).
+    #[serde(default, alias = "format")]
+    pub api_format: ApiFormat,
+    #[serde(default)]
     pub priority: u32,
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    #[serde(default = "default_rpm_limit")]
     pub rpm_limit: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_max_retries() -> u32 { 3 }
+fn default_rpm_limit() -> u32 { 60 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiFormat {
     Openai,
     Anthropic,
 }
 
+impl Default for ApiFormat {
+    fn default() -> Self { Self::Openai }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleConfig {
     pub attack_agent: String,
-    pub supervisor: Option<String>,
-    pub compressor: Option<String>,
-    pub skill_evolver: Option<String>,
-    pub goal_evaluator: Option<String>,
+    #[serde(default)]
+    pub supervisor: String,
+    #[serde(default)]
+    pub compressor: String,
+    #[serde(default)]
+    pub skill_evolver: String,
+    #[serde(default)]
+    pub goal_evaluator: String,
 }
+
+/// Alias for compatibility with apeiron-core call sites that imported `RoleAssignment`.
+pub type RoleAssignment = RoleConfig;
+
+/// Alias for compatibility with apeiron-core call sites that imported `Config`.
+pub type Config = HolmesConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressorConfig {
@@ -86,7 +115,12 @@ pub struct GuardConfig {
     pub skeptic_gate: bool,
     pub failure_tracker: bool,
     pub soft404: bool,
+    /// Window size for the repetition guard (number of recent calls to track).
+    #[serde(default = "default_repetition_window")]
+    pub repetition_window: usize,
 }
+
+fn default_repetition_window() -> usize { 10 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -131,13 +165,29 @@ pub enum McpTransport {
 pub struct BrowserConfig {
     pub enabled: bool,
     pub vision: bool,
-    pub content_limit: u32,
+    pub content_limit: usize,
     pub timeout: u32,
     pub headless: bool,
     pub proxy: Option<String>,
     pub ignore_https_errors: bool,
     pub mcp_command: String,
     pub mcp_args: Vec<String>,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vision: false,
+            content_limit: 5000,
+            timeout: 30,
+            headless: true,
+            proxy: None,
+            ignore_https_errors: true,
+            mcp_command: "node".into(),
+            mcp_args: vec!["browser-mcp/dist/index.js".into()],
+        }
+    }
 }
 
 impl Default for HolmesConfig {
@@ -157,10 +207,10 @@ impl Default for HolmesConfig {
                 providers: vec![],
                 roles: RoleConfig {
                     attack_agent: "default".into(),
-                    supervisor: None,
-                    compressor: None,
-                    skill_evolver: None,
-                    goal_evaluator: None,
+                    supervisor: String::new(),
+                    compressor: String::new(),
+                    skill_evolver: String::new(),
+                    goal_evaluator: String::new(),
                 },
             },
             compressor: CompressorConfig {
@@ -183,6 +233,7 @@ impl Default for HolmesConfig {
                 skeptic_gate: true,
                 failure_tracker: true,
                 soft404: true,
+                repetition_window: 10,
             },
             memory: MemoryConfig {
                 db_path: "data/memory.db".into(),

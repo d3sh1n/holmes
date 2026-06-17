@@ -1,0 +1,150 @@
+use anyhow::Result;
+use holmes_core::state::tool_truth::{AttackSurface, PortInfo};
+use holmes_core::{FunctionCall, ToolCall};
+use holmes_tools::registry::ToolRegistry;
+use regex::Regex;
+use tracing::{debug, info};
+
+pub struct AutoRecon {
+    timeout: u32,
+}
+
+impl AutoRecon {
+    pub fn new(timeout: u32) -> Self {
+        Self { timeout }
+    }
+
+    pub async fn run(
+        &self,
+        target_url: &str,
+        target_ip: &str,
+        tools: &ToolRegistry,
+    ) -> AttackSurface {
+        let mut surface = AttackSurface::default();
+
+        info!(target = %target_url, "starting auto recon");
+
+        if !Self::url_has_port(target_url) {
+            if let Ok(ports) = self.nmap_scan(target_ip, tools).await {
+                surface.ports = ports;
+            }
+        } else {
+            let port = Self::extract_port(target_url).unwrap_or(80);
+            surface.ports.push(PortInfo {
+                port,
+                service: "http".into(),
+                version: String::new(),
+            });
+        }
+
+        if let Ok(techs) = self.httpx_probe(target_url, tools).await {
+            surface.tech_stack = techs;
+        }
+
+        info!(
+            ports = surface.ports.len(),
+            techs = surface.tech_stack.len(),
+            "auto recon complete"
+        );
+        surface
+    }
+
+    async fn nmap_scan(&self, target_ip: &str, tools: &ToolRegistry) -> Result<Vec<PortInfo>> {
+        let call = ToolCall {
+            id: "recon-nmap".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "execute_command".into(),
+                arguments: serde_json::json!({
+                    "command": format!("nmap -sV -T4 --top-ports 100 {} 2>/dev/null", target_ip),
+                    "timeout": self.timeout
+                })
+                .to_string(),
+            },
+        };
+
+        let result = tools.execute(&call).await;
+        if result.is_error {
+            return Ok(Vec::new());
+        }
+
+        let port_re = Regex::new(r"(\d+)/(tcp|udp)\s+open\s+(\S+)(?:\s+(.+))?").unwrap();
+        let mut ports = Vec::new();
+        for cap in port_re.captures_iter(&result.text_content()) {
+            ports.push(PortInfo {
+                port: cap[1].parse().unwrap_or(0),
+                service: cap[3].to_string(),
+                version: cap
+                    .get(4)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(ports)
+    }
+
+    async fn httpx_probe(&self, target_url: &str, tools: &ToolRegistry) -> Result<Vec<String>> {
+        let call = ToolCall {
+            id: "recon-httpx".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "execute_command".into(),
+                arguments: serde_json::json!({
+                    "command": format!("echo '{}' | httpx -silent -tech-detect -status-code 2>/dev/null", target_url),
+                    "timeout": self.timeout
+                }).to_string(),
+            },
+        };
+
+        let result = tools.execute(&call).await;
+        if result.is_error {
+            return Ok(Vec::new());
+        }
+
+        let tech_re = Regex::new(r"\[([^\]]+)\]").unwrap();
+        let mut techs = Vec::new();
+        for cap in tech_re.captures_iter(&result.text_content()) {
+            for tech in cap[1].split(',') {
+                let t = tech.trim().to_string();
+                if !t.is_empty() && !techs.contains(&t) {
+                    techs.push(t);
+                }
+            }
+        }
+        Ok(techs)
+    }
+
+    fn url_has_port(url: &str) -> bool {
+        let without_scheme = url.split("://").nth(1).unwrap_or(url);
+        let host_part = without_scheme.split('/').next().unwrap_or("");
+        host_part.contains(':')
+    }
+
+    fn extract_port(url: &str) -> Option<u16> {
+        let without_scheme = url.split("://").nth(1).unwrap_or(url);
+        let host_part = without_scheme.split('/').next()?;
+        let port_str = host_part.split(':').nth(1)?;
+        port_str.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_has_port_detection() {
+        assert!(AutoRecon::url_has_port("http://10.0.0.1:8080/path"));
+        assert!(!AutoRecon::url_has_port("http://10.0.0.1/path"));
+        assert!(AutoRecon::url_has_port("https://target:443"));
+    }
+
+    #[test]
+    fn extract_port_from_url() {
+        assert_eq!(
+            AutoRecon::extract_port("http://10.0.0.1:8080/path"),
+            Some(8080)
+        );
+        assert_eq!(AutoRecon::extract_port("http://10.0.0.1/path"), None);
+    }
+}
