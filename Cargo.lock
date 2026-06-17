@@ -227,6 +227,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "holmes-engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "holmes-core",
+ "holmes-mind-palace",
+ "holmes-session",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "holmes-mind-palace"
 version = "0.1.0"
 dependencies = [
