@@ -127,21 +127,19 @@ impl SessionDB {
 
     pub async fn append_event(&self, session_id: &str, event: &Event) -> Result<u64, SessionError> {
         let event_type = event_type_str(event);
-        let event_json = serde_json::to_string(event)?;
         let content_text = event.content_text();
         let timestamp = chrono::Utc::now().to_rfc3339();
 
-        // Wrap event_data to include content_text for FTS5
-        let escaped = content_text
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
-        let event_data = if event_json.len() > 2 {
-            // event_json starts with '{' — splice content_text in front
-            format!(r#"{{"content_text":"{}",{}"#, escaped, &event_json[1..])
-        } else {
-            format!(r#"{{"content_text":"{}"}}"#, escaped)
-        };
+        // Wrap event_data to include content_text for FTS5 by injecting it into
+        // the serialized JSON object via serde_json::Value (safe and structured).
+        let mut v: serde_json::Value = serde_json::to_value(event)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "content_text".to_string(),
+                serde_json::Value::String(content_text),
+            );
+        }
+        let event_data = serde_json::to_string(&v)?;
 
         let session_id_owned = session_id.to_string();
         let event_type_owned = event_type.to_string();
@@ -208,9 +206,9 @@ impl SessionDB {
 
         let rows = stmt.query_map(params![session_id], |row| {
             let data: String = row.get(5)?;
-            // The event_data has content_text injected at the front. Strip it for deserialization.
-            let event: Event = strip_content_text_and_parse(&data)
-                .or_else(|_| serde_json::from_str(&data))
+            // event_data has a `content_text` field injected for FTS. Parse as
+            // Value, drop that field, then deserialize the remainder as Event.
+            let event: Event = parse_event_data(&data)
                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
                     5,
                     rusqlite::types::Type::Text,
@@ -222,14 +220,25 @@ impl SessionDB {
             let turn_index: Option<i64> = row.get(3)?;
             let timestamp_str: String = row.get(6)?;
 
+            let timestamp = match chrono::DateTime::parse_from_rfc3339(&timestamp_str) {
+                Ok(d) => d.with_timezone(&chrono::Utc),
+                Err(e) => {
+                    tracing::warn!(
+                        event_id = id,
+                        timestamp = %timestamp_str,
+                        error = %e,
+                        "failed to parse event timestamp; falling back to now()",
+                    );
+                    chrono::Utc::now()
+                }
+            };
+
             Ok(StoredEvent {
                 id: id as u64,
                 session_id: row.get(1)?,
                 event_index: event_index as u64,
                 turn_index: turn_index.map(|v| v as u64),
-                timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp_str)
-                    .map(|d| d.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                timestamp,
                 event,
             })
         })?;
@@ -417,25 +426,144 @@ impl SessionDB {
     pub async fn fork_session(&self, id: &str, fork_point: u64, new_title: &str) -> Result<Session, SessionError> {
         let parent = self.get_session(id).await?.ok_or(SessionError::NotFound(id.to_string()))?;
         let events = self.get_events(id).await?;
-        let forked_events: Vec<StoredEvent> = events.into_iter().filter(|e| e.event_index <= fork_point).collect();
+        let forked_events: Vec<StoredEvent> = events
+            .into_iter()
+            .filter(|e| e.event_index <= fork_point)
+            .collect();
 
-        let new_session = self.create_session(CreateSessionParams {
-            id: None,
-            title: Some(new_title.to_string()),
-            mode: Some(parent.mode),
-            model: parent.model,
-            system_prompt: parent.system_prompt,
-            parent_session_id: Some(id.to_string()),
+        // Pre-compute everything that doesn't need the DB lock so that the
+        // transaction below stays short.
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let now_str = now.to_rfc3339();
+        let new_mode = parent.mode.clone();
+        let new_model = parent.model.clone();
+        let new_system_prompt = parent.system_prompt.clone();
+        let new_tags = parent.tags.clone();
+        let parent_id = id.to_string();
+        let title = new_title.to_string();
+
+        // Serialize forked events up front so the transaction body is purely DB ops.
+        let prepared_events: Vec<(String, String, String)> = forked_events
+            .iter()
+            .map(|stored| {
+                let event_type = event_type_str(&stored.event).to_string();
+                let content_text = stored.event.content_text();
+                let mut v: serde_json::Value = serde_json::to_value(&stored.event)?;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "content_text".to_string(),
+                        serde_json::Value::String(content_text),
+                    );
+                }
+                let event_data = serde_json::to_string(&v)?;
+                Ok::<_, serde_json::Error>((event_type, event_data, now_str.clone()))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Run create + appends inside a single transaction with retry on
+        // contention. The closure returns the necessary state on success.
+        let new_id_for_retry = new_id.clone();
+        let title_for_retry = title.clone();
+        let mode_for_retry = new_mode.clone();
+        let model_for_retry = new_model.clone();
+        let prompt_for_retry = new_system_prompt.clone();
+        let tags_for_retry = new_tags.clone();
+        let parent_id_for_retry = parent_id.clone();
+        let now_str_for_retry = now_str.clone();
+        let prepared_for_retry = prepared_events.clone();
+
+        self.write_contention
+            .with_retry(|| {
+                let new_id = new_id_for_retry.clone();
+                let title = title_for_retry.clone();
+                let mode = mode_for_retry.clone();
+                let model = model_for_retry.clone();
+                let system_prompt = prompt_for_retry.clone();
+                let tags = tags_for_retry.clone();
+                let parent_id = parent_id_for_retry.clone();
+                let now_str = now_str_for_retry.clone();
+                let prepared = prepared_for_retry.clone();
+                async move {
+                    let mut conn = self.conn.lock().await;
+                    let tx = conn.transaction()?;
+
+                    tx.execute(
+                        "INSERT INTO sessions (id, title, mode, model, system_prompt, parent_session_id, fork_point, source, tags, started_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            new_id,
+                            title,
+                            mode_to_str(&mode),
+                            model,
+                            system_prompt,
+                            parent_id,
+                            fork_point as i64,
+                            "fork",
+                            serde_json::to_string(&tags).unwrap_or_default(),
+                            now_str,
+                        ],
+                    )?;
+
+                    let mut user_msg_count: i64 = 0;
+                    let mut tool_call_count: i64 = 0;
+                    for (idx, (event_type, event_data, ts)) in prepared.iter().enumerate() {
+                        tx.execute(
+                            "INSERT INTO events (session_id, event_index, event_type, event_data, timestamp)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![new_id, idx as i64, event_type, event_data, ts],
+                        )?;
+                        if event_type == "user_message" {
+                            user_msg_count += 1;
+                        }
+                        if event_type == "tool_call" {
+                            tool_call_count += 1;
+                        }
+                    }
+                    if user_msg_count > 0 || tool_call_count > 0 {
+                        tx.execute(
+                            "UPDATE sessions SET message_count = message_count + ?1,
+                                                  tool_call_count = tool_call_count + ?2
+                             WHERE id = ?3",
+                            params![user_msg_count, tool_call_count, new_id],
+                        )?;
+                    }
+
+                    tx.commit()?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+
+        Ok(Session {
+            id: new_id,
+            title: Some(title),
+            mode: new_mode,
+            model: new_model,
+            model_config: None,
+            system_prompt: new_system_prompt,
+            parent_session_id: Some(parent_id),
             fork_point: Some(fork_point),
-            source: Some("fork".into()),
-            tags: parent.tags,
-        }).await?;
-
-        for evt in forked_events {
-            self.append_event(&new_session.id, &evt.event).await?;
-        }
-
-        Ok(new_session)
+            source: "fork".into(),
+            tags: new_tags,
+            started_at: now,
+            ended_at: None,
+            end_reason: None,
+            message_count: prepared_events
+                .iter()
+                .filter(|(t, _, _)| t == "user_message")
+                .count() as u64,
+            tool_call_count: prepared_events
+                .iter()
+                .filter(|(t, _, _)| t == "tool_call")
+                .count() as u64,
+            subagent_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            goal_condition: None,
+            goal_achieved: false,
+        })
     }
 
     pub async fn update_token_counts(&self, id: &str, delta: &TokenDelta) -> Result<(), SessionError> {
@@ -562,11 +690,12 @@ pub enum SessionError {
 
 // === Helper functions ===
 
-/// Try to parse event_data that has a `content_text` field injected at the
-/// front by removing that field before deserializing back into Event.
-fn strip_content_text_and_parse(data: &str) -> Result<Event, serde_json::Error> {
-    // First try as-is (Event has #[serde(tag = "type")] and will ignore unknown fields by default? No, it won't)
-    // We deserialize via serde_json::Value, remove content_text, and re-serialize.
+/// Parse an event_data JSON blob back into an `Event`.
+///
+/// `append_event` injects a `content_text` field into the serialized event for
+/// FTS5 indexing; this helper strips that field before deserializing so the
+/// resulting JSON matches the `Event` schema exactly.
+fn parse_event_data(data: &str) -> Result<Event, serde_json::Error> {
     let mut value: serde_json::Value = serde_json::from_str(data)?;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("content_text");
@@ -663,4 +792,83 @@ fn parse_datetime(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a unique temp DB path. We avoid pulling in `tempfile` as a dep.
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "holmes-session-{}-{}-{}.sqlite",
+            label,
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+        ));
+        p
+    }
+
+    #[tokio::test]
+    async fn round_trip_session_and_events() {
+        let path = temp_db_path("roundtrip");
+        let db = SessionDB::open(&path).await.expect("open db");
+
+        let session = db
+            .create_session(CreateSessionParams {
+                id: None,
+                title: Some("test session".into()),
+                mode: Some(SessionMode::Pentest),
+                model: Some("claude-sonnet-4-5".into()),
+                system_prompt: Some("be helpful".into()),
+                parent_session_id: None,
+                fork_point: None,
+                source: Some("test".into()),
+                tags: vec!["unit".into(), "round-trip".into()],
+            })
+            .await
+            .expect("create session");
+
+        // Mix of events including content with characters that previously
+        // exercised the manual JSON splicing (quotes, backslashes, newlines,
+        // unicode).
+        let events = vec![
+            Event::UserMessage {
+                content: "hello \"world\"\n with \\ backslash and 中文".into(),
+                timestamp: chrono::Utc::now(),
+            },
+            Event::Thinking {
+                content: "let me think about this".into(),
+                reasoning_type: Some("plan".into()),
+            },
+            Event::UserMessage {
+                content: "second message".into(),
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        for e in &events {
+            db.append_event(&session.id, e).await.expect("append event");
+        }
+
+        let stored = db.get_events(&session.id).await.expect("get events");
+        assert_eq!(stored.len(), events.len(), "event count mismatch");
+
+        for (i, (got, want)) in stored.iter().zip(events.iter()).enumerate() {
+            assert_eq!(got.event_index, i as u64, "event_index ordering");
+            // Re-serialize both sides via Value to compare structurally
+            // (avoids field-order or float-formatting quirks).
+            let got_v = serde_json::to_value(&got.event).unwrap();
+            let want_v = serde_json::to_value(want).unwrap();
+            assert_eq!(got_v, want_v, "event {} did not round-trip", i);
+        }
+
+        // Cleanup. Best-effort — ignore errors on shared CI temp dirs.
+        let _ = std::fs::remove_file(&path);
+    }
 }
