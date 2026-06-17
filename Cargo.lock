@@ -242,6 +242,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "holmes-goal"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "holmes-core",
+ "holmes-session",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "holmes-mind-palace"
 version = "0.1.0"
 dependencies = [
@@ -265,6 +279,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "holmes-subagent"
+version = "0.1.0"
+dependencies = [
+ "holmes-core",
+ "holmes-session",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",

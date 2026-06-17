@@ -1,0 +1,13 @@
+[package]
+name = "holmes-subagent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+holmes-core = { path = "../holmes-core" }
+holmes-session = { path = "../holmes-session" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
