@@ -1,7 +1,6 @@
 use super::immutable::ImmutableFields;
 use super::tool_truth::{AttackSurface, Credential, EvidenceBundle};
 use super::validated::{AttackHypothesis, Finding};
-use crate::directive::{CandidateChain, Directive};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,8 +32,8 @@ impl std::fmt::Display for AttackPhase {
 ///
 /// Partition enforcement:
 /// - Immutable: `immutable` field, read-only getters
-/// - Tool truth: `attack_surface` / `evidence_bundle` / `weak_creds`, only PostGuards write
-/// - Validated: `findings` / `attack_hypotheses`, only SkepticGate writes
+/// - Tool truth: `attack_surface` / `evidence_bundle`, only PostGuards write
+/// - Validated: `findings`, only SkepticGate writes
 /// - Free: everything else, agent loop writes directly
 pub struct AttackState {
     // Immutable zone
@@ -43,11 +42,9 @@ pub struct AttackState {
     // Tool truth zone (pub(crate) — only PostGuards in this crate can write)
     pub(crate) attack_surface: AttackSurface,
     pub(crate) evidence_bundle: EvidenceBundle,
-    pub(crate) weak_creds: Vec<Credential>,
 
     // Validated zone (pub(crate) — only SkepticGate writes)
     pub(crate) findings: HashMap<String, Finding>,
-    pub(crate) attack_hypotheses: Vec<AttackHypothesis>,
 
     // Free zone (pub — agent loop writes directly)
     pub current_attack_type: String,
@@ -57,16 +54,10 @@ pub struct AttackState {
     pub is_finished: bool,
     pub is_authenticated: bool,
     pub flag: Option<String>,
-    pub flag_submitted: bool,
-    pub scored_flags: Vec<String>,
     pub action_history: Vec<String>,
-    pub supervisor_directive: String,
-    pub candidate_chains: Vec<CandidateChain>,
     pub phase: AttackPhase,
-    pub recon_iterations: u32,
     pub soft404_baseline: Option<(u16, usize)>,
     pub last_progress_at: u32,
-    pub progress_events: Vec<String>,
 }
 
 impl AttackState {
@@ -97,16 +88,10 @@ impl AttackState {
             is_finished: false,
             is_authenticated: false,
             flag: None,
-            flag_submitted: false,
-            scored_flags: Vec::new(),
             action_history: Vec::new(),
-            supervisor_directive: String::new(),
-            candidate_chains: Vec::new(),
             phase: AttackPhase::default(),
-            recon_iterations: 0,
             soft404_baseline: None,
             last_progress_at: 0,
-            progress_events: Vec::new(),
         }
     }
 
@@ -134,11 +119,6 @@ impl AttackState {
     pub fn evidence_bundle(&self) -> &EvidenceBundle {
         &self.evidence_bundle
     }
-    pub fn weak_creds(&self) -> &[Credential] {
-        &self.weak_creds
-    }
-
-    // Tool truth zone — mutable access for PostGuards
     pub fn attack_surface_mut(&mut self) -> &mut AttackSurface {
         &mut self.attack_surface
     }
@@ -146,56 +126,18 @@ impl AttackState {
         &mut self.evidence_bundle
     }
 
-    // Validated zone — mutable access for SkepticGate
     pub fn findings_mut(&mut self) -> &mut HashMap<String, Finding> {
         &mut self.findings
     }
-
-    // Validated zone — read-only public access
     pub fn findings(&self) -> &HashMap<String, Finding> {
         &self.findings
     }
-    pub fn attack_hypotheses(&self) -> &[AttackHypothesis] {
-        &self.attack_hypotheses
-    }
 
-    // Free zone helpers
     pub fn increment_no_tool_rounds(&mut self) {
         self.no_tool_rounds += 1;
     }
     pub fn reset_no_tool_rounds(&mut self) {
         self.no_tool_rounds = 0;
-    }
-
-    pub fn record_progress(&mut self, iteration: u32, event: &str) {
-        self.last_progress_at = iteration;
-        self.progress_events.push(event.to_string());
-        if self.progress_events.len() > 20 {
-            self.progress_events
-                .drain(..self.progress_events.len() - 20);
-        }
-    }
-
-    pub fn stale_iterations(&self, current: u32) -> u32 {
-        current.saturating_sub(self.last_progress_at)
-    }
-
-    pub fn set_directive(&mut self, directive: Directive) {
-        self.current_attack_type = directive.attack_type;
-        self.current_objective = directive.objective;
-        self.supervisor_directive = directive.reasoning;
-        self.consecutive_failures = 0;
-    }
-
-    pub fn has_unaddressed_attack_vectors(&self) -> bool {
-        !self.candidate_chains.is_empty() && self.candidate_chains.iter().any(|c| !c.attempted)
-    }
-
-    pub fn objective_completed(&self) -> bool {
-        self.findings.values().any(|f| {
-            f.confidence == super::validated::FindingConfidence::Confirmed
-                && f.attack_type == self.current_attack_type
-        })
     }
 }
 

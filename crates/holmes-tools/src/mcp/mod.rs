@@ -17,7 +17,6 @@ pub struct McpToolProvider {
 }
 
 struct McpServer {
-    name: String,
     transport: McpTransport,
     tools: Vec<ToolDefinition>,
 }
@@ -74,7 +73,6 @@ impl McpToolProvider {
         let tools = Self::parse_tools_list(list_resp.result)?;
 
         Ok(McpServer {
-            name: cfg.name.clone(),
             transport,
             tools,
         })

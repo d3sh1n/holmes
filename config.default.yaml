@@ -1,0 +1,97 @@
+# Holmes Agent Configuration
+# Edit this file to configure your LLM provider and other settings.
+
+agent:
+  max_iterations: 90
+  no_tool_threshold: 3
+  hypothesis_budget: 8
+  reflection_threshold: 5
+  reflection_cooldown: 3
+  stale_threshold: 8
+  force_pivot_threshold: 15
+  generate_reports: true
+
+llm:
+  providers:
+    # Configure at least one provider below.
+    # For Anthropic (Claude):
+    #   name: claude
+    #   base_url: "https://api.anthropic.com"
+    #   api_key: "sk-ant-..."
+    #   model: "claude-sonnet-4-6"
+    #   api_format: anthropic
+    #   priority: 0
+    #   max_retries: 3
+    #
+    # For OpenAI-compatible:
+    #   name: openai
+    #   base_url: "https://api.openai.com/v1"
+    #   api_key: "sk-..."
+    #   model: "gpt-4o"
+    #   api_format: openai
+    #   priority: 0
+    #   max_retries: 3
+    - name: default
+      base_url: "https://api.anthropic.com"
+      api_key: "YOUR_API_KEY_HERE"
+      model: "claude-sonnet-4-6"
+      api_format: anthropic
+      priority: 0
+      max_retries: 3
+      rpm_limit: 50
+
+  roles:
+    attack_agent: default
+    supervisor: default
+    compressor: default
+    skill_evolver: default
+    goal_evaluator: default
+
+compressor:
+  context_limit: 128000
+  threshold: 0.75
+  protected_head: 3
+  protected_tail_tokens: 4000
+
+advisor:
+  enabled: true
+  auto_apply_nudge: true
+  auto_apply_suggest: false
+
+guards:
+  immutable_field: true
+  dangerous_command: true
+  repetition: true
+  repetition_window: 10
+  attack_surface: true
+  evidence_extractor: true
+  skeptic_gate: true
+  failure_tracker: true
+  soft404: true
+
+memory:
+  db_path: data/memory.db
+  consolidation_threshold: 0.85
+
+skills:
+  dir: skills
+  auto_inject: true
+
+recon:
+  auto_run: false
+  nmap_top_ports: 100
+
+mcp:
+  servers: []
+
+browser:
+  enabled: false
+  vision: false
+  content_limit: 5000
+  timeout: 30
+  headless: true
+  ignore_https_errors: true
+  mcp_command: node
+  mcp_args: ["browser-mcp/dist/index.js"]
+
+output_dir: output

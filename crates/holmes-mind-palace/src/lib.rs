@@ -1,4 +1,3 @@
-pub mod consolidation;
 pub mod context_layer;
 pub mod context_stack;
 pub mod dashboard_layer;
@@ -7,7 +6,6 @@ pub mod retrieval;
 
 use holmes_core::event::Event;
 use holmes_core::types::*;
-use holmes_session::db::SessionDB;
 use holmes_session::memory_store::MemoryStore;
 use std::sync::Arc;
 
@@ -18,21 +16,19 @@ use memory_layer::MemoryLayer;
 pub struct MindPalace {
     pub memory: MemoryLayer,
     pub context: ContextLayer,
-    session_db: Arc<SessionDB>,
 }
 
 impl MindPalace {
-    pub fn new(session_db: Arc<SessionDB>, long_term: Arc<MemoryStore>) -> Self {
+    pub fn new(session_db: Arc<holmes_session::db::SessionDB>, long_term: Arc<MemoryStore>) -> Self {
         Self {
-            memory: MemoryLayer::new(session_db.clone(), long_term),
+            memory: MemoryLayer::new(session_db, long_term),
             context: ContextLayer::new(),
-            session_db,
         }
     }
 
     pub async fn from_events(
         session_id: &str,
-        session_db: Arc<SessionDB>,
+        session_db: Arc<holmes_session::db::SessionDB>,
         long_term: Arc<MemoryStore>,
     ) -> Result<Self, String> {
         let mut palace = Self::new(session_db, long_term);

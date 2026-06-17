@@ -1,5 +1,4 @@
 pub mod config;
-pub mod directive;
 pub mod error;
 pub mod event;
 pub mod state;
