@@ -1,0 +1,510 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::types::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    // === Session Lifecycle ===
+    SessionCreated {
+        id: String,
+        title: Option<String>,
+        mode: SessionMode,
+        model: Option<String>,
+        system_prompt: Option<String>,
+        parent_id: Option<String>,
+        fork_point: Option<u64>,
+        created_at: DateTime<Utc>,
+        tags: Vec<String>,
+    },
+    SessionEnded {
+        reason: EndReason,
+        summary: Option<String>,
+    },
+    SessionModeSet {
+        mode: SessionMode,
+    },
+
+    // === Turn Boundaries ===
+    UserMessage {
+        content: String,
+        timestamp: DateTime<Utc>,
+    },
+    TurnComplete {
+        event_range: (u64, u64),
+        tokens_used: TokenDelta,
+        sub_agents_spawned: Vec<String>,
+    },
+
+    // === Goal System ===
+    GoalSet {
+        condition: String,
+        plan: Option<String>,
+        subtasks: Vec<SubTask>,
+    },
+    GoalEvaluated {
+        satisfied: bool,
+        reason: String,
+        turn_count: u64,
+        tokens_spent: u64,
+    },
+    GoalCleared {
+        reason: String,
+    },
+    GoalProgress {
+        turns: u64,
+        tokens: u64,
+        summary: String,
+    },
+    SubtaskUpdate {
+        subtask_id: String,
+        status: SubTaskStatus,
+        note: Option<String>,
+    },
+
+    // === Agent Thought & Action ===
+    Thinking {
+        content: String,
+        reasoning_type: Option<String>,
+    },
+    ToolCall {
+        name: String,
+        arguments: serde_json::Value,
+        purpose: Option<String>,
+    },
+    ToolResult {
+        name: String,
+        success: bool,
+        content: String,
+        error: Option<String>,
+        artifacts: Vec<String>,
+    },
+    ToolBlocked {
+        tool_name: String,
+        guard_name: String,
+        reason: String,
+    },
+
+    // === Situational Awareness ===
+    TargetDiscovered {
+        kind: TargetKind,
+        details: serde_json::Value,
+        confidence: String,
+        source: String,
+    },
+    AttackSurfaceUpdate {
+        hosts: Vec<String>,
+        services: Vec<ServiceInfo>,
+        tech_stack: Vec<String>,
+        endpoints: Vec<String>,
+        credentials: Vec<CredentialRef>,
+        notes: Option<String>,
+    },
+    VulnerabilityFound {
+        title: String,
+        cwe: Option<String>,
+        cvss: Option<f64>,
+        severity: Severity,
+        location: String,
+        evidence: String,
+        poc: Option<String>,
+        status: FindingStatus,
+    },
+    CodePatternFound {
+        pattern_type: String,
+        file: String,
+        line_range: Option<(u32, u32)>,
+        snippet: String,
+        risk_assessment: String,
+        language: Option<String>,
+    },
+    ReverseInsight {
+        insight_type: ReverseInsightType,
+        description: String,
+        confidence: String,
+        addresses: Vec<String>,
+    },
+    CredentialFound {
+        username: String,
+        credential_type: CredentialType,
+        source_host: String,
+        context: String,
+        cracked: Option<bool>,
+    },
+    HostCompromised {
+        host: String,
+        access_level: AccessLevel,
+        method: String,
+        persistence: Option<String>,
+        session_id: Option<String>,
+    },
+    LateralMovement {
+        from_host: String,
+        to_host: String,
+        method: String,
+        credentials_used: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    NetworkTopologyUpdate {
+        subnets: Vec<String>,
+        hosts: Vec<HostInfo>,
+        relationships: Vec<HostRelationship>,
+        trust_paths: Vec<Vec<String>>,
+        domain_info: Option<DomainInfo>,
+    },
+
+    // === Strategy & Reflection ===
+    DirectiveSet {
+        attack_type: Option<String>,
+        objective: String,
+        approach: String,
+        entry_points: Vec<String>,
+        recommended_skills: Vec<String>,
+    },
+    ReflectionRecorded {
+        diagnosis: String,
+        failure_type: String,
+        lessons_learned: String,
+        suggestions: Vec<String>,
+        triggered_by: String,
+    },
+    HypothesisUpdate {
+        active: Option<String>,
+        pending_count: usize,
+        rejected: Vec<String>,
+        confirmed: Vec<String>,
+    },
+    AdvisorAction {
+        level: InterventionLevel,
+        advice: String,
+        reasoning: String,
+        auto_applied: bool,
+    },
+
+    // === Mind Palace Operations ===
+    MemoryStored {
+        category: MemoryCategory,
+        content: String,
+        tags: Vec<String>,
+        relevance_score: f64,
+        source_session_id: Option<String>,
+    },
+    MemoryRecalled {
+        memory_ids: Vec<String>,
+        trigger: RecallTrigger,
+        relevance: Vec<f64>,
+    },
+    MemoryConsolidated {
+        from_ids: Vec<String>,
+        into_id: String,
+        summary: String,
+    },
+    ContextSnapshotTaken {
+        summary: String,
+        preserved_keys: Vec<String>,
+        active_contexts: Vec<ContextTarget>,
+    },
+    ContextSwitched {
+        from_context: Option<ContextTarget>,
+        to_context: ContextTarget,
+        reason: String,
+    },
+    DashboardUpdated {
+        section: String,
+        content_summary: String,
+        timestamp: DateTime<Utc>,
+    },
+
+    // === Context Management ===
+    CompressionApplied {
+        before_count: usize,
+        after_count: usize,
+        summary: String,
+        preserved_keys: Vec<String>,
+        method: CompressionMethod,
+    },
+
+    // === Skill & Knowledge Injection ===
+    SkillInjected {
+        skill_name: String,
+        source: InjectionSource,
+        match_reason: Option<String>,
+    },
+    KnowledgeInjected {
+        source: KnowledgeSource,
+        content: String,
+        relevance_context: String,
+    },
+    HumanFeedback {
+        content: String,
+        target_event: Option<u64>,
+        timestamp: DateTime<Utc>,
+    },
+
+    // === Sub-Agent ===
+    SubAgentSpawned {
+        sub_session_id: String,
+        agent_type: AgentType,
+        task_description: String,
+        context_summary: serde_json::Value,
+        isolation: Option<String>,
+        model: String,
+        tools: Vec<String>,
+        max_turns: u32,
+    },
+    SubAgentCompleted {
+        sub_session_id: String,
+        result: SubAgentResult,
+        tokens_used: u64,
+        events_count: u64,
+        findings_count: usize,
+    },
+    SubAgentProgress {
+        sub_session_id: String,
+        status: SubAgentStatus,
+        current_turn: u32,
+        summary: Option<String>,
+    },
+
+    // === Report ===
+    ReportGenerated {
+        report_type: ReportType,
+        file_path: String,
+        sections: Vec<String>,
+        generated_by: ReportGenerator,
+    },
+}
+
+// === Supporting Types ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    Host,
+    Service,
+    Endpoint,
+    File,
+    Function,
+    Protocol,
+    Credential,
+    Vulnerability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceInfo {
+    pub host: String,
+    pub port: u16,
+    pub protocol: String,
+    pub service: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRef {
+    pub username: String,
+    pub credential_type: String,
+    pub host: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingStatus {
+    Confirmed,
+    Suspicious,
+    FalsePositive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReverseInsightType {
+    FunctionIdentified,
+    ProtocolReverse,
+    AlgorithmRecovery,
+    ObfuscationBypass,
+    StringDecode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialType {
+    Plaintext,
+    Hash,
+    Token,
+    KerberosTicket,
+    SshKey,
+    ApiKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLevel {
+    User,
+    Root,
+    System,
+    DomainAdmin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub host: String,
+    pub ip: Option<String>,
+    pub os: Option<String>,
+    pub access_level: Option<AccessLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostRelationship {
+    pub from: String,
+    pub to: String,
+    pub relationship_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainInfo {
+    pub domain_name: String,
+    pub domain_controllers: Vec<String>,
+    pub trusted_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionLevel {
+    Nudge,
+    Suggest,
+    ForcePivot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallTrigger {
+    Query,
+    Context,
+    Similarity,
+    SkillMatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionMethod {
+    LlmSummary,
+    StaticFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectionSource {
+    Initial,
+    Perception,
+    Reflection,
+    User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeSource {
+    Memory,
+    Skill,
+    User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportType {
+    Writeup,
+    VulnerabilityReport,
+    CodeAuditReport,
+    ReverseEngineeringReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportGenerator {
+    Agent,
+    SubAgent,
+    User,
+}
+
+// === StoredEvent ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEvent {
+    pub id: u64,
+    pub session_id: String,
+    pub event_index: u64,
+    pub turn_index: Option<u64>,
+    pub timestamp: DateTime<Utc>,
+    #[serde(flatten)]
+    pub event: Event,
+}
+
+impl Event {
+    pub fn content_text(&self) -> String {
+        match self {
+            Event::UserMessage { content, .. } => content.clone(),
+            Event::Thinking { content, .. } => content.clone(),
+            Event::ToolCall { name, arguments, purpose, .. } => {
+                format!("{} {:?} {}", name, arguments, purpose.as_deref().unwrap_or(""))
+            }
+            Event::ToolResult { name, content, .. } => {
+                format!("{} {}", name, content)
+            }
+            Event::VulnerabilityFound { title, evidence, .. } => {
+                format!("{} {}", title, evidence)
+            }
+            Event::ReflectionRecorded { diagnosis, .. } => diagnosis.clone(),
+            Event::MemoryStored { content, .. } => content.clone(),
+            Event::SubAgentSpawned { task_description, .. } => task_description.clone(),
+            Event::SubAgentCompleted { result, .. } => result.summary.clone(),
+            Event::ReportGenerated { file_path, sections, .. } => {
+                format!("{} {:?}", file_path, sections)
+            }
+            _ => String::new(),
+        }
+    }
+
+    pub fn is_turn_start(&self) -> bool {
+        matches!(self, Event::UserMessage { .. })
+    }
+
+    pub fn is_turn_end(&self) -> bool {
+        matches!(self, Event::TurnComplete { .. })
+    }
+
+    pub fn category(&self) -> &'static str {
+        match self {
+            Event::SessionCreated { .. } | Event::SessionEnded { .. } | Event::SessionModeSet { .. } => "session",
+            Event::UserMessage { .. } | Event::TurnComplete { .. } => "turn",
+            Event::GoalSet { .. } | Event::GoalEvaluated { .. } | Event::GoalCleared { .. }
+            | Event::GoalProgress { .. } | Event::SubtaskUpdate { .. } => "goal",
+            Event::Thinking { .. } | Event::ToolCall { .. } | Event::ToolResult { .. }
+            | Event::ToolBlocked { .. } => "action",
+            Event::TargetDiscovered { .. } | Event::AttackSurfaceUpdate { .. }
+            | Event::VulnerabilityFound { .. } | Event::CodePatternFound { .. }
+            | Event::ReverseInsight { .. } | Event::CredentialFound { .. }
+            | Event::HostCompromised { .. } | Event::LateralMovement { .. }
+            | Event::NetworkTopologyUpdate { .. } => "situational",
+            Event::DirectiveSet { .. } | Event::ReflectionRecorded { .. }
+            | Event::HypothesisUpdate { .. } | Event::AdvisorAction { .. } => "strategy",
+            Event::MemoryStored { .. } | Event::MemoryRecalled { .. }
+            | Event::MemoryConsolidated { .. } | Event::ContextSnapshotTaken { .. }
+            | Event::ContextSwitched { .. } | Event::DashboardUpdated { .. } => "mind_palace",
+            Event::CompressionApplied { .. } => "context",
+            Event::SkillInjected { .. } | Event::KnowledgeInjected { .. }
+            | Event::HumanFeedback { .. } => "injection",
+            Event::SubAgentSpawned { .. } | Event::SubAgentCompleted { .. }
+            | Event::SubAgentProgress { .. } => "subagent",
+            Event::ReportGenerated { .. } => "report",
+        }
+    }
+}
