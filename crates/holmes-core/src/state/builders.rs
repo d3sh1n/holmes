@@ -1,6 +1,6 @@
 use super::immutable::ImmutableFields;
-use super::tool_truth::{AttackSurface, Credential, EvidenceBundle};
-use super::validated::{AttackHypothesis, Finding};
+use super::tool_truth::{AttackSurface, EvidenceBundle};
+use super::validated::Finding;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,9 +78,7 @@ impl AttackState {
             ),
             attack_surface: AttackSurface::default(),
             evidence_bundle: EvidenceBundle::default(),
-            weak_creds: Vec::new(),
             findings: HashMap::new(),
-            attack_hypotheses: Vec::new(),
             current_attack_type: String::new(),
             current_objective: String::new(),
             consecutive_failures: 0,
@@ -183,18 +181,4 @@ mod tests {
         assert_eq!(state.no_tool_rounds, 0);
     }
 
-    #[test]
-    fn set_directive_resets_failures() {
-        let mut state = make_state();
-        state.consecutive_failures = 5;
-        state.set_directive(Directive {
-            attack_type: "idor".into(),
-            objective: "test".into(),
-            entry_points: vec![],
-            reasoning: "pivot".into(),
-            recommended_skills: vec![],
-        });
-        assert_eq!(state.current_attack_type, "idor");
-        assert_eq!(state.consecutive_failures, 0);
-    }
 }
