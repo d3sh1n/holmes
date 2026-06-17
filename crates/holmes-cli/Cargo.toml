@@ -1,0 +1,30 @@
+[package]
+name = "holmes-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "holmes"
+path = "src/main.rs"
+
+[dependencies]
+holmes-core = { path = "../holmes-core" }
+holmes-session = { path = "../holmes-session" }
+holmes-mind-palace = { path = "../holmes-mind-palace" }
+holmes-engine = { path = "../holmes-engine" }
+holmes-llm = { path = "../holmes-llm" }
+holmes-tools = { path = "../holmes-tools" }
+holmes-guards = { path = "../holmes-guards" }
+holmes-goal = { path = "../holmes-goal" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rustyline = "14"
+dirs = "5"
