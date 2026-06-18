@@ -37,10 +37,8 @@ const SYSTEM_PROMPT: &str = r#"你是 Holmes，一个渗透测试、安全研究
 - 工具被 Guard 阻断时，分析原因并调整策略
 "#;
 
-fn holmes_data_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("holmes")
+fn holmes_data_dir(profile: Option<&str>) -> PathBuf {
+    crate::profile::HolmesProfiles::new().resolve(profile)
 }
 
 fn load_config(path: &Path) -> anyhow::Result<Config> {
@@ -77,8 +75,9 @@ pub async fn run_chat(
     query: Option<String>,
     model: Option<String>,
     mode_str: String,
+    profile: Option<&str>,
 ) -> anyhow::Result<()> {
-    let data_dir = holmes_data_dir();
+    let data_dir = holmes_data_dir(profile);
     std::fs::create_dir_all(&data_dir)?;
 
     let config_path = data_dir.join("config.yaml");
@@ -319,8 +318,8 @@ async fn handle_slash_command(input: &str, session_id: &str, db: &SessionDB) -> 
     }
 }
 
-pub async fn list_sessions() -> anyhow::Result<()> {
-    let data_dir = holmes_data_dir();
+pub async fn list_sessions(profile: Option<&str>) -> anyhow::Result<()> {
+    let data_dir = holmes_data_dir(profile);
     let db_path = data_dir.join("holmes.db");
     let db = SessionDB::open(&db_path).await?;
     let sessions = db.list_sessions(&SessionFilter { limit: Some(20), ..Default::default() }).await?;
