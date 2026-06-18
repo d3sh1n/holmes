@@ -518,6 +518,7 @@ name = "holmes-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "dirs",
@@ -541,9 +542,11 @@ dependencies = [
 name = "holmes-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",
+ "thiserror",
  "uuid",
 ]
 
@@ -594,8 +597,10 @@ dependencies = [
 name = "holmes-session"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "holmes-core",
+ "holmes-llm",
  "rand",
  "rusqlite",
  "serde",

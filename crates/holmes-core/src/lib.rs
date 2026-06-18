@@ -5,6 +5,7 @@ pub mod session;
 pub mod state;
 pub mod tool_types;
 pub mod types;
+pub mod workflow;
 
 pub use config::*;
 pub use event::*;
