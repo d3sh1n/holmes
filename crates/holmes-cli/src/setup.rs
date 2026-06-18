@@ -1,4 +1,3 @@
-use anyhow::Context;
 use holmes_core::config::{ApiFormat, HolmesConfig, ProviderConfig};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -165,10 +164,10 @@ pub fn run_setup(data_dir: &PathBuf) -> anyhow::Result<()> {
             }],
             roles: holmes_core::config::RoleConfig {
                 attack_agent: provider.name.to_string(),
-                supervisor: Some(provider.name.to_string()),
-                compressor: Some(provider.name.to_string()),
-                skill_evolver: Some(provider.name.to_string()),
-                goal_evaluator: Some(provider.name.to_string()),
+                supervisor: provider.name.to_string(),
+                compressor: provider.name.to_string(),
+                skill_evolver: provider.name.to_string(),
+                goal_evaluator: provider.name.to_string(),
             },
         },
         ..HolmesConfig::default()

@@ -91,7 +91,7 @@ pub struct ChatContext {
     pub runtime_session: RuntimeSession,
     pub mind_palace: MindPalace,
     pub config: Config,
-    pub profile_dir: PathBuf,
+    pub data_dir: PathBuf,
     pub command_registry: CommandRegistry,
 }
 
@@ -223,7 +223,7 @@ pub async fn run_chat(
         runtime_session,
         mind_palace,
         config,
-        profile_dir: data_dir.clone(),
+        data_dir: data_dir.clone(),
         command_registry: CommandRegistry::default(),
     };
 
@@ -613,10 +613,10 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
             if args.starts_with("set ") {
                 println!(
                     "Config editing not yet supported in REPL. Edit {} directly.",
-                    ctx.profile_dir.join("config.yaml").display(),
+                    ctx.data_dir.join("config.yaml").display(),
                 );
             } else {
-                println!("Config: {}", ctx.profile_dir.join("config.yaml").display());
+                println!("Config: {}", ctx.data_dir.join("config.yaml").display());
                 println!("  Providers: {}", ctx.config.llm.providers.len());
                 println!("  Output dir: {}", ctx.config.output_dir);
                 println!(
