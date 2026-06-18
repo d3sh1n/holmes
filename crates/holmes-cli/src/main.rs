@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use holmes_cli::{chat, profile};
+use holmes_cli::{chat, setup};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "holmes", about = "Holmes — AI-powered security research agent")]
@@ -7,43 +8,43 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    /// Resume a previous session
     #[arg(short, long)]
     resume: Option<String>,
 
+    /// Continue the most recent session
     #[arg(short, long)]
     r#continue: bool,
 
+    /// One-shot query (non-interactive)
     #[arg(short, long)]
     query: Option<String>,
 
+    /// Model to use
     #[arg(short, long)]
     model: Option<String>,
 
+    /// Session mode
     #[arg(long, default_value = "pentest")]
     mode: String,
-
-    #[arg(short = 'p', long)]
-    profile: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start interactive chat (default)
     Chat,
+    /// List recent sessions
     Sessions,
+    /// Configure LLM provider (interactive wizard)
+    Setup,
+    /// Show version
     Version,
-    Profile {
-        #[command(subcommand)]
-        action: ProfileAction,
-    },
 }
 
-#[derive(Subcommand)]
-enum ProfileAction {
-    List,
-    Use { name: String },
-    Create { name: String, #[arg(long)] clone: Option<String> },
-    Delete { name: String },
-    Show { name: Option<String> },
+fn holmes_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("holmes")
 }
 
 #[tokio::main]
@@ -61,41 +62,17 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat => {
             chat::run_chat(
                 cli.resume, cli.r#continue, cli.query, cli.model, cli.mode,
-                cli.profile.as_deref(),
             ).await?;
         }
         Commands::Sessions => {
-            chat::list_sessions(cli.profile.as_deref()).await?;
+            chat::list_sessions().await?;
+        }
+        Commands::Setup => {
+            let data_dir = holmes_data_dir();
+            setup::run_setup(&data_dir)?;
         }
         Commands::Version => {
             println!("Holmes v{}", env!("CARGO_PKG_VERSION"));
-        }
-        Commands::Profile { action } => {
-            let profiles = profile::HolmesProfiles::new();
-            match action {
-                ProfileAction::List => {
-                    let list = profiles.list()?;
-                    let active = profiles.resolve(None);
-                    let active_name = active.file_name().unwrap().to_string_lossy();
-                    for name in &list {
-                        if name == active_name.as_ref() { println!("* {}", name); }
-                        else { println!("  {}", name); }
-                    }
-                }
-                ProfileAction::Use { name } => {
-                    profiles.set_active(&name)?;
-                    println!("Switched to profile '{}'", name);
-                }
-                ProfileAction::Create { name, clone } => {
-                    profiles.create(&name, clone.as_deref())?;
-                }
-                ProfileAction::Delete { name } => {
-                    profiles.delete(&name)?;
-                }
-                ProfileAction::Show { name } => {
-                    profiles.show(name.as_deref())?;
-                }
-            }
         }
     }
     Ok(())

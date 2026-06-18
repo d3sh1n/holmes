@@ -27,3 +27,4 @@ async-trait = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rustyline = "14"
 dirs = "5"
+rpassword = "7"
