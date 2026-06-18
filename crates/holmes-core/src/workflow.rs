@@ -37,7 +37,6 @@ pub enum WorkflowError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SessionMode;
 
     struct TestWorkflow {
         name: String,

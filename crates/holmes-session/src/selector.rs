@@ -143,7 +143,6 @@ impl Default for Selector {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use holmes_core::types::SessionMode;
 
     struct TestWf { name: String, desc: String }
     #[async_trait]
