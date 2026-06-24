@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HolmesConfig {
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub permissions: PermissionConfig,
     pub llm: LlmConfig,
     pub compressor: CompressorConfig,
+    #[serde(default)]
+    pub learning: LearningConfig,
     pub advisor: AdvisorConfig,
     pub guards: GuardConfig,
     pub memory: MemoryConfig,
@@ -25,6 +29,80 @@ pub struct AgentConfig {
     pub stale_threshold: u32,
     pub force_pivot_threshold: u32,
     pub generate_reports: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionConfig {
+    #[serde(default)]
+    pub mode: PermissionMode,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+    #[serde(default = "default_true")]
+    pub auto_approve_read_only: bool,
+}
+
+impl Default for PermissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: PermissionMode::Default,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            auto_approve_read_only: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Normal Holmes behavior: policy lists and guards decide.
+    Default,
+    /// Planning-only mode. Tools are blocked so Holmes must reason or ask.
+    Plan,
+    /// Read-only mode. Only tools marked read-only can run.
+    ReadOnly,
+    /// Accept edits mode. Holmes can perform file edits without explicit confirmation.
+    AcceptEdits,
+    /// Non-interactive mode. Policy lists still apply, but Holmes will not ask for approval.
+    DontAsk,
+    /// Maximum autonomy. Policy lists still apply; security guards remain active.
+    Bypass,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "default" => Ok(PermissionMode::Default),
+            "plan" => Ok(PermissionMode::Plan),
+            "read-only" | "readonly" => Ok(PermissionMode::ReadOnly),
+            "accept-edits" | "acceptedits" => Ok(PermissionMode::AcceptEdits),
+            "dont-ask" | "dontask" => Ok(PermissionMode::DontAsk),
+            "bypass" => Ok(PermissionMode::Bypass),
+            _ => Err("Invalid permission mode. Expected 'plan', 'default', 'read-only', 'accept-edits', 'dont-ask', or 'bypass'.".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PermissionMode::Default => write!(f, "default"),
+            PermissionMode::Plan => write!(f, "plan"),
+            PermissionMode::ReadOnly => write!(f, "read-only"),
+            PermissionMode::AcceptEdits => write!(f, "accept-edits"),
+            PermissionMode::DontAsk => write!(f, "dont-ask"),
+            PermissionMode::Bypass => write!(f, "bypass"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,8 +135,12 @@ pub struct ProviderConfig {
     pub rpm_limit: u32,
 }
 
-fn default_max_retries() -> u32 { 3 }
-fn default_rpm_limit() -> u32 { 60 }
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_rpm_limit() -> u32 {
+    60
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -68,7 +150,9 @@ pub enum ApiFormat {
 }
 
 impl Default for ApiFormat {
-    fn default() -> Self { Self::Openai }
+    fn default() -> Self {
+        Self::Anthropic
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,10 +176,36 @@ pub type Config = HolmesConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressorConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_protect_last_n")]
+    pub protect_last_n: usize,
+    #[serde(default = "default_target_ratio")]
+    pub target_ratio: f64,
+    #[serde(default = "default_max_summary_tokens")]
+    pub max_summary_tokens: u32,
+    #[serde(default = "default_true")]
+    pub preserve_tool_groups: bool,
     pub context_limit: u32,
     pub threshold: f64,
     pub protected_head: usize,
     pub protected_tail_tokens: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_protect_last_n() -> usize {
+    20
+}
+
+fn default_target_ratio() -> f64 {
+    0.25
+}
+
+fn default_max_summary_tokens() -> u32 {
+    12_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +213,46 @@ pub struct AdvisorConfig {
     pub enabled: bool,
     pub auto_apply_nudge: bool,
     pub auto_apply_suggest: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub background: bool,
+    #[serde(default = "default_review_interval_turns")]
+    pub review_interval_turns: u32,
+    #[serde(default = "default_max_learning_candidates")]
+    pub max_candidates_per_turn: usize,
+    #[serde(default)]
+    pub memory_write_approval: bool,
+    #[serde(default = "default_true")]
+    pub skill_write_approval: bool,
+    #[serde(default = "default_true")]
+    pub rule_write_approval: bool,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            background: default_true(),
+            review_interval_turns: default_review_interval_turns(),
+            max_candidates_per_turn: default_max_learning_candidates(),
+            memory_write_approval: false,
+            skill_write_approval: default_true(),
+            rule_write_approval: default_true(),
+        }
+    }
+}
+
+fn default_review_interval_turns() -> u32 {
+    1
+}
+
+fn default_max_learning_candidates() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,12 +265,16 @@ pub struct GuardConfig {
     pub skeptic_gate: bool,
     pub failure_tracker: bool,
     pub soft404: bool,
+    #[serde(default = "default_true")]
+    pub read_state_seeding: bool,
     /// Window size for the repetition guard (number of recent calls to track).
     #[serde(default = "default_repetition_window")]
     pub repetition_window: usize,
 }
 
-fn default_repetition_window() -> usize { 10 }
+fn default_repetition_window() -> usize {
+    10
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -203,6 +357,7 @@ impl Default for HolmesConfig {
                 force_pivot_threshold: 15,
                 generate_reports: true,
             },
+            permissions: PermissionConfig::default(),
             llm: LlmConfig {
                 providers: vec![],
                 roles: RoleConfig {
@@ -214,11 +369,17 @@ impl Default for HolmesConfig {
                 },
             },
             compressor: CompressorConfig {
+                enabled: default_true(),
+                protect_last_n: default_protect_last_n(),
+                target_ratio: default_target_ratio(),
+                max_summary_tokens: default_max_summary_tokens(),
+                preserve_tool_groups: default_true(),
                 context_limit: 128000,
                 threshold: 0.75,
                 protected_head: 3,
                 protected_tail_tokens: 4000,
             },
+            learning: LearningConfig::default(),
             advisor: AdvisorConfig {
                 enabled: true,
                 auto_apply_nudge: true,
@@ -233,6 +394,7 @@ impl Default for HolmesConfig {
                 skeptic_gate: true,
                 failure_tracker: true,
                 soft404: true,
+                read_state_seeding: true,
                 repetition_window: 10,
             },
             memory: MemoryConfig {
@@ -261,5 +423,44 @@ impl Default for HolmesConfig {
             },
             output_dir: "output".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compressor_defaults_enable_static_compaction() {
+        let compressor = HolmesConfig::default().compressor;
+
+        assert!(compressor.enabled);
+        assert_eq!(compressor.protect_last_n, 20);
+        assert_eq!(compressor.target_ratio, 0.25);
+        assert_eq!(compressor.max_summary_tokens, 12_000);
+        assert!(compressor.preserve_tool_groups);
+    }
+
+    #[test]
+    fn learning_defaults_enable_memory_review_with_approval_gates() {
+        let learning = HolmesConfig::default().learning;
+
+        assert!(learning.enabled);
+        assert!(learning.background);
+        assert_eq!(learning.review_interval_turns, 1);
+        assert_eq!(learning.max_candidates_per_turn, 5);
+        assert!(!learning.memory_write_approval);
+        assert!(learning.skill_write_approval);
+        assert!(learning.rule_write_approval);
+    }
+
+    #[test]
+    fn permission_defaults_match_interactive_agent_mode() {
+        let permissions = HolmesConfig::default().permissions;
+
+        assert_eq!(permissions.mode, PermissionMode::Default);
+        assert!(permissions.allowed_tools.is_empty());
+        assert!(permissions.disallowed_tools.is_empty());
+        assert!(permissions.auto_approve_read_only);
     }
 }

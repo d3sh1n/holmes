@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use holmes_cli::{chat, setup};
+use holmes_harness::{HarnessRunner, HarnessScenario};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -37,6 +38,8 @@ enum Commands {
     Sessions,
     /// Configure LLM provider (interactive wizard)
     Setup,
+    /// Run a deterministic Holmes harness scenario
+    Harness { scenario: PathBuf },
     /// Show version
     Version,
 }
@@ -60,9 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Commands::Chat) {
         Commands::Chat => {
-            chat::run_chat(
-                cli.resume, cli.r#continue, cli.query, cli.model, cli.mode,
-            ).await?;
+            chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
         }
         Commands::Sessions => {
             chat::list_sessions().await?;
@@ -70,6 +71,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup => {
             let data_dir = holmes_data_dir();
             setup::run_setup(&data_dir)?;
+        }
+        Commands::Harness { scenario } => {
+            let scenario = HarnessScenario::from_path(&scenario)?;
+            let report = HarnessRunner::new().run(scenario).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.success {
+                std::process::exit(1);
+            }
         }
         Commands::Version => {
             println!("Holmes v{}", env!("CARGO_PKG_VERSION"));

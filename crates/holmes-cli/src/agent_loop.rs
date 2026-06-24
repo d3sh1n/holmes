@@ -32,7 +32,7 @@ pub async fn run_agent_loop(
     let budget = IterationBudget::new(agent_config.max_iterations);
 
     // Inject situation summary as context.
-    let situation = mind_palace.situation_summary();
+    let situation = mind_palace.situation_summary(&holmes_core::types::SessionMode::Pentest);
     if !situation.is_empty() {
         messages.push(Message::user(format!("[当前态势]\n{}", situation)));
     }
@@ -152,7 +152,9 @@ async fn execute_sequential(
                 error: if result.is_error { Some(text) } else { None },
                 artifacts: vec![],
             };
-            let _ = session_db.append_event(session_id, &tool_result_event).await;
+            let _ = session_db
+                .append_event(session_id, &tool_result_event)
+                .await;
             mind_palace.ingest(tool_result_event);
 
             result

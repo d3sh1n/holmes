@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use holmes_core::config::{ApiFormat, Config, RoleAssignment};
+use holmes_core::config::{Config, RoleAssignment};
 use holmes_core::{LlmResponse, Message, ToolDefinition};
 use reqwest::Client as HttpClient;
 use std::time::Duration;
@@ -9,8 +9,6 @@ use crate::anthropic::{AnthropicRequest, AnthropicResponse};
 use crate::error_classifier::ClassifiedError;
 use crate::provider::{FailoverChain, ProviderState};
 use crate::rate_limiter::RateLimiter;
-use crate::request::ChatCompletionRequest;
-use crate::response::ChatCompletionResponse;
 
 fn safe_truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -21,6 +19,15 @@ fn safe_truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn anthropic_messages_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
 }
 
 pub struct LlmClient {
@@ -87,27 +94,11 @@ impl LlmClient {
     ) -> Result<LlmResponse> {
         let _permit = self.rate_limiter.acquire(&provider.config.name).await;
 
-        let is_anthropic = provider.config.api_format == ApiFormat::Anthropic;
+        let url = anthropic_messages_url(&provider.config.base_url);
+        let req = AnthropicRequest::from_messages(&provider.config.model, messages, tools);
+        let request_body = serde_json::to_value(&req).context("serializing Anthropic request")?;
 
-        let (url, request_body) = if is_anthropic {
-            let url = format!(
-                "{}/v1/messages",
-                provider.config.base_url.trim_end_matches('/')
-            );
-            let req = AnthropicRequest::from_messages(&provider.config.model, messages, tools);
-            let body = serde_json::to_value(&req).context("serializing Anthropic request")?;
-            (url, body)
-        } else {
-            let url = format!(
-                "{}/chat/completions",
-                provider.config.base_url.trim_end_matches('/')
-            );
-            let req = ChatCompletionRequest::new(&provider.config.model, messages, tools);
-            let body = serde_json::to_value(&req).context("serializing OpenAI request")?;
-            (url, body)
-        };
-
-        debug!(provider = %provider.config.name, model = %provider.config.model, format = ?provider.config.api_format, "LLM request");
+        debug!(provider = %provider.config.name, model = %provider.config.model, configured_format = ?provider.config.api_format, wire_protocol = "anthropic", "LLM request");
 
         let mut last_error = None;
         let max_retries = provider.config.max_retries;
@@ -124,16 +115,9 @@ impl LlmClient {
                 .post(&url)
                 .header("Content-Type", "application/json");
 
-            if is_anthropic {
-                req_builder = req_builder
-                    .header("x-api-key", &provider.config.api_key)
-                    .header("anthropic-version", "2023-06-01");
-            } else {
-                req_builder = req_builder.header(
-                    "Authorization",
-                    format!("Bearer {}", provider.config.api_key),
-                );
-            }
+            req_builder = req_builder
+                .header("x-api-key", &provider.config.api_key)
+                .header("anthropic-version", "2023-06-01");
 
             let result = req_builder.json(&request_body).send().await;
 
@@ -143,31 +127,15 @@ impl LlmClient {
                     if status == 200 {
                         let body = resp.text().await.context("reading response body")?;
 
-                        let parse_result = if is_anthropic {
-                            serde_json::from_str::<AnthropicResponse>(&body)
-                                .map(|parsed| parsed.into_llm_response())
-                                .map_err(|e| {
-                                    format!(
-                                        "parsing Anthropic response: {} — body: {}",
-                                        e,
-                                        safe_truncate(&body, 200)
-                                    )
-                                })
-                        } else {
-                            serde_json::from_str::<ChatCompletionResponse>(&body)
-                                .map_err(|e| {
-                                    format!(
-                                        "parsing LLM response: {} — body: {}",
-                                        e,
-                                        safe_truncate(&body, 200)
-                                    )
-                                })
-                                .and_then(|parsed| {
-                                    parsed
-                                        .into_llm_response()
-                                        .ok_or_else(|| "empty choices in LLM response".to_string())
-                                })
-                        };
+                        let parse_result = serde_json::from_str::<AnthropicResponse>(&body)
+                            .map(|parsed| parsed.into_llm_response())
+                            .map_err(|e| {
+                                format!(
+                                    "parsing Anthropic response: {} — body: {}",
+                                    e,
+                                    safe_truncate(&body, 200)
+                                )
+                            });
 
                         match parse_result {
                             Ok(llm_response) => {
@@ -281,5 +249,22 @@ impl LlmClient {
             "skill_evolver" => self.roles.skill_evolver.clone(),
             _ => self.roles.attack_agent.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::anthropic_messages_url;
+
+    #[test]
+    fn anthropic_url_does_not_duplicate_v1_segment() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://gateway.example.test/v1"),
+            "https://gateway.example.test/v1/messages"
+        );
     }
 }

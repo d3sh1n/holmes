@@ -24,31 +24,57 @@ impl GuardChain {
     pub fn from_config(config: &GuardConfig) -> Self {
         let mut chain = Self::new();
 
-        chain
-            .pre
-            .push(Box::new(pre::immutable_field::ImmutableFieldGuard));
-        chain
-            .pre
-            .push(Box::new(pre::dangerous_command::DangerousCommandGuard));
-        chain
-            .pre
-            .push(Box::new(pre::repetition::RepetitionGuard::new(
-                config.repetition_window,
-            )));
+        if config.immutable_field {
+            chain
+                .pre
+                .push(Box::new(pre::immutable_field::ImmutableFieldGuard));
+        }
+        if config.dangerous_command {
+            chain
+                .pre
+                .push(Box::new(pre::dangerous_command::DangerousCommandGuard));
+        }
+        if config.repetition {
+            chain
+                .pre
+                .push(Box::new(pre::repetition::RepetitionGuard::new(
+                    config.repetition_window,
+                )));
+        }
+        if config.read_state_seeding {
+            chain
+                .pre
+                .push(Box::new(pre::file_tracker::FileTrackerPreGuard));
+        }
 
-        chain
-            .post
-            .push(Box::new(post::attack_surface::AttackSurfaceUpdater::new()));
-        chain
-            .post
-            .push(Box::new(post::evidence_extractor::EvidenceExtractor::new()));
-        chain.post.push(Box::new(post::skeptic_gate::SkepticGate));
-        chain
-            .post
-            .push(Box::new(post::failure_tracker::FailureTracker));
-        chain
-            .post
-            .push(Box::new(post::soft404::Soft404Detector::new()));
+        if config.attack_surface {
+            chain
+                .post
+                .push(Box::new(post::attack_surface::AttackSurfaceUpdater::new()));
+        }
+        if config.evidence_extractor {
+            chain
+                .post
+                .push(Box::new(post::evidence_extractor::EvidenceExtractor::new()));
+        }
+        if config.skeptic_gate {
+            chain.post.push(Box::new(post::skeptic_gate::SkepticGate));
+        }
+        if config.failure_tracker {
+            chain
+                .post
+                .push(Box::new(post::failure_tracker::FailureTracker));
+        }
+        if config.soft404 {
+            chain
+                .post
+                .push(Box::new(post::soft404::Soft404Detector::new()));
+        }
+        if config.read_state_seeding {
+            chain
+                .post
+                .push(Box::new(post::file_tracker::FileTrackerPostGuard));
+        }
 
         chain
     }
@@ -73,5 +99,44 @@ impl GuardChain {
         for guard in &mut self.post {
             guard.process(call, result, state).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use holmes_core::config::{GuardConfig, HolmesConfig};
+
+    use super::*;
+
+    #[test]
+    fn guard_chain_respects_disabled_config_flags() {
+        let mut config = HolmesConfig::default().guards;
+        config.immutable_field = false;
+        config.dangerous_command = false;
+        config.repetition = false;
+        config.attack_surface = false;
+        config.evidence_extractor = false;
+        config.skeptic_gate = false;
+        config.failure_tracker = false;
+        config.soft404 = false;
+        config.read_state_seeding = false;
+
+        let chain = GuardChain::from_config(&config);
+
+        assert!(chain.pre.is_empty());
+        assert!(chain.post.is_empty());
+    }
+
+    #[test]
+    fn guard_chain_loads_enabled_defaults() {
+        let config = GuardConfig {
+            repetition_window: 10,
+            ..HolmesConfig::default().guards
+        };
+
+        let chain = GuardChain::from_config(&config);
+
+        assert_eq!(chain.pre.len(), 4);
+        assert_eq!(chain.post.len(), 6);
     }
 }

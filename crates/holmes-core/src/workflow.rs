@@ -45,8 +45,12 @@ mod tests {
 
     #[async_trait]
     impl Workflow for TestWorkflow {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { &self.desc }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            &self.desc
+        }
         async fn forward(&self, _session: &mut RuntimeSession) -> Result<(), WorkflowError> {
             Ok(())
         }

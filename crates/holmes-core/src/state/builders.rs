@@ -58,6 +58,7 @@ pub struct AttackState {
     pub phase: AttackPhase,
     pub soft404_baseline: Option<(u16, usize)>,
     pub last_progress_at: u32,
+    pub file_access_tracker: HashMap<String, u64>,
 }
 
 impl AttackState {
@@ -90,6 +91,7 @@ impl AttackState {
             phase: AttackPhase::default(),
             soft404_baseline: None,
             last_progress_at: 0,
+            file_access_tracker: HashMap::new(),
         }
     }
 
@@ -180,5 +182,4 @@ mod tests {
         state.reset_no_tool_rounds();
         assert_eq!(state.no_tool_rounds, 0);
     }
-
 }

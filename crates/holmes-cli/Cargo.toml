@@ -14,6 +14,8 @@ holmes-mind-palace = { path = "../holmes-mind-palace" }
 holmes-llm = { path = "../holmes-llm" }
 holmes-tools = { path = "../holmes-tools" }
 holmes-guards = { path = "../holmes-guards" }
+holmes-runtime = { path = "../holmes-runtime" }
+holmes-harness = { path = "../holmes-harness" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,7 +27,8 @@ uuid = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-rustyline = "14"
 dirs = "5"
 rpassword = "7"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
+reedline = "0.48.0"
+crossterm = "0.29.0"

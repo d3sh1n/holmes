@@ -1,7 +1,9 @@
-use holmes_core::event::Event;
-use holmes_core::event::{AccessLevel, CredentialType, FindingStatus, HostInfo, ReverseInsightType, Severity};
-use holmes_core::types::*;
 use crate::context_stack::ContextStack;
+use holmes_core::event::Event;
+use holmes_core::event::{
+    AccessLevel, CredentialType, FindingStatus, HostInfo, ReverseInsightType, Severity,
+};
+use holmes_core::types::*;
 
 #[derive(Debug, Clone)]
 pub struct ContextLayer {
@@ -120,7 +122,14 @@ impl ContextLayer {
     pub fn ingest(&mut self, event: &Event) {
         self.events_processed += 1;
         match event {
-            Event::AttackSurfaceUpdate { hosts, services, tech_stack, endpoints, credentials, .. } => {
+            Event::AttackSurfaceUpdate {
+                hosts,
+                services,
+                tech_stack,
+                endpoints,
+                credentials,
+                ..
+            } => {
                 for h in hosts {
                     if !self.attack_surface.hosts.contains(h) {
                         self.attack_surface.hosts.push(h.clone());
@@ -144,60 +153,133 @@ impl ContextLayer {
                 }
                 self.attack_surface.credentials_count += credentials.len();
             }
-            Event::VulnerabilityFound { title, cwe, cvss, severity, location, status, .. } => {
+            Event::VulnerabilityFound {
+                title,
+                cwe,
+                cvss,
+                severity,
+                location,
+                status,
+                ..
+            } => {
                 self.vulnerabilities.push(VulnerabilitySummary {
-                    title: title.clone(), cwe: cwe.clone(), cvss: *cvss,
-                    severity: severity.clone(), location: location.clone(), status: status.clone(),
+                    title: title.clone(),
+                    cwe: cwe.clone(),
+                    cvss: *cvss,
+                    severity: severity.clone(),
+                    location: location.clone(),
+                    status: status.clone(),
                 });
             }
-            Event::CodePatternFound { pattern_type, file, line_range, risk_assessment, .. } => {
+            Event::CodePatternFound {
+                pattern_type,
+                file,
+                line_range,
+                risk_assessment,
+                ..
+            } => {
                 self.code_patterns.push(CodePatternSummary {
-                    pattern_type: pattern_type.clone(), file: file.clone(),
-                    line_range: *line_range, risk: risk_assessment.clone(),
+                    pattern_type: pattern_type.clone(),
+                    file: file.clone(),
+                    line_range: *line_range,
+                    risk: risk_assessment.clone(),
                 });
             }
-            Event::ReverseInsight { insight_type, description, confidence, .. } => {
+            Event::ReverseInsight {
+                insight_type,
+                description,
+                confidence,
+                ..
+            } => {
                 self.reverse_insights.push(ReverseInsightSummary {
-                    insight_type: insight_type.clone(), description: description.clone(),
+                    insight_type: insight_type.clone(),
+                    description: description.clone(),
                     confidence: confidence.clone(),
                 });
             }
-            Event::CredentialFound { username, credential_type, source_host, cracked, .. } => {
+            Event::CredentialFound {
+                username,
+                credential_type,
+                source_host,
+                cracked,
+                ..
+            } => {
                 self.credentials.push(CredentialSummary {
-                    username: username.clone(), credential_type: credential_type.clone(),
-                    host: source_host.clone(), cracked: cracked.unwrap_or(false),
+                    username: username.clone(),
+                    credential_type: credential_type.clone(),
+                    host: source_host.clone(),
+                    cracked: cracked.unwrap_or(false),
                 });
             }
-            Event::HostCompromised { host, access_level, method, .. } => {
+            Event::HostCompromised {
+                host,
+                access_level,
+                method,
+                ..
+            } => {
                 self.compromised_hosts.push(CompromisedHostSummary {
-                    host: host.clone(), access_level: access_level.clone(), method: method.clone(),
+                    host: host.clone(),
+                    access_level: access_level.clone(),
+                    method: method.clone(),
                 });
             }
-            Event::LateralMovement { from_host, to_host, method, .. } => {
+            Event::LateralMovement {
+                from_host,
+                to_host,
+                method,
+                ..
+            } => {
                 self.lateral_movements.push(LateralMovementSummary {
-                    from: from_host.clone(), to: to_host.clone(), method: method.clone(),
+                    from: from_host.clone(),
+                    to: to_host.clone(),
+                    method: method.clone(),
                 });
             }
-            Event::NetworkTopologyUpdate { subnets, hosts, trust_paths, .. } => {
+            Event::NetworkTopologyUpdate {
+                subnets,
+                hosts,
+                trust_paths,
+                ..
+            } => {
                 self.network_topology = Some(NetworkTopologySummary {
-                    subnets: subnets.clone(), hosts: hosts.clone(), trust_paths: trust_paths.clone(),
+                    subnets: subnets.clone(),
+                    hosts: hosts.clone(),
+                    trust_paths: trust_paths.clone(),
                 });
             }
-            Event::DirectiveSet { attack_type, objective, approach, .. } => {
+            Event::DirectiveSet {
+                attack_type,
+                objective,
+                approach,
+                ..
+            } => {
                 self.directive = Some(DirectiveSummary {
-                    attack_type: attack_type.clone(), objective: objective.clone(),
+                    attack_type: attack_type.clone(),
+                    objective: objective.clone(),
                     approach: approach.clone(),
                 });
             }
-            Event::HypothesisUpdate { active, pending_count, rejected, confirmed } => {
+            Event::HypothesisUpdate {
+                active,
+                pending_count,
+                rejected,
+                confirmed,
+            } => {
                 self.hypothesis = Some(HypothesisState {
-                    active: active.clone(), pending_count: *pending_count,
-                    rejected: rejected.clone(), confirmed: confirmed.clone(),
+                    active: active.clone(),
+                    pending_count: *pending_count,
+                    rejected: rejected.clone(),
+                    confirmed: confirmed.clone(),
                 });
             }
-            Event::ReflectionRecorded { diagnosis, failure_type, .. } => {
+            Event::ReflectionRecorded {
+                diagnosis,
+                failure_type,
+                ..
+            } => {
                 self.reflections.push(ReflectionSummary {
-                    diagnosis: diagnosis.clone(), failure_type: failure_type.clone(),
+                    diagnosis: diagnosis.clone(),
+                    failure_type: failure_type.clone(),
                     timestamp: chrono::Utc::now(),
                 });
             }
@@ -222,16 +304,25 @@ impl ContextLayer {
             ));
         }
         if !self.attack_surface.tech_stack.is_empty() {
-            parts.push(format!("[技术栈] {}", self.attack_surface.tech_stack.join(", ")));
+            parts.push(format!(
+                "[技术栈] {}",
+                self.attack_surface.tech_stack.join(", ")
+            ));
         }
         if !self.vulnerabilities.is_empty() {
-            let confirmed: Vec<_> = self.vulnerabilities.iter()
-                .filter(|v| v.status == FindingStatus::Confirmed).collect();
+            let confirmed: Vec<_> = self
+                .vulnerabilities
+                .iter()
+                .filter(|v| v.status == FindingStatus::Confirmed)
+                .collect();
             if !confirmed.is_empty() {
                 parts.push(format!(
                     "[已确认漏洞] {}",
-                    confirmed.iter().map(|v| format!("{} ({})", v.title, v.severity_str()))
-                        .collect::<Vec<_>>().join(", ")
+                    confirmed
+                        .iter()
+                        .map(|v| format!("{} ({})", v.title, v.severity_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         }
@@ -239,13 +330,22 @@ impl ContextLayer {
             parts.push(format!("[凭据] 发现 {} 组", self.credentials.len()));
         }
         if let Some(ref d) = self.directive {
-            parts.push(format!("[当前策略] {} — {}", d.attack_type.as_deref().unwrap_or("unknown"), d.objective));
+            parts.push(format!(
+                "[当前策略] {} — {}",
+                d.attack_type.as_deref().unwrap_or("unknown"),
+                d.objective
+            ));
         }
         if let Some(ref h) = self.hypothesis {
             if let Some(ref active) = h.active {
                 parts.push(format!("[活跃假设] {}", active));
             }
-            parts.push(format!("[假设状态] 待验证: {}, 已否定: {}, 已确认: {}", h.pending_count, h.rejected.len(), h.confirmed.len()));
+            parts.push(format!(
+                "[假设状态] 待验证: {}, 已否定: {}, 已确认: {}",
+                h.pending_count,
+                h.rejected.len(),
+                h.confirmed.len()
+            ));
         }
         parts.join("\n")
     }
@@ -266,12 +366,15 @@ impl ContextLayer {
         if self.reflections.len() > 5 {
             self.reflections = self.reflections.split_off(self.reflections.len() - 5);
         }
-        self.vulnerabilities.retain(|v| v.status != FindingStatus::FalsePositive);
+        self.vulnerabilities
+            .retain(|v| v.status != FindingStatus::FalsePositive);
     }
 }
 
 impl Default for ContextLayer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VulnerabilitySummary {

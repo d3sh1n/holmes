@@ -1,0 +1,19 @@
+[package]
+name = "holmes-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+holmes-core = { path = "../holmes-core" }
+holmes-guards = { path = "../holmes-guards" }
+holmes-llm = { path = "../holmes-llm" }
+holmes-mind-palace = { path = "../holmes-mind-palace" }
+holmes-session = { path = "../holmes-session" }
+holmes-tools = { path = "../holmes-tools" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

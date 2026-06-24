@@ -6,10 +6,14 @@ use holmes_core::config::McpServerConfig;
 use holmes_core::{FunctionDefinition, ToolDefinition};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use protocol::JsonRpcRequest;
 use transport::{HttpTransport, McpTransport, StdioTransport};
+
+use crate::registry::{Tool, ToolRegistry};
 
 pub struct McpToolProvider {
     servers: Vec<McpServer>,
@@ -26,11 +30,12 @@ impl McpToolProvider {
         let mut servers = Vec::new();
         let mut tool_to_server = HashMap::new();
 
-        for (idx, cfg) in configs.iter().enumerate() {
+        for cfg in configs {
             match Self::connect_server(cfg).await {
                 Ok(server) => {
+                    let server_idx = servers.len();
                     for tool in &server.tools {
-                        tool_to_server.insert(tool.function.name.clone(), idx);
+                        tool_to_server.insert(tool.function.name.clone(), server_idx);
                     }
                     info!(server = %cfg.name, tools = server.tools.len(), "MCP server connected");
                     servers.push(server);
@@ -72,10 +77,7 @@ impl McpToolProvider {
 
         let tools = Self::parse_tools_list(list_resp.result)?;
 
-        Ok(McpServer {
-            transport,
-            tools,
-        })
+        Ok(McpServer { transport, tools })
     }
 
     fn parse_tools_list(result: Option<Value>) -> Result<Vec<ToolDefinition>> {
@@ -139,5 +141,57 @@ impl McpToolProvider {
             .result
             .map(|v| v.to_string())
             .unwrap_or_else(|| "null".into()))
+    }
+}
+
+pub async fn register_mcp_tools(registry: &mut ToolRegistry, configs: &[McpServerConfig]) -> usize {
+    if configs.is_empty() {
+        return 0;
+    }
+
+    let provider = McpToolProvider::from_config(configs).await;
+    let definitions = provider.definitions();
+    let provider = Arc::new(Mutex::new(provider));
+    let count = definitions.len();
+
+    for definition in definitions {
+        registry.register(Box::new(McpTool {
+            name: definition.function.name.clone(),
+            definition,
+            provider: provider.clone(),
+        }));
+    }
+
+    count
+}
+
+struct McpTool {
+    name: String,
+    definition: ToolDefinition,
+    provider: Arc<Mutex<McpToolProvider>>,
+}
+
+#[async_trait::async_trait]
+impl Tool for McpTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    async fn execute(&self, args: &str) -> Result<String> {
+        let arguments =
+            serde_json::from_str::<Value>(args).unwrap_or_else(|_| Value::String(args.into()));
+        self.provider
+            .lock()
+            .await
+            .execute(&self.name, arguments)
+            .await
     }
 }

@@ -29,6 +29,14 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.definition()).collect()
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
+    pub fn is_read_only(&self, name: &str) -> Option<bool> {
+        self.tools.get(name).map(|tool| tool.is_read_only())
+    }
+
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
         match self.tools.get(&call.function.name) {
             Some(tool) => match tool.execute(&call.function.arguments).await {

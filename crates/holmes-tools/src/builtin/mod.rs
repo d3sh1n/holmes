@@ -6,11 +6,18 @@ pub mod hypothesis;
 pub mod report_finding;
 pub mod report_progress;
 pub mod report_recon;
+pub mod subagent;
 
 use crate::registry::ToolRegistry;
 use holmes_core::config::HolmesConfig;
+use holmes_core::subagent::SubagentRunner;
+use std::sync::Arc;
 
-pub fn register_all(registry: &mut ToolRegistry, _config: &HolmesConfig) {
+pub fn register_all(
+    registry: &mut ToolRegistry, 
+    _config: &HolmesConfig,
+    runner: Option<Arc<dyn SubagentRunner>>,
+) {
     registry.register(Box::new(execute_command::ExecuteCommandTool));
     registry.register(Box::new(execute_python::ExecutePythonTool));
     registry.register(Box::new(http_request::HttpRequestTool::new()));
@@ -20,4 +27,8 @@ pub fn register_all(registry: &mut ToolRegistry, _config: &HolmesConfig) {
     registry.register(Box::new(hypothesis::AddHypothesisTool));
     registry.register(Box::new(hypothesis::RejectHypothesisTool));
     registry.register(Box::new(hypothesis::ConfirmHypothesisTool));
+
+    if let Some(r) = runner {
+        registry.register(Box::new(subagent::SpawnSubagentTool::new(r)));
+    }
 }

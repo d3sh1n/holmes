@@ -1,6 +1,6 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::types::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -18,7 +18,7 @@ impl SessionDB {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON;"
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON;",
         )?;
 
         // Run migrations
@@ -51,8 +51,14 @@ impl SessionDB {
         })
     }
 
-    pub async fn create_session(&self, params: CreateSessionParams) -> Result<Session, SessionError> {
-        let id = params.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    pub async fn create_session(
+        &self,
+        params: CreateSessionParams,
+    ) -> Result<Session, SessionError> {
+        let id = params
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = chrono::Utc::now().to_rfc3339();
         let started_at = chrono::Utc::now();
 
@@ -201,19 +207,20 @@ impl SessionDB {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, event_index, turn_index, event_type, event_data, timestamp
-             FROM events WHERE session_id = ?1 ORDER BY event_index"
+             FROM events WHERE session_id = ?1 ORDER BY event_index",
         )?;
 
         let rows = stmt.query_map(params![session_id], |row| {
             let data: String = row.get(5)?;
             // event_data has a `content_text` field injected for FTS. Parse as
             // Value, drop that field, then deserialize the remainder as Event.
-            let event: Event = parse_event_data(&data)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+            let event: Event = parse_event_data(&data).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
                     5,
                     rusqlite::types::Type::Text,
                     Box::new(e),
-                ))?;
+                )
+            })?;
 
             let id: i64 = row.get(0)?;
             let event_index: i64 = row.get(2)?;
@@ -250,7 +257,10 @@ impl SessionDB {
         Ok(events)
     }
 
-    pub async fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<SessionSummary>, SessionError> {
+    pub async fn list_sessions(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
         let conn = self.conn.lock().await;
         let mut sql = String::from(
             "SELECT s.id, s.title, s.mode, s.source, s.started_at, s.ended_at,
@@ -261,7 +271,7 @@ impl SessionDB {
                     (SELECT e.timestamp FROM events e
                      WHERE e.session_id = s.id
                      ORDER BY e.event_index DESC LIMIT 1) as last_active
-             FROM sessions s WHERE 1=1"
+             FROM sessions s WHERE 1=1",
         );
 
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -281,7 +291,9 @@ impl SessionDB {
             param_values.push(Box::new(parent_id.clone()));
         }
         if let Some(search) = &filter.search {
-            sql.push_str(" AND s.id IN (SELECT session_id FROM events_fts WHERE events_fts MATCH ?)");
+            sql.push_str(
+                " AND s.id IN (SELECT session_id FROM events_fts WHERE events_fts MATCH ?)",
+            );
             param_values.push(Box::new(search.clone()));
         }
 
@@ -294,7 +306,8 @@ impl SessionDB {
             sql.push_str(&format!(" OFFSET {}", offset));
         }
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
             let message_count: i64 = row.get(7)?;
@@ -305,11 +318,15 @@ impl SessionDB {
                 source: row.get(3)?,
                 started_at: parse_datetime(&row.get::<_, String>(4)?),
                 ended_at: row.get::<_, Option<String>>(5)?.map(|s| parse_datetime(&s)),
-                end_reason: row.get::<_, Option<String>>(6)?.and_then(|r| str_to_end_reason(&r)),
+                end_reason: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|r| str_to_end_reason(&r)),
                 message_count: message_count as u64,
                 parent_session_id: row.get(8)?,
                 preview: row.get(9)?,
-                last_active: row.get::<_, Option<String>>(10)?.map(|s| parse_datetime(&s)),
+                last_active: row
+                    .get::<_, Option<String>>(10)?
+                    .map(|s| parse_datetime(&s)),
             })
         })?;
 
@@ -323,34 +340,84 @@ impl SessionDB {
     pub async fn end_session(&self, id: &str, reason: EndReason) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         let reason_owned = reason;
-        self.write_contention.with_retry(|| {
-            let id = id_owned.clone();
-            let reason = reason_owned.clone();
-            async move {
-                let conn = self.conn.lock().await;
-                conn.execute(
-                    "UPDATE sessions SET ended_at = ?1, end_reason = ?2 WHERE id = ?3",
-                    params![chrono::Utc::now().to_rfc3339(), end_reason_to_str(&reason), id],
-                )?;
-                Ok::<_, rusqlite::Error>(())
-            }
-        }).await?;
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let reason = reason_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET ended_at = ?1, end_reason = ?2 WHERE id = ?3",
+                        params![
+                            chrono::Utc::now().to_rfc3339(),
+                            end_reason_to_str(&reason),
+                            id
+                        ],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
         Ok(())
     }
 
     pub async fn reopen_session(&self, id: &str) -> Result<(), SessionError> {
         let id_owned = id.to_string();
-        self.write_contention.with_retry(|| {
-            let id = id_owned.clone();
-            async move {
-                let conn = self.conn.lock().await;
-                conn.execute(
-                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?1",
-                    params![id],
-                )?;
-                Ok::<_, rusqlite::Error>(())
-            }
-        }).await?;
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?1",
+                        params![id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_goal_condition(
+        &self,
+        id: &str,
+        condition: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let id_owned = id.to_string();
+        let condition_owned = condition.map(ToOwned::to_owned);
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let condition = condition_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET goal_condition = ?1, goal_achieved = 0 WHERE id = ?2",
+                        params![condition, id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_goal_achieved(&self, id: &str) -> Result<(), SessionError> {
+        let id_owned = id.to_string();
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET goal_achieved = 1 WHERE id = ?1",
+                        params![id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
         Ok(())
     }
 
@@ -377,15 +444,25 @@ impl SessionDB {
                     title: row.get(1)?,
                     mode: str_to_mode(&row.get::<_, String>(2)?),
                     model: row.get(3)?,
-                    model_config: row.get::<_, Option<String>>(4)?.and_then(|v| serde_json::from_str(&v).ok()),
+                    model_config: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|v| serde_json::from_str(&v).ok()),
                     system_prompt: row.get(5)?,
                     parent_session_id: row.get(6)?,
                     fork_point: fork_point.map(|v| v as u64),
                     source: row.get(8)?,
-                    tags: row.get::<_, String>(9).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(),
+                    tags: row
+                        .get::<_, String>(9)
+                        .ok()
+                        .and_then(|t| serde_json::from_str(&t).ok())
+                        .unwrap_or_default(),
                     started_at: parse_datetime(&row.get::<_, String>(10)?),
-                    ended_at: row.get::<_, Option<String>>(11)?.map(|s| parse_datetime(&s)),
-                    end_reason: row.get::<_, Option<String>>(12)?.and_then(|r| str_to_end_reason(&r)),
+                    ended_at: row
+                        .get::<_, Option<String>>(11)?
+                        .map(|s| parse_datetime(&s)),
+                    end_reason: row
+                        .get::<_, Option<String>>(12)?
+                        .and_then(|r| str_to_end_reason(&r)),
                     message_count: message_count as u64,
                     tool_call_count: tool_call_count as u64,
                     subagent_count: subagent_count as u64,
@@ -403,7 +480,7 @@ impl SessionDB {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Try prefix match
                 let mut stmt = conn.prepare(
-                    "SELECT id FROM sessions WHERE id LIKE ?1 ORDER BY started_at DESC LIMIT 2"
+                    "SELECT id FROM sessions WHERE id LIKE ?1 ORDER BY started_at DESC LIMIT 2",
                 )?;
                 let matches: Vec<String> = stmt
                     .query_map(params![format!("{}%", id)], |r| r.get(0))?
@@ -423,8 +500,16 @@ impl SessionDB {
         }
     }
 
-    pub async fn fork_session(&self, id: &str, fork_point: u64, new_title: &str) -> Result<Session, SessionError> {
-        let parent = self.get_session(id).await?.ok_or(SessionError::NotFound(id.to_string()))?;
+    pub async fn fork_session(
+        &self,
+        id: &str,
+        fork_point: u64,
+        new_title: &str,
+    ) -> Result<Session, SessionError> {
+        let parent = self
+            .get_session(id)
+            .await?
+            .ok_or(SessionError::NotFound(id.to_string()))?;
         let events = self.get_events(id).await?;
         let forked_events: Vec<StoredEvent> = events
             .into_iter()
@@ -566,45 +651,156 @@ impl SessionDB {
         })
     }
 
-    pub async fn update_token_counts(&self, id: &str, delta: &TokenDelta) -> Result<(), SessionError> {
+    pub async fn update_token_counts(
+        &self,
+        id: &str,
+        delta: &TokenDelta,
+    ) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         let delta_owned = delta.clone();
-        self.write_contention.with_retry(|| {
-            let id = id_owned.clone();
-            let delta = delta_owned.clone();
-            async move {
-                let conn = self.conn.lock().await;
-                conn.execute(
-                    "UPDATE sessions SET
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let delta = delta_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET
                         input_tokens = input_tokens + ?1,
                         output_tokens = output_tokens + ?2,
                         cache_read_tokens = cache_read_tokens + ?3,
                         cache_write_tokens = cache_write_tokens + ?4
                      WHERE id = ?5",
-                    params![delta.input as i64, delta.output as i64, delta.cache_read as i64, delta.cache_write as i64, id],
-                )?;
-                Ok::<_, rusqlite::Error>(())
-            }
-        }).await?;
+                        params![
+                            delta.input as i64,
+                            delta.output as i64,
+                            delta.cache_read as i64,
+                            delta.cache_write as i64,
+                            id
+                        ],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn truncate_events_after(
+        &self,
+        session_id: &str,
+        event_index: u64,
+    ) -> Result<(), SessionError> {
+        let session_id_owned = session_id.to_string();
+        self.write_contention
+            .with_retry(|| {
+                let session_id = session_id_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "DELETE FROM events WHERE session_id = ?1 AND event_index > ?2",
+                        params![session_id, event_index as i64],
+                    )?;
+
+                    let message_count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'user_message'",
+                        params![session_id],
+                        |row| row.get(0),
+                    )?;
+                    let tool_call_count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'tool_call'",
+                        params![session_id],
+                        |row| row.get(0),
+                    )?;
+
+                    let last_goal_set = conn
+                        .query_row(
+                            "SELECT event_index, json_extract(event_data, '$.condition')
+                             FROM events
+                             WHERE session_id = ?1 AND event_type = 'goal_set'
+                             ORDER BY event_index DESC LIMIT 1",
+                            params![session_id],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                        )
+                        .optional()?;
+                    let last_goal_clear_index = conn
+                        .query_row(
+                            "SELECT MAX(event_index)
+                             FROM events
+                             WHERE session_id = ?1 AND event_type = 'goal_cleared'",
+                            params![session_id],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )?
+                        .unwrap_or(-1);
+
+                    let (goal_condition, goal_achieved) =
+                        if let Some((goal_index, condition)) = last_goal_set {
+                            if goal_index > last_goal_clear_index {
+                                let achieved_count: i64 = conn.query_row(
+                                    "SELECT COUNT(*) FROM events
+                                     WHERE session_id = ?1
+                                       AND event_type = 'goal_evaluated'
+                                       AND event_index > ?2
+                                       AND json_extract(event_data, '$.satisfied') = 1",
+                                    params![session_id, goal_index],
+                                    |row| row.get(0),
+                                )?;
+                                (condition, achieved_count > 0)
+                            } else {
+                                (None, false)
+                            }
+                        } else {
+                            (None, false)
+                        };
+
+                    conn.execute(
+                        "UPDATE sessions
+                         SET message_count = ?1,
+                             tool_call_count = ?2,
+                             goal_condition = ?3,
+                             goal_achieved = ?4
+                         WHERE id = ?5",
+                        params![
+                            message_count,
+                            tool_call_count,
+                            goal_condition,
+                            goal_achieved as i32,
+                            session_id
+                        ],
+                    )?;
+
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
         Ok(())
     }
 
     pub async fn set_title(&self, id: &str, title: &str) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         let title_owned = title.to_string();
-        self.write_contention.with_retry(|| {
-            let id = id_owned.clone();
-            let title = title_owned.clone();
-            async move {
-                let conn = self.conn.lock().await;
-                conn.execute("UPDATE sessions SET title = ?1 WHERE id = ?2", params![title, id])?;
-                Ok::<_, rusqlite::Error>(())
-            }
-        }).await?;
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let title = title_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                        params![title, id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
         Ok(())
     }
 
-    pub async fn search_events(&self, query: &str, top_k: u32) -> Result<Vec<SearchResult>, SessionError> {
+    pub async fn search_events(
+        &self,
+        query: &str,
+        top_k: u32,
+    ) -> Result<Vec<SearchResult>, SessionError> {
         let sanitized = crate::fts::sanitize_fts5_query(query);
         let conn = self.conn.lock().await;
 
@@ -728,6 +924,16 @@ fn event_type_str(event: &Event) -> &'static str {
         Event::HostCompromised { .. } => "host_compromised",
         Event::LateralMovement { .. } => "lateral_movement",
         Event::NetworkTopologyUpdate { .. } => "network_topology_update",
+        Event::EvidenceObserved { .. } => "evidence_observed",
+        Event::FactRecorded { .. } => "fact_recorded",
+        Event::HypothesisProposed { .. } => "hypothesis_proposed",
+        Event::PredictionMade { .. } => "prediction_made",
+        Event::ExperimentPlanned { .. } => "experiment_planned",
+        Event::HypothesisSupported { .. } => "hypothesis_supported",
+        Event::HypothesisContradicted { .. } => "hypothesis_contradicted",
+        Event::HypothesisRejected { .. } => "hypothesis_rejected",
+        Event::HypothesisConfirmed { .. } => "hypothesis_confirmed",
+        Event::ConclusionDrawn { .. } => "conclusion_drawn",
         Event::DirectiveSet { .. } => "directive_set",
         Event::ReflectionRecorded { .. } => "reflection_recorded",
         Event::HypothesisUpdate { .. } => "hypothesis_update",
@@ -742,6 +948,10 @@ fn event_type_str(event: &Event) -> &'static str {
         Event::SkillInjected { .. } => "skill_injected",
         Event::KnowledgeInjected { .. } => "knowledge_injected",
         Event::HumanFeedback { .. } => "human_feedback",
+        Event::LearningReviewStarted { .. } => "learning_review_started",
+        Event::LearningReviewCompleted { .. } => "learning_review_completed",
+        Event::LearningCandidateRejected { .. } => "learning_candidate_rejected",
+        Event::MemoryWriteStaged { .. } => "memory_write_staged",
         Event::SubAgentSpawned { .. } => "subagent_spawned",
         Event::SubAgentCompleted { .. } => "subagent_completed",
         Event::SubAgentProgress { .. } => "subagent_progress",
@@ -869,6 +1079,148 @@ mod tests {
         }
 
         // Cleanup. Best-effort — ignore errors on shared CI temp dirs.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn goal_condition_can_be_set_cleared_and_marked_achieved() {
+        let path = temp_db_path("goal");
+        let db = SessionDB::open(&path).await.expect("open db");
+
+        let session = db
+            .create_session(CreateSessionParams {
+                id: None,
+                title: None,
+                mode: Some(SessionMode::Pentest),
+                model: None,
+                system_prompt: None,
+                parent_session_id: None,
+                fork_point: None,
+                source: Some("test".into()),
+                tags: Vec::new(),
+            })
+            .await
+            .expect("create session");
+
+        db.set_goal_condition(&session.id, Some("prove the login behavior"))
+            .await
+            .expect("set goal");
+        let with_goal = db
+            .get_session(&session.id)
+            .await
+            .expect("get session")
+            .expect("session");
+        assert_eq!(
+            with_goal.goal_condition.as_deref(),
+            Some("prove the login behavior")
+        );
+        assert!(!with_goal.goal_achieved);
+
+        db.mark_goal_achieved(&session.id)
+            .await
+            .expect("mark achieved");
+        let achieved = db
+            .get_session(&session.id)
+            .await
+            .expect("get session")
+            .expect("session");
+        assert!(achieved.goal_achieved);
+
+        db.set_goal_condition(&session.id, None)
+            .await
+            .expect("clear goal");
+        let cleared = db
+            .get_session(&session.id)
+            .await
+            .expect("get session")
+            .expect("session");
+        assert!(cleared.goal_condition.is_none());
+        assert!(!cleared.goal_achieved);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn truncate_events_after_removes_future_events_and_rebuilds_counters() {
+        let path = temp_db_path("truncate");
+        let db = SessionDB::open(&path).await.expect("open db");
+
+        let session = db
+            .create_session(CreateSessionParams {
+                id: None,
+                title: None,
+                mode: Some(SessionMode::Pentest),
+                model: None,
+                system_prompt: None,
+                parent_session_id: None,
+                fork_point: None,
+                source: Some("test".into()),
+                tags: Vec::new(),
+            })
+            .await
+            .expect("create session");
+
+        db.append_event(
+            &session.id,
+            &Event::UserMessage {
+                content: "before checkpoint".into(),
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("append user");
+        let checkpoint = db
+            .append_event(
+                &session.id,
+                &Event::ContextSnapshotTaken {
+                    summary: "checkpoint".into(),
+                    preserved_keys: Vec::new(),
+                    active_contexts: Vec::new(),
+                },
+            )
+            .await
+            .expect("append checkpoint");
+        db.append_event(
+            &session.id,
+            &Event::GoalSet {
+                condition: "future goal".into(),
+                plan: None,
+                subtasks: Vec::new(),
+            },
+        )
+        .await
+        .expect("append goal");
+        db.append_event(
+            &session.id,
+            &Event::UserMessage {
+                content: "after checkpoint".into(),
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("append user");
+
+        db.truncate_events_after(&session.id, checkpoint)
+            .await
+            .expect("truncate");
+
+        let events = db.get_events(&session.id).await.expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last().unwrap().event,
+            Event::ContextSnapshotTaken { .. }
+        ));
+
+        let session = db
+            .get_session(&session.id)
+            .await
+            .expect("session")
+            .expect("session exists");
+        assert_eq!(session.message_count, 1);
+        assert_eq!(session.tool_call_count, 0);
+        assert!(session.goal_condition.is_none());
+        assert!(!session.goal_achieved);
+
         let _ = std::fs::remove_file(&path);
     }
 }

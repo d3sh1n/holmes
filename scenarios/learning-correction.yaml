@@ -1,0 +1,24 @@
+name: learning-correction
+description: Proves Watson corrections become audited learning candidates.
+mode: pentest
+config:
+  compressor:
+    enabled: false
+  learning:
+    enabled: true
+    memory_write_approval: true
+    max_candidates_per_turn: 3
+turns:
+  - input: "Remember next time: we prefer HEAD requests before GET requests for safe probes."
+scripted_responses:
+  - content: '<holmes_decision>{"type":"answer","message":"Preference noted for future probes."}</holmes_decision>'
+expectations:
+  final_contains:
+    - Preference noted
+  event_types:
+    - user_message
+    - learning_review_started
+    - memory_write_staged
+    - learning_review_completed
+    - turn_complete
+  max_errors: 0

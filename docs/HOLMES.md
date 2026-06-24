@@ -28,7 +28,10 @@ Holmes is a CLI-native AI agent for penetration testing, security research, code
 - **Workflow + Selector** — OpenRath-inspired composable workflows with LLM-driven routing
 - **Mind Palace** — Unified memory + context awareness + dashboard cognitive system
 - **Event Sourcing** — Every state change is an immutable event, enabling full session replay
+- **RuntimeYield Stream** — SDK-like structured stream for messages, permissions, tools, compaction, and results
+- **PermissionPolicy** — Central tool authorization layer with default, plan, read-only, dont-ask, and bypass modes
 - **GuardChain** — 3 pre-guards + 5 post-guards for safety and evidence extraction
+- **Harness** — Agent OS testbench for deterministic runtime scenarios
 - **10 built-in tools** — Shell execution, HTTP requests, Python scripting, browser automation, MCP
 
 ### Design Metaphor
@@ -61,7 +64,7 @@ Holmes is a CLI-native AI agent for penetration testing, security research, code
 ### Prerequisites
 
 - Rust toolchain (1.80+)
-- An LLM API key (Anthropic, OpenAI, DeepSeek, OpenRouter, Groq, or custom endpoint)
+- An Anthropic API key, or an Anthropic-compatible `/v1/messages` endpoint
 
 ### Installation
 
@@ -85,13 +88,9 @@ The wizard guides you through provider selection, API key entry, and model disco
 
 Available providers:
   1. Anthropic (Claude)
-  2. OpenAI (GPT-4o, o4, etc.)
-  3. DeepSeek
-  4. OpenRouter (multi-provider aggregator)
-  5. Groq (fast inference)
-  6. Custom endpoint (enter URL manually)
+  2. Custom Anthropic-compatible endpoint
 
-Select provider [1-6]: 1
+Select provider [1-2]: 1
 ✓ Found ANTHROPIC_API_KEY in environment (sk-ant-...)
 
 ✓ Fetched 5 available models from API:
@@ -106,9 +105,9 @@ Select model [1-4, or type a custom model name]:
 Setup complete! Run 'holmes' to start.
 ```
 
-**Provider auto-detection**: Holmes automatically detects API keys from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`).
+**Provider auto-detection**: Holmes automatically detects API keys from environment variables such as `ANTHROPIC_API_KEY` and `HOLMES_API_KEY`. Custom endpoints are spoken to through the Anthropic Messages protocol.
 
-**Model auto-discovery**: Holmes queries the provider's `/models` endpoint to fetch available models, with curated fallback lists for each provider when the API is unreachable.
+**Model auto-discovery**: Holmes queries the provider's model endpoint before saving configuration. Authentication failures stop setup instead of writing a broken config.
 
 ### Launch
 
@@ -120,17 +119,19 @@ Setup complete! Run 'holmes' to start.
 
 ## 3. Architecture
 
-### Crate Map (7 crates)
+### Crate Map
 
 ```
 holmes/
 ├── crates/
 │   ├── holmes-core/       # Event enum (40+ variants), types, config, RuntimeSession, Workflow trait
 │   ├── holmes-session/    # SessionDB (SQLite + FTS5), MemoryStore, Selector
-│   ├── holmes-llm/        # Multi-provider LLM client (OpenAI + Anthropic), failover, rate limiting
-│   ├── holmes-tools/      # Tool trait, ToolRegistry, 9 built-in tools, MCP integration
+│   ├── holmes-llm/        # Anthropic Messages client, failover, rate limiting
+│   ├── holmes-runtime/    # Agent loop, RuntimeYield stream, permissions, deduction, learning, compaction
+│   ├── holmes-tools/      # Tool trait, ToolRegistry, built-in tools, MCP integration
 │   ├── holmes-guards/     # GuardChain: 3 PreGuards + 5 PostGuards
 │   ├── holmes-mind-palace/# Memory Layer + Context Layer + Dashboard Layer
+│   ├── holmes-harness/    # Deterministic agent OS testbench
 │   └── holmes-cli/        # CLI binary: REPL, slash commands, setup wizard, workflows, goal loop
 ```
 
@@ -168,15 +169,19 @@ User Input
 │           ExploitWorkflow / ReportWorkflow           │
 │                   │                                   │
 │                   ▼                                   │
-│           LLM ↔ Tool Loop                             │
+│           Runtime Agent Loop                          │
 │           ┌──────────────────────────┐               │
 │           │ LlmClient.chat_completion│               │
+│           │        ↓                  │               │
+│           │ PermissionPolicy.evaluate│               │
 │           │        ↓                  │               │
 │           │ GuardChain.run_pre()     │               │
 │           │        ↓                  │               │
 │           │ ToolRegistry.execute()   │               │
 │           │        ↓                  │               │
 │           │ GuardChain.run_post()    │               │
+│           │        ↓                  │               │
+│           │ RuntimeYield stream      │               │
 │           └──────────────────────────┘               │
 │                   │                                   │
 │                   ▼                                   │
@@ -478,7 +483,7 @@ Nine built-in tools, extensible via the `Tool` trait and MCP:
 ### LLM Layer
 
 Multi-provider HTTP client with:
-- **OpenAI-compatible** (`/chat/completions`, Bearer auth) and **Anthropic native** (`/v1/messages`, `x-api-key` + `anthropic-version`) formats
+- **Anthropic Messages** (`/v1/messages`, `x-api-key` + `anthropic-version`) as the single wire protocol
 - **Failover chain** — providers sorted by priority, marked unhealthy on failure
 - **Rate limiting** — per-provider RPM caps
 - **Exponential backoff retry** (500ms × 2^n) with error classification
@@ -693,6 +698,13 @@ agent:
   stale_threshold: 8
   force_pivot_threshold: 15
   generate_reports: true
+
+permissions:
+  # default | plan | read_only | dont_ask | bypass
+  mode: default
+  allowed_tools: []
+  disallowed_tools: []
+  auto_approve_read_only: true
 
 llm:
   providers:

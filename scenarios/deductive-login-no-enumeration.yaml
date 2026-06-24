@@ -1,0 +1,43 @@
+name: deductive-login-no-enumeration
+description: Proves Holmes can reject a user-enumeration hypothesis when controlled probes are equivalent.
+mode: pentest
+config:
+  compressor:
+    enabled: false
+  learning:
+    enabled: false
+turns:
+  - input: "Determine whether the staging login leaks user enumeration."
+tools:
+  - name: login_probe
+    description: Returns controlled equivalent valid/invalid username probe evidence.
+    read_only: true
+    output: |
+      valid_user_status=401
+      invalid_user_status=401
+      response_diff=false
+      generic_failure=true
+      confirmed=true
+scripted_responses:
+  - content: '<holmes_decision>{"type":"use_tools","rationale":"compare controlled login responses","calls":[{"id":"call-1","type":"function","function":{"name":"login_probe","arguments":"{\"valid\":\"alice\",\"invalid\":\"not-a-user\"}"}}]}</holmes_decision>'
+  - content: '<holmes_decision>{"type":"answer","message":"Deduction trace rejects login user enumeration for this probe."}</holmes_decision>'
+expectations:
+  final_contains:
+    - rejects login user enumeration
+  event_sequence:
+    - user_message
+    - tool_call
+    - tool_result
+    - evidence_observed
+    - hypothesis_proposed
+    - prediction_made
+    - experiment_planned
+    - hypothesis_supported
+    - hypothesis_contradicted
+    - hypothesis_rejected
+    - hypothesis_confirmed
+    - conclusion_drawn
+    - turn_complete
+  tool_calls:
+    - login_probe
+  max_errors: 0

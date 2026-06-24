@@ -1,7 +1,6 @@
 pub const SCHEMA_VERSION: u32 = 1;
 
-pub const MIGRATIONS: &[&str] = &[
-    r#"
+pub const MIGRATIONS: &[&str] = &[r#"
     CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         title TEXT,
@@ -134,8 +133,7 @@ pub const MIGRATIONS: &[&str] = &[
     PRAGMA journal_mode=WAL;
     PRAGMA busy_timeout=1000;
     PRAGMA foreign_keys=ON;
-    "#,
-];
+    "#];
 
 pub fn schema_version_table() -> &'static str {
     r#"

@@ -1,0 +1,20 @@
+[package]
+name = "holmes-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+holmes-core = { path = "../holmes-core" }
+holmes-guards = { path = "../holmes-guards" }
+holmes-mind-palace = { path = "../holmes-mind-palace" }
+holmes-runtime = { path = "../holmes-runtime" }
+holmes-session = { path = "../holmes-session" }
+holmes-tools = { path = "../holmes-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

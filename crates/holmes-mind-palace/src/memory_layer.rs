@@ -41,11 +41,7 @@ impl MemoryLayer {
         Ok(())
     }
 
-    pub async fn recall(
-        &mut self,
-        context: &ContextSnapshot,
-        top_k: usize,
-    ) -> Vec<Memory> {
+    pub async fn recall(&mut self, context: &ContextSnapshot, top_k: usize) -> Vec<Memory> {
         let query = build_recall_query(context);
         if let Some(cached) = self.recall_cache.get(&query) {
             return cached.clone();

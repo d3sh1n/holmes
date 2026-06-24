@@ -1,0 +1,15 @@
+name: basic-answer
+description: Minimal deterministic harness scenario that proves Holmes can answer and record events.
+mode: pentest
+turns:
+  - input: hello
+scripted_responses:
+  - content: '<holmes_decision>{"type":"answer","message":"Harness OK"}</holmes_decision>'
+expectations:
+  final_contains:
+    - Harness OK
+  event_types:
+    - user_message
+    - thinking
+    - turn_complete
+  max_errors: 0

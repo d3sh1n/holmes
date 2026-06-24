@@ -30,5 +30,7 @@ async fn test_full_session_lifecycle() {
     let events = db.get_events(&session.id).await.unwrap();
     assert_eq!(events.len(), 1);
 
-    db.end_session(&session.id, EndReason::UserQuit).await.unwrap();
+    db.end_session(&session.id, EndReason::UserQuit)
+        .await
+        .unwrap();
 }

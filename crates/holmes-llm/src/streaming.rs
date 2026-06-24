@@ -20,5 +20,7 @@ pub trait StreamSink: Send {
 }
 
 impl StreamSink for Vec<StreamChunk> {
-    fn push(&mut self, chunk: StreamChunk) { Vec::push(self, chunk); }
+    fn push(&mut self, chunk: StreamChunk) {
+        Vec::push(self, chunk);
+    }
 }

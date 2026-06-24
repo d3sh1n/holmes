@@ -1,4 +1,4 @@
-use holmes_core::{FunctionCall, LlmResponse, Message, ToolCall, ToolDefinition, Usage};
+use holmes_core::{FunctionCall, LlmResponse, Message, Role, ToolCall, ToolDefinition, Usage};
 use serde::{Deserialize, Serialize};
 
 // ── Request types ──
@@ -79,8 +79,9 @@ impl AnthropicRequest {
     ) -> Self {
         let mut system_text: Option<String> = None;
         let mut anthropic_messages: Vec<AnthropicMessage> = Vec::new();
+        let messages = sanitize_tool_use_groups(messages);
 
-        for msg in messages {
+        for msg in &messages {
             let role_str = format!(
                 "{}",
                 serde_json::to_value(&msg.role).unwrap().as_str().unwrap()
@@ -209,6 +210,89 @@ impl AnthropicRequest {
     }
 }
 
+fn sanitize_tool_use_groups(messages: &[Message]) -> Vec<Message> {
+    let mut sanitized = Vec::with_capacity(messages.len());
+    let mut index = 0;
+
+    while index < messages.len() {
+        let message = messages[index].clone();
+        index += 1;
+
+        if message.role == Role::Tool {
+            sanitized.push(orphan_tool_result_as_user_message(&message));
+            continue;
+        }
+
+        let required_tool_results = if message.role == Role::Assistant {
+            message
+                .tool_calls
+                .as_deref()
+                .into_iter()
+                .flat_map(|tool_calls| tool_calls.iter())
+                .map(|tool_call| (tool_call.id.clone(), tool_call.function.name.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if required_tool_results.is_empty() {
+            sanitized.push(message);
+            continue;
+        }
+
+        let mut matched_results = Vec::new();
+        let mut extra_results = Vec::new();
+
+        while index < messages.len() && messages[index].role == Role::Tool {
+            let tool_result = messages[index].clone();
+            index += 1;
+
+            if let Some(tool_call_id) = tool_result.tool_call_id.as_deref() {
+                if required_tool_results
+                    .iter()
+                    .any(|(required_id, _)| required_id == tool_call_id)
+                    && !matched_results.iter().any(|matched: &Message| {
+                        matched.tool_call_id.as_deref() == Some(tool_call_id)
+                    })
+                {
+                    matched_results.push(tool_result);
+                    continue;
+                }
+            }
+
+            extra_results.push(tool_result);
+        }
+
+        sanitized.push(message);
+        for (tool_call_id, tool_name) in required_tool_results {
+            if let Some(position) = matched_results
+                .iter()
+                .position(|result| result.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
+            {
+                sanitized.push(matched_results.remove(position));
+            } else {
+                sanitized.push(Message::tool_result(
+                    tool_call_id,
+                    tool_name,
+                    "[Tool output unavailable in Holmes conversation history; continue from current runtime state.]",
+                ));
+            }
+        }
+
+        sanitized.extend(extra_results.iter().map(orphan_tool_result_as_user_message));
+    }
+
+    sanitized
+}
+
+fn orphan_tool_result_as_user_message(message: &Message) -> Message {
+    let name = message.name.as_deref().unwrap_or("unknown_tool");
+    let content = message.content.as_deref().unwrap_or_default();
+    Message::user(format!(
+        "[Historical tool result without matching Anthropic tool_use: {name}]\n{content}"
+    ))
+}
+
 fn merge_consecutive_roles(messages: Vec<AnthropicMessage>) -> Vec<AnthropicMessage> {
     let mut result: Vec<AnthropicMessage> = Vec::new();
 
@@ -292,7 +376,7 @@ impl AnthropicResponse {
                 AnthropicResponseBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ToolCall {
                         id,
-                        call_type: "function".into(),
+                        call_type: "tool_use".into(),
                         function: FunctionCall {
                             name,
                             arguments: serde_json::to_string(&input).unwrap_or_default(),
@@ -363,6 +447,7 @@ mod tests {
         let llm = resp.into_llm_response();
         assert!(llm.content.unwrap().contains("Let me check"));
         assert_eq!(llm.tool_calls.len(), 1);
+        assert_eq!(llm.tool_calls[0].call_type, "tool_use");
         assert_eq!(llm.tool_calls[0].function.name, "execute_command");
         assert_eq!(llm.finish_reason.unwrap(), "tool_calls");
     }
@@ -439,6 +524,87 @@ mod tests {
     }
 
     #[test]
+    fn assistant_tool_use_without_result_gets_synthetic_tool_result() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("go"),
+            Message::assistant_with_content_and_tool_calls(
+                Some("I will inspect.".into()),
+                vec![ToolCall {
+                    id: "toolu_missing".into(),
+                    call_type: "tool_use".into(),
+                    function: FunctionCall {
+                        name: "inspect_target".into(),
+                        arguments: r#"{"path":"/Applications/Antigravity.app"}"#.into(),
+                    },
+                }],
+            ),
+            Message::user("continue"),
+        ];
+
+        let req = AnthropicRequest::from_messages("claude-3", &messages, &[]);
+        let json = serde_json::to_value(&req).unwrap();
+        let rendered = serde_json::to_string(&json).unwrap();
+
+        assert!(!rendered.contains("tool_calls"));
+        assert!(rendered.contains("tool_use"));
+        assert!(rendered.contains("tool_result"));
+        assert!(rendered.contains("toolu_missing"));
+        assert!(rendered.contains("Tool output unavailable"));
+
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_missing");
+    }
+
+    #[test]
+    fn orphan_tool_result_is_preserved_as_plain_history_text() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::tool_result("orphan", "inspect_target", "old output"),
+            Message::user("continue"),
+        ];
+
+        let req = AnthropicRequest::from_messages("claude-3", &messages, &[]);
+        let json = serde_json::to_value(&req).unwrap();
+        let rendered = serde_json::to_string(&json).unwrap();
+
+        assert!(!rendered.contains("tool_result"));
+        assert!(rendered.contains("Historical tool result without matching Anthropic tool_use"));
+        assert!(rendered.contains("old output"));
+    }
+
+    #[test]
+    fn tool_use_round_trip_uses_anthropic_wire_blocks() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("go"),
+            Message::assistant_with_content_and_tool_calls(
+                Some("Checking.".into()),
+                vec![ToolCall {
+                    id: "toolu_01".into(),
+                    call_type: "tool_use".into(),
+                    function: FunctionCall {
+                        name: "execute_command".into(),
+                        arguments: r#"{"cmd":"file /Applications/Antigravity.app"}"#.into(),
+                    },
+                }],
+            ),
+            Message::tool_result("toolu_01", "execute_command", "directory"),
+        ];
+
+        let req = AnthropicRequest::from_messages("claude-3", &messages, &[]);
+        let rendered = serde_json::to_string(&serde_json::to_value(&req).unwrap()).unwrap();
+
+        assert!(rendered.contains(r#""type":"tool_use""#));
+        assert!(rendered.contains(r#""type":"tool_result""#));
+        assert!(!rendered.contains("tool_calls"));
+        assert!(!rendered.contains("tool_call_id"));
+    }
+
+    #[test]
     fn tool_result_with_image_serializes_as_content_blocks() {
         use holmes_core::{ContentBlock, ToolResult};
 
@@ -462,7 +628,17 @@ mod tests {
         let messages = vec![
             Message::system("sys"),
             Message::user("go"),
-            Message::assistant("ok"),
+            Message::assistant_with_content_and_tool_calls(
+                Some("ok".into()),
+                vec![ToolCall {
+                    id: "t1".into(),
+                    call_type: "tool_use".into(),
+                    function: FunctionCall {
+                        name: "browser".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
             msg,
         ];
         let req = AnthropicRequest::from_messages("claude-3", &messages, &[]);
@@ -488,7 +664,17 @@ mod tests {
         let messages = vec![
             Message::system("sys"),
             Message::user("go"),
-            Message::assistant("ok"),
+            Message::assistant_with_content_and_tool_calls(
+                Some("ok".into()),
+                vec![ToolCall {
+                    id: "t1".into(),
+                    call_type: "tool_use".into(),
+                    function: FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
             Message::tool("t1", "plain text result"),
         ];
         let req = AnthropicRequest::from_messages("claude-3", &messages, &[]);

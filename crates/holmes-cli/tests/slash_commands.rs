@@ -18,6 +18,8 @@ fn test_all_commands_registered() {
     assert_eq!(registry.resolve("history"), Some("sessions"));
     assert_eq!(registry.resolve("branch"), Some("branch"));
     assert_eq!(registry.resolve("fork"), Some("branch"));
+    assert_eq!(registry.resolve("compress"), Some("compress"));
+    assert_eq!(registry.resolve("compact"), Some("compress"));
     assert_eq!(registry.resolve("status"), Some("status"));
     assert_eq!(registry.resolve("goal"), Some("goal"));
     assert_eq!(registry.resolve("model"), Some("model"));
@@ -28,6 +30,13 @@ fn test_all_commands_registered() {
     assert_eq!(registry.resolve("usage"), Some("usage"));
     assert_eq!(registry.resolve("save"), Some("save"));
     assert_eq!(registry.resolve("export"), Some("save"));
+    assert_eq!(registry.resolve("snapshot"), Some("snapshot"));
+    assert_eq!(registry.resolve("checkpoint"), Some("snapshot"));
+    assert_eq!(registry.resolve("rollback"), Some("rollback"));
+    assert_eq!(registry.resolve("rewind"), Some("rollback"));
+    assert_eq!(registry.resolve("report"), Some("report"));
+    assert_eq!(registry.resolve("queue"), Some("queue"));
+    assert_eq!(registry.resolve("steer"), Some("steer"));
 }
 
 #[test]
@@ -55,12 +64,17 @@ fn test_help_displays_all_categories() {
 #[test]
 fn test_unique_canonical_names() {
     let registry = CommandRegistry::default();
-    let mut names: Vec<&str> = registry.list_by_category()
+    let mut names: Vec<&str> = registry
+        .list_by_category()
         .iter()
         .flat_map(|(_, cmds)| cmds.iter().map(|c| c.name))
         .collect();
     let len_before = names.len();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), len_before, "Duplicate canonical command names found");
+    assert_eq!(
+        names.len(),
+        len_before,
+        "Duplicate canonical command names found"
+    );
 }

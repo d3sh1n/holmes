@@ -14,21 +14,34 @@ struct CountingWorkflow {
 
 impl CountingWorkflow {
     fn new(name: &str, desc: &str) -> Self {
-        Self { name: name.into(), desc: desc.into(), count: AtomicU32::new(0) }
+        Self {
+            name: name.into(),
+            desc: desc.into(),
+            count: AtomicU32::new(0),
+        }
     }
-    fn count(&self) -> u32 { self.count.load(Ordering::SeqCst) }
+    fn count(&self) -> u32 {
+        self.count.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl Workflow for CountingWorkflow {
-    fn name(&self) -> &str { &self.name }
-    fn description(&self) -> &str { &self.desc }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.desc
+    }
     async fn forward(&self, session: &mut RuntimeSession) -> Result<(), WorkflowError> {
         self.count.fetch_add(1, Ordering::SeqCst);
         // Simulate adding a message
-        session.messages.push(
-            holmes_core::tool_types::Message::user(format!("Workflow {} executed", self.name))
-        );
+        session
+            .messages
+            .push(holmes_core::tool_types::Message::user(format!(
+                "Workflow {} executed",
+                self.name
+            )));
         Ok(())
     }
 }
@@ -51,8 +64,14 @@ fn test_selector_register_and_get() {
 #[test]
 fn test_selector_prompt_contains_all_workflows() {
     let mut selector = Selector::new();
-    selector.register(Box::new(CountingWorkflow::new("recon", "信息收集：扫描端口")));
-    selector.register(Box::new(CountingWorkflow::new("analysis", "深度分析：代码审计")));
+    selector.register(Box::new(CountingWorkflow::new(
+        "recon",
+        "信息收集：扫描端口",
+    )));
+    selector.register(Box::new(CountingWorkflow::new(
+        "analysis",
+        "深度分析：代码审计",
+    )));
 
     let prompt = selector.selector_prompt();
     assert!(prompt.contains("recon"));
@@ -89,8 +108,8 @@ async fn test_multiple_workflows_chain() {
 
 #[test]
 fn test_runtime_session_fork() {
-    let original = RuntimeSession::new("orig".into(), SessionMode::Pentest)
-        .with_user_message("hello");
+    let original =
+        RuntimeSession::new("orig".into(), SessionMode::Pentest).with_user_message("hello");
     let forked = original.fork();
 
     assert_ne!(original.id, forked.id);

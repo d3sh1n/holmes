@@ -154,6 +154,68 @@ pub enum Event {
         domain_info: Option<DomainInfo>,
     },
 
+    // === Deduction Ledger ===
+    EvidenceObserved {
+        evidence_id: String,
+        summary: String,
+        source: String,
+        confidence: String,
+    },
+    FactRecorded {
+        fact_id: String,
+        statement: String,
+        evidence_ids: Vec<String>,
+    },
+    HypothesisProposed {
+        hypothesis_id: String,
+        statement: String,
+        rationale: String,
+        #[serde(default)]
+        confidence: Option<f32>,
+        #[serde(default)]
+        attack_type: Option<String>,
+        #[serde(default)]
+        entry_points: Vec<String>,
+    },
+    PredictionMade {
+        hypothesis_id: String,
+        prediction: String,
+    },
+    ExperimentPlanned {
+        hypothesis_id: String,
+        action: String,
+        distinguishes: Vec<String>,
+    },
+    HypothesisSupported {
+        hypothesis_id: String,
+        evidence_id: String,
+        rationale: String,
+        #[serde(default)]
+        confidence: Option<f32>,
+    },
+    HypothesisContradicted {
+        hypothesis_id: String,
+        evidence_id: String,
+        rationale: String,
+        #[serde(default)]
+        confidence: Option<f32>,
+    },
+    HypothesisRejected {
+        hypothesis_id: String,
+        reason: String,
+    },
+    HypothesisConfirmed {
+        hypothesis_id: String,
+        conclusion: String,
+        #[serde(default)]
+        confidence: Option<f32>,
+    },
+    ConclusionDrawn {
+        conclusion: String,
+        supporting_hypotheses: Vec<String>,
+        evidence_ids: Vec<String>,
+    },
+
     // === Strategy & Reflection ===
     DirectiveSet {
         attack_type: Option<String>,
@@ -240,6 +302,23 @@ pub enum Event {
         content: String,
         target_event: Option<u64>,
         timestamp: DateTime<Utc>,
+    },
+    LearningReviewStarted {
+        trigger: String,
+        event_range: (u64, u64),
+    },
+    LearningReviewCompleted {
+        candidates: usize,
+        applied: usize,
+        staged: usize,
+    },
+    LearningCandidateRejected {
+        kind: String,
+        reason: String,
+    },
+    MemoryWriteStaged {
+        content: String,
+        reason: String,
     },
 
     // === Sub-Agent ===
@@ -453,20 +532,69 @@ impl Event {
         match self {
             Event::UserMessage { content, .. } => content.clone(),
             Event::Thinking { content, .. } => content.clone(),
-            Event::ToolCall { name, arguments, purpose, .. } => {
-                format!("{} {:?} {}", name, arguments, purpose.as_deref().unwrap_or(""))
+            Event::ToolCall {
+                name,
+                arguments,
+                purpose,
+                ..
+            } => {
+                format!(
+                    "{} {:?} {}",
+                    name,
+                    arguments,
+                    purpose.as_deref().unwrap_or("")
+                )
             }
             Event::ToolResult { name, content, .. } => {
                 format!("{} {}", name, content)
             }
-            Event::VulnerabilityFound { title, evidence, .. } => {
+            Event::VulnerabilityFound {
+                title, evidence, ..
+            } => {
                 format!("{} {}", title, evidence)
             }
+            Event::EvidenceObserved { summary, .. } => summary.clone(),
+            Event::FactRecorded { statement, .. } => statement.clone(),
+            Event::HypothesisProposed {
+                statement,
+                rationale,
+                ..
+            } => {
+                format!("{} {}", statement, rationale)
+            }
+            Event::PredictionMade { prediction, .. } => prediction.clone(),
+            Event::ExperimentPlanned { action, .. } => action.clone(),
+            Event::HypothesisSupported { rationale, .. }
+            | Event::HypothesisContradicted { rationale, .. } => rationale.clone(),
+            Event::HypothesisRejected { reason, .. } => reason.clone(),
+            Event::HypothesisConfirmed { conclusion, .. }
+            | Event::ConclusionDrawn { conclusion, .. } => conclusion.clone(),
             Event::ReflectionRecorded { diagnosis, .. } => diagnosis.clone(),
             Event::MemoryStored { content, .. } => content.clone(),
-            Event::SubAgentSpawned { task_description, .. } => task_description.clone(),
+            Event::LearningReviewStarted { trigger, .. } => trigger.clone(),
+            Event::LearningReviewCompleted {
+                candidates,
+                applied,
+                staged,
+            } => {
+                format!(
+                    "learning candidates={} applied={} staged={}",
+                    candidates, applied, staged
+                )
+            }
+            Event::LearningCandidateRejected { kind, reason } => {
+                format!("{} {}", kind, reason)
+            }
+            Event::MemoryWriteStaged { content, .. } => content.clone(),
+            Event::SubAgentSpawned {
+                task_description, ..
+            } => task_description.clone(),
             Event::SubAgentCompleted { result, .. } => result.summary.clone(),
-            Event::ReportGenerated { file_path, sections, .. } => {
+            Event::ReportGenerated {
+                file_path,
+                sections,
+                ..
+            } => {
                 format!("{} {:?}", file_path, sections)
             }
             _ => String::new(),
@@ -483,26 +611,58 @@ impl Event {
 
     pub fn category(&self) -> &'static str {
         match self {
-            Event::SessionCreated { .. } | Event::SessionEnded { .. } | Event::SessionModeSet { .. } => "session",
+            Event::SessionCreated { .. }
+            | Event::SessionEnded { .. }
+            | Event::SessionModeSet { .. } => "session",
             Event::UserMessage { .. } | Event::TurnComplete { .. } => "turn",
-            Event::GoalSet { .. } | Event::GoalEvaluated { .. } | Event::GoalCleared { .. }
-            | Event::GoalProgress { .. } | Event::SubtaskUpdate { .. } => "goal",
-            Event::Thinking { .. } | Event::ToolCall { .. } | Event::ToolResult { .. }
+            Event::GoalSet { .. }
+            | Event::GoalEvaluated { .. }
+            | Event::GoalCleared { .. }
+            | Event::GoalProgress { .. }
+            | Event::SubtaskUpdate { .. } => "goal",
+            Event::Thinking { .. }
+            | Event::ToolCall { .. }
+            | Event::ToolResult { .. }
             | Event::ToolBlocked { .. } => "action",
-            Event::TargetDiscovered { .. } | Event::AttackSurfaceUpdate { .. }
-            | Event::VulnerabilityFound { .. } | Event::CodePatternFound { .. }
-            | Event::ReverseInsight { .. } | Event::CredentialFound { .. }
-            | Event::HostCompromised { .. } | Event::LateralMovement { .. }
+            Event::TargetDiscovered { .. }
+            | Event::AttackSurfaceUpdate { .. }
+            | Event::VulnerabilityFound { .. }
+            | Event::CodePatternFound { .. }
+            | Event::ReverseInsight { .. }
+            | Event::CredentialFound { .. }
+            | Event::HostCompromised { .. }
+            | Event::LateralMovement { .. }
             | Event::NetworkTopologyUpdate { .. } => "situational",
-            Event::DirectiveSet { .. } | Event::ReflectionRecorded { .. }
-            | Event::HypothesisUpdate { .. } | Event::AdvisorAction { .. } => "strategy",
-            Event::MemoryStored { .. } | Event::MemoryRecalled { .. }
-            | Event::MemoryConsolidated { .. } | Event::ContextSnapshotTaken { .. }
-            | Event::ContextSwitched { .. } | Event::DashboardUpdated { .. } => "mind_palace",
+            Event::EvidenceObserved { .. }
+            | Event::FactRecorded { .. }
+            | Event::HypothesisProposed { .. }
+            | Event::PredictionMade { .. }
+            | Event::ExperimentPlanned { .. }
+            | Event::HypothesisSupported { .. }
+            | Event::HypothesisContradicted { .. }
+            | Event::HypothesisRejected { .. }
+            | Event::HypothesisConfirmed { .. }
+            | Event::ConclusionDrawn { .. } => "deduction",
+            Event::DirectiveSet { .. }
+            | Event::ReflectionRecorded { .. }
+            | Event::HypothesisUpdate { .. }
+            | Event::AdvisorAction { .. } => "strategy",
+            Event::MemoryStored { .. }
+            | Event::MemoryRecalled { .. }
+            | Event::MemoryConsolidated { .. }
+            | Event::ContextSnapshotTaken { .. }
+            | Event::ContextSwitched { .. }
+            | Event::DashboardUpdated { .. } => "mind_palace",
             Event::CompressionApplied { .. } => "context",
-            Event::SkillInjected { .. } | Event::KnowledgeInjected { .. }
+            Event::SkillInjected { .. }
+            | Event::KnowledgeInjected { .. }
             | Event::HumanFeedback { .. } => "injection",
-            Event::SubAgentSpawned { .. } | Event::SubAgentCompleted { .. }
+            Event::LearningReviewStarted { .. }
+            | Event::LearningReviewCompleted { .. }
+            | Event::LearningCandidateRejected { .. }
+            | Event::MemoryWriteStaged { .. } => "learning",
+            Event::SubAgentSpawned { .. }
+            | Event::SubAgentCompleted { .. }
             | Event::SubAgentProgress { .. } => "subagent",
             Event::ReportGenerated { .. } => "report",
         }

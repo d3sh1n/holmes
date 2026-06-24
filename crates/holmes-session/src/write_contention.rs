@@ -24,7 +24,6 @@ impl WriteContention {
         E: std::fmt::Display,
     {
         let mut attempt = 0;
-        let mut rng = rand::thread_rng();
 
         loop {
             match f().await {
@@ -34,8 +33,11 @@ impl WriteContention {
                     if attempt >= self.max_retries {
                         return Err(e);
                     }
-                    let jitter = rng.gen_range(0..self.jitter_range_ms);
-                    let delay = self.base_delay_ms + jitter;
+                    let delay = {
+                        let mut rng = rand::thread_rng();
+                        let jitter = rng.gen_range(0..self.jitter_range_ms);
+                        self.base_delay_ms + jitter
+                    };
                     tracing::warn!(
                         attempt,
                         max_retries = self.max_retries,

@@ -1,0 +1,46 @@
+name: deductive-llm-trace
+description: Proves LLM decisions can explicitly update the deduction ledger.
+mode: pentest
+config:
+  compressor:
+    enabled: false
+  learning:
+    enabled: false
+turns:
+  - input: "Reason about the observed admin endpoint."
+scripted_responses:
+  - content: |
+      <holmes_decision>{"type":"deduce","message":"Recording deduction trace for the admin endpoint.","trace":{"evidence":[{"evidence_id":"evidence-admin-403","summary":"/admin returns 403 with request-id req-7","source":"http_probe","confidence":"tool_observed"}],"hypotheses":[{"hypothesis_id":"hypothesis-admin-authz","statement":"The admin endpoint exists but requires authorization.","rationale":"A 403 with a request id is more consistent with authz enforcement than absence.","confidence":0.66,"attack_type":"authorization","entry_points":["/admin"]},{"hypothesis_id":"hypothesis-admin-missing","statement":"The admin endpoint may not exist and the 403 may be generic.","rationale":"A generic edge response could mimic authorization denial.","confidence":0.32}],"predictions":[{"hypothesis_id":"hypothesis-admin-authz","prediction":"Authenticated or differently privileged requests should change the authorization outcome."}],"experiments":[{"hypothesis_id":"hypothesis-admin-authz","action":"Compare unauthenticated and authorized-safe requests to /admin without destructive actions.","distinguishes":["authorization_required","generic_edge_response"]}],"supports":[{"hypothesis_id":"hypothesis-admin-authz","evidence_id":"evidence-admin-403","rationale":"403 indicates an existing protected resource in this context.","confidence":0.7}],"contradictions":[{"hypothesis_id":"hypothesis-admin-missing","evidence_id":"evidence-admin-403","rationale":"A stable request id and authorization status weakly contradict a missing endpoint.","confidence":0.25}],"conclusions":[{"conclusion":"Treat /admin as an existing protected endpoint pending authorization-safe comparison.","supporting_hypotheses":["hypothesis-admin-authz"],"evidence_ids":["evidence-admin-403"]}]}}</holmes_decision>
+  - content: '<holmes_decision>{"type":"answer","message":"Deduction ledger recorded the protected admin endpoint hypothesis."}</holmes_decision>'
+expectations:
+  final_contains:
+    - protected admin endpoint
+  yield_types:
+    - plan_update
+    - final_answer
+  event_sequence:
+    - user_message
+    - thinking
+    - evidence_observed
+    - hypothesis_proposed
+    - prediction_made
+    - experiment_planned
+    - hypothesis_supported
+    - hypothesis_contradicted
+    - conclusion_drawn
+    - thinking
+    - turn_complete
+  event_payloads:
+    - event_type: hypothesis_proposed
+      contains:
+        - hypothesis-admin-authz
+        - authorization
+    - event_type: hypothesis_supported
+      contains:
+        - evidence-admin-403
+        - "0.7"
+    - event_type: conclusion_drawn
+      contains:
+        - protected endpoint
+        - evidence-admin-403
+  max_errors: 0

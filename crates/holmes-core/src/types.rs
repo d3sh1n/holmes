@@ -15,7 +15,9 @@ pub enum SessionMode {
 }
 
 impl Default for SessionMode {
-    fn default() -> Self { Self::Pentest }
+    fn default() -> Self {
+        Self::Pentest
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -287,9 +289,17 @@ pub enum SubTaskStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UserInput {
-    Message { content: String },
-    SlashCommand { command: String, args: String },
-    DirectTool { tool_name: String, arguments: String },
+    Message {
+        content: String,
+    },
+    SlashCommand {
+        command: String,
+        args: String,
+    },
+    DirectTool {
+        tool_name: String,
+        arguments: String,
+    },
 }
 
 // ---- Session Filter ----

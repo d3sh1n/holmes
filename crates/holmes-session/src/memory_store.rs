@@ -105,11 +105,7 @@ impl MemoryStore {
         Ok(id)
     }
 
-    pub async fn search(
-        &self,
-        query: &str,
-        top_k: u32,
-    ) -> Result<Vec<Memory>, rusqlite::Error> {
+    pub async fn search(&self, query: &str, top_k: u32) -> Result<Vec<Memory>, rusqlite::Error> {
         let sanitized = crate::fts::sanitize_fts5_query(query);
         let conn = self.conn.lock().await;
 

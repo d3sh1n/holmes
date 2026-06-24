@@ -19,7 +19,10 @@ pub struct MindPalace {
 }
 
 impl MindPalace {
-    pub fn new(session_db: Arc<holmes_session::db::SessionDB>, long_term: Arc<MemoryStore>) -> Self {
+    pub fn new(
+        session_db: Arc<holmes_session::db::SessionDB>,
+        long_term: Arc<MemoryStore>,
+    ) -> Self {
         Self {
             memory: MemoryLayer::new(session_db, long_term),
             context: ContextLayer::new(),
@@ -49,8 +52,17 @@ impl MindPalace {
         DashboardLayer::generate(&self.context, mode)
     }
 
-    pub fn situation_summary(&self) -> String {
-        self.context.situation_summary()
+    pub fn situation_summary(&self, mode: &SessionMode) -> String {
+        let snapshot = DashboardLayer::generate(&self.context, mode);
+        let mut parts = Vec::new();
+        if !snapshot.sections.is_empty() {
+            for (_, section) in snapshot.sections {
+                parts.push(format!("[{}] {}", section.title, section.content_summary));
+            }
+        } else {
+            parts.push("No significant context yet.".into());
+        }
+        parts.join("\n")
     }
 
     pub fn snapshot(&self) -> ContextSnapshot {

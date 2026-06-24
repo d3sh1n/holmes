@@ -2,7 +2,26 @@
 /// FTS5 has special characters that need quoting: hyphens, dots, etc.
 pub fn sanitize_fts5_query(query: &str) -> String {
     let mut result = String::new();
-    let needs_quoting = |c: char| matches!(c, '-' | '.' | '@' | '/' | '\\' | ':' | '|' | '^');
+    let needs_quoting = |c: char| {
+        matches!(
+            c,
+            '-' | '.'
+                | ','
+                | ';'
+                | '@'
+                | '/'
+                | '\\'
+                | ':'
+                | '|'
+                | '^'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+        )
+    };
 
     for word in query.split_whitespace() {
         if !result.is_empty() {
@@ -10,7 +29,7 @@ pub fn sanitize_fts5_query(query: &str) -> String {
         }
         if word.chars().any(needs_quoting) {
             result.push('"');
-            result.push_str(word);
+            result.push_str(&word.replace('"', "\"\""));
             result.push('"');
         } else {
             result.push_str(word);
@@ -42,6 +61,10 @@ mod tests {
         assert_eq!(sanitize_fts5_query("simple query"), "simple query");
         assert_eq!(sanitize_fts5_query("host-name.com"), "\"host-name.com\"");
         assert_eq!(sanitize_fts5_query("192.168.1.1"), "\"192.168.1.1\"");
+        assert_eq!(
+            sanitize_fts5_query("Yes, authorized"),
+            "\"Yes,\" authorized"
+        );
     }
 
     #[test]

@@ -154,11 +154,11 @@ mod tests {
 
     #[test]
     fn test_merge_combines_unique_messages() {
-        let mut a = RuntimeSession::new("a".into(), SessionMode::Pentest)
-            .with_user_message("msg from a");
+        let mut a =
+            RuntimeSession::new("a".into(), SessionMode::Pentest).with_user_message("msg from a");
 
         let b = RuntimeSession::new("b".into(), SessionMode::Pentest)
-            .with_user_message("msg from a")  // duplicate
+            .with_user_message("msg from a") // duplicate
             .with_user_message("msg from b"); // unique
 
         a.merge(&b);

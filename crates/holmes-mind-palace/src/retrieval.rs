@@ -7,12 +7,16 @@ impl Retrieval {
         let mut features = Vec::new();
         for event in events.iter().rev().take(20) {
             match event {
-                Event::ToolCall { name, arguments, .. } => {
+                Event::ToolCall {
+                    name, arguments, ..
+                } => {
                     features.push(name.clone());
                     if let Some(args) = arguments.as_object() {
                         for v in args.values() {
                             if let Some(s) = v.as_str() {
-                                if s.len() < 100 { features.push(s.to_string()); }
+                                if s.len() < 100 {
+                                    features.push(s.to_string());
+                                }
                             }
                         }
                     }
@@ -25,9 +29,13 @@ impl Retrieval {
                         }
                     }
                 }
-                Event::VulnerabilityFound { title, .. } => { features.push(title.clone()); }
+                Event::VulnerabilityFound { title, .. } => {
+                    features.push(title.clone());
+                }
                 Event::DirectiveSet { attack_type, .. } => {
-                    if let Some(at) = attack_type { features.push(at.clone()); }
+                    if let Some(at) = attack_type {
+                        features.push(at.clone());
+                    }
                 }
                 _ => {}
             }

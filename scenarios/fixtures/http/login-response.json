@@ -1,0 +1,11 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json",
+    "x-request-id": "req-harness-001"
+  },
+  "body": {
+    "message": "login probe accepted in staging fixture",
+    "mfa_required": true
+  }
+}

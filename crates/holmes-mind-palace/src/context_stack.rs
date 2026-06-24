@@ -1,5 +1,5 @@
-use holmes_core::types::*;
 use crate::memory_layer::ContextTargetExt;
+use holmes_core::types::*;
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextStack {
