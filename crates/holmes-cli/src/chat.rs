@@ -15,7 +15,8 @@ use holmes_session::memory_store::MemoryStore;
 use holmes_session::selector::Selector;
 use holmes_tools::ToolRegistry;
 use reedline::{
-    Completer, ColumnarMenu, IdeMenu, MenuBuilder, Reedline, ReedlineEvent, Signal, Span, Suggestion, ReedlineMenu, FileBackedHistory
+    default_emacs_keybindings, Completer, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers,
+    Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, MenuBuilder,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -918,9 +919,23 @@ pub async fn run_chat(
         Err(_) => Box::new(reedline::FileBackedHistory::default()),
     };
 
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+
+    let edit_mode = Box::new(Emacs::new(keybindings));
+
     let mut rl = Reedline::create()
         .with_completer(completer)
+        .with_quick_completions(true)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_edit_mode(edit_mode)
         .with_history(history);
 
     if !is_resume {
