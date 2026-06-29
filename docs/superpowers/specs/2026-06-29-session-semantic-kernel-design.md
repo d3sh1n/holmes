@@ -359,13 +359,13 @@ Mitigation: treat `ActiveToolsSet` as semantic/audit metadata. Runtime loads too
 
 Mitigation: no migration. Mark old sessions incomplete and use legacy resume or warnings.
 
-## Open Implementation Decisions
+## Fixed Implementation Decisions
 
-These are implementation choices, not product ambiguities:
+The implementation plan should follow these concrete choices:
 
-- Whether `replay_session_context` belongs first on `SessionDB` or directly on `SessionStore`.
-- Whether compaction archive files store fully serialized `StoredEvent`s or a narrower event archive DTO.
-- Whether `SessionSystemPromptSet.content` should be compressed if it becomes very large.
-- Exact wording for replay warning yields in TUI/REPL.
+- Put `replay_session_context` on `SessionStore`, with `SessionDB` as the first implementation. This keeps downstream code (`MindPalace`, harness, CLI, future tests) trait-oriented.
+- Store compaction archives as a dedicated DTO, not raw `StoredEvent`s. The DTO should include `event_index`, `event_type`, `timestamp`, and serialized `event` JSON so it is stable even if `StoredEvent` gains database-only fields later.
+- Do not compress `SessionSystemPromptSet.content` in this phase. The prompt is required for exact replay and should stay inline unless it becomes a measured storage problem.
+- Replay warnings should be surfaced through the existing runtime/UI warning path as `RuntimeYield::PlanUpdate` in interactive contexts and as log/tracing warnings in lower-level replay code.
 
-The design is complete without resolving these now; the implementation plan should choose one option for each.
+These choices remove ambiguity from the implementation plan while keeping the design focused.
