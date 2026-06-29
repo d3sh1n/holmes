@@ -434,8 +434,7 @@ async fn append_startup_metadata_events(
     parent_id: Option<String>,
     fork_point: Option<u64>,
     tags: Vec<String>,
-    tool_names: Vec<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<chrono::DateTime<Utc>> {
     let now = Utc::now();
     session_db
         .append_event(
@@ -485,13 +484,22 @@ async fn append_startup_metadata_events(
             },
         )
         .await?;
+    Ok(now)
+}
+
+async fn append_active_tools_startup_metadata_event(
+    session_db: &SessionDB,
+    id: &str,
+    tool_names: Vec<String>,
+    timestamp: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
     session_db
         .append_event(
             id,
             &Event::ActiveToolsSet {
                 tool_names,
                 source: "startup".into(),
-                timestamp: now,
+                timestamp,
             },
         )
         .await?;
@@ -501,11 +509,12 @@ async fn append_startup_metadata_events(
 async fn create_fresh_runtime_session(
     session_db: Arc<SessionDB>,
     memory_store: Arc<MemoryStore>,
+    llm: Arc<LlmClient>,
+    config: &HolmesConfig,
     mode: SessionMode,
     model: Option<String>,
     system_prompt: String,
-    tool_names: Vec<String>,
-) -> anyhow::Result<(String, RuntimeSession, MindPalace)> {
+) -> anyhow::Result<(String, RuntimeSession, MindPalace, Arc<ToolRegistry>)> {
     let session = session_db
         .create_session(CreateSessionParams {
             id: None,
@@ -520,7 +529,7 @@ async fn create_fresh_runtime_session(
         })
         .await?;
     let session_id = session.id.clone();
-    append_startup_metadata_events(
+    let startup_timestamp = append_startup_metadata_events(
         &session_db,
         &session_id,
         session.title,
@@ -530,7 +539,23 @@ async fn create_fresh_runtime_session(
         None,
         None,
         session.tags,
-        tool_names,
+    )
+    .await?;
+    let registry = Arc::new(
+        build_tool_registry(
+            config,
+            Some(session_db.clone()),
+            Some(memory_store.clone()),
+            Some(llm),
+            Some(session_id.clone()),
+        )
+        .await,
+    );
+    append_active_tools_startup_metadata_event(
+        &session_db,
+        &session_id,
+        active_tool_names(&registry),
+        startup_timestamp,
     )
     .await?;
     let mind_palace = MindPalace::new(session_db, memory_store);
@@ -538,7 +563,158 @@ async fn create_fresh_runtime_session(
         session_id.clone(),
         RuntimeSession::new(session_id, mode).with_system_prompt(&system_prompt),
         mind_palace,
+        registry,
     ))
+}
+
+pub(crate) struct ChatStartup {
+    pub(crate) ctx: ChatContext,
+    pub(crate) is_resume: bool,
+}
+
+pub(crate) async fn create_chat_context(
+    resume_id: Option<String>,
+    continue_last: bool,
+    model: Option<String>,
+    mode_str: String,
+) -> anyhow::Result<Option<ChatStartup>> {
+    let data_dir = holmes_data_dir();
+    std::fs::create_dir_all(&data_dir)?;
+
+    let config_path = data_dir.join("config.yaml");
+    let config = if config_path.exists() {
+        load_config(&config_path)?
+    } else {
+        let default_config = HolmesConfig::default();
+        let yaml = serde_yaml::to_string(&default_config)?;
+        std::fs::write(&config_path, yaml)?;
+        eprintln!("Created default config at {}", config_path.display());
+        eprintln!("Please edit it to configure your LLM provider and API key.");
+        return Ok(None);
+    };
+    let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let system_prompt = build_system_prompt(SYSTEM_PROMPT, &config, &project_dir);
+
+    let db_path = data_dir.join("holmes.db");
+    let session_db = Arc::new(SessionDB::open(&db_path).await?);
+
+    let memory_path = data_dir.join("memory.db");
+    let memory_store = Arc::new(MemoryStore::open(&memory_path).await?);
+
+    let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
+    let runtime_guards = GuardChain::from_config(&config.guards);
+    let llm = Arc::new(LlmClient::new(&config));
+    let mode = parse_mode(&mode_str);
+    let startup_model = configured_model(&config, model);
+
+    let (session_id, runtime_session, mind_palace, registry, is_resume) = if let Some(id) =
+        resume_id
+    {
+        let events = session_db.get_events(&id).await?;
+        let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
+        let mut session =
+            RuntimeSession::new(id.clone(), mode.clone()).with_system_prompt(&system_prompt);
+        for se in &events {
+            replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
+        }
+        eprintln!("↻ Resumed session {}", &id[..8.min(id.len())]);
+        let registry = Arc::new(
+            build_tool_registry(
+                &config,
+                Some(session_db.clone()),
+                Some(memory_store.clone()),
+                Some(llm.clone()),
+                Some(id.clone()),
+            )
+            .await,
+        );
+        (id, session, mp, registry, true)
+    } else if continue_last {
+        let filter = SessionFilter {
+            limit: Some(1),
+            ..Default::default()
+        };
+        let sessions = session_db.list_sessions(&filter).await?;
+        if let Some(s) = sessions.first() {
+            let events = session_db.get_events(&s.id).await?;
+            let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
+            let mut session =
+                RuntimeSession::new(s.id.clone(), mode.clone()).with_system_prompt(&system_prompt);
+            for se in &events {
+                replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
+            }
+            eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
+            let registry = Arc::new(
+                build_tool_registry(
+                    &config,
+                    Some(session_db.clone()),
+                    Some(memory_store.clone()),
+                    Some(llm.clone()),
+                    Some(s.id.clone()),
+                )
+                .await,
+            );
+            (s.id.clone(), session, mp, registry, true)
+        } else {
+            let (session_id, runtime_session, mind_palace, registry) =
+                create_fresh_runtime_session(
+                    session_db.clone(),
+                    memory_store.clone(),
+                    llm.clone(),
+                    &config,
+                    mode.clone(),
+                    startup_model.clone(),
+                    system_prompt.clone(),
+                )
+                .await?;
+            (session_id, runtime_session, mind_palace, registry, false)
+        }
+    } else {
+        let (session_id, runtime_session, mind_palace, registry) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            llm.clone(),
+            &config,
+            mode.clone(),
+            startup_model.clone(),
+            system_prompt.clone(),
+        )
+        .await?;
+        (session_id, runtime_session, mind_palace, registry, false)
+    };
+
+    let mut selector = Selector::new();
+    for wf in workflows::create_builtin_workflows(llm.clone(), registry.clone(), guards.clone()) {
+        selector.register(wf);
+    }
+
+    let mut runtime_state = RuntimeState::new(runtime_session.mode.clone());
+    if let Some(session_record) = session_db.get_session(&session_id).await? {
+        runtime_state.active_goal = session_record.goal_condition;
+    }
+
+    Ok(Some(ChatStartup {
+        ctx: ChatContext {
+            session_id,
+            session_db: session_db.clone(),
+            memory_store: memory_store.clone(),
+            llm: llm.clone(),
+            registry,
+            guards,
+            runtime_guards,
+            selector,
+            runtime_session,
+            mind_palace,
+            runtime_state,
+            queued_turns: VecDeque::new(),
+            steering_notes: Vec::new(),
+            system_prompt,
+            config,
+            data_dir,
+            command_registry: CommandRegistry::default(),
+        },
+        is_resume,
+    }))
 }
 
 async fn run_runtime_input(
@@ -874,127 +1050,10 @@ pub async fn run_chat(
     model: Option<String>,
     mode_str: String,
 ) -> anyhow::Result<()> {
-    let data_dir = holmes_data_dir();
-    std::fs::create_dir_all(&data_dir)?;
-
-    let config_path = data_dir.join("config.yaml");
-    let config = if config_path.exists() {
-        load_config(&config_path)?
-    } else {
-        let default_config = HolmesConfig::default();
-        let yaml = serde_yaml::to_string(&default_config)?;
-        std::fs::write(&config_path, yaml)?;
-        eprintln!("Created default config at {}", config_path.display());
-        eprintln!("Please edit it to configure your LLM provider and API key.");
+    let Some(ChatStartup { mut ctx, is_resume }) =
+        create_chat_context(resume_id, continue_last, model, mode_str).await?
+    else {
         return Ok(());
-    };
-    let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let system_prompt = build_system_prompt(SYSTEM_PROMPT, &config, &project_dir);
-
-    let db_path = data_dir.join("holmes.db");
-    let session_db = Arc::new(SessionDB::open(&db_path).await?);
-
-    let memory_path = data_dir.join("memory.db");
-    let memory_store = Arc::new(MemoryStore::open(&memory_path).await?);
-
-    let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
-    let runtime_guards = GuardChain::from_config(&config.guards);
-    let llm = Arc::new(LlmClient::new(&config));
-    let mode = parse_mode(&mode_str);
-    let startup_model = configured_model(&config, model.clone());
-    let initial_registry = build_tool_registry(&config, None, None, None, None).await;
-    let tool_names = active_tool_names(&initial_registry);
-
-    // Create RuntimeSession
-    let (session_id, runtime_session, mind_palace, is_resume) = if let Some(id) = resume_id {
-        let events = session_db.get_events(&id).await?;
-        let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
-        let mut session =
-            RuntimeSession::new(id.clone(), mode.clone()).with_system_prompt(&system_prompt);
-        for se in &events {
-            replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
-        }
-        eprintln!("↻ Resumed session {}", &id[..8.min(id.len())]);
-        (id, session, mp, true)
-    } else if continue_last {
-        let filter = SessionFilter {
-            limit: Some(1),
-            ..Default::default()
-        };
-        let sessions = session_db.list_sessions(&filter).await?;
-        if let Some(s) = sessions.first() {
-            let events = session_db.get_events(&s.id).await?;
-            let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
-            let mut session =
-                RuntimeSession::new(s.id.clone(), mode.clone()).with_system_prompt(&system_prompt);
-            for se in &events {
-                replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
-            }
-            eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
-            (s.id.clone(), session, mp, true)
-        } else {
-            let (session_id, runtime_session, mind_palace) = create_fresh_runtime_session(
-                session_db.clone(),
-                memory_store.clone(),
-                mode.clone(),
-                startup_model.clone(),
-                system_prompt.clone(),
-                tool_names.clone(),
-            )
-            .await?;
-            (session_id, runtime_session, mind_palace, false)
-        }
-    } else {
-        let (session_id, runtime_session, mind_palace) = create_fresh_runtime_session(
-            session_db.clone(),
-            memory_store.clone(),
-            mode.clone(),
-            startup_model.clone(),
-            system_prompt.clone(),
-            tool_names.clone(),
-        )
-        .await?;
-        (session_id, runtime_session, mind_palace, false)
-    };
-
-    let registry = Arc::new(
-        build_tool_registry(
-            &config,
-            Some(session_db.clone()),
-            Some(memory_store.clone()),
-            Some(llm.clone()),
-            Some(session_id.clone()),
-        )
-        .await,
-    );
-
-    let mut selector = Selector::new();
-    for wf in workflows::create_builtin_workflows(llm.clone(), registry.clone(), guards.clone()) {
-        selector.register(wf);
-    }
-
-    let mut runtime_state = RuntimeState::new(runtime_session.mode.clone());
-    if let Some(session_record) = session_db.get_session(&session_id).await? {
-        runtime_state.active_goal = session_record.goal_condition;
-    }
-    let mut ctx = ChatContext {
-        session_id,
-        session_db: session_db.clone(),
-        memory_store: memory_store.clone(),
-        llm: llm.clone(),
-        registry: registry.clone(),
-        guards: guards.clone(),
-        runtime_guards,
-        selector,
-        runtime_session,
-        mind_palace,
-        runtime_state,
-        queued_turns: VecDeque::new(),
-        steering_notes: Vec::new(),
-        system_prompt,
-        config,
-        data_dir: data_dir.clone(),
-        command_registry: CommandRegistry::default(),
     };
 
     // One-shot query
@@ -1042,7 +1101,7 @@ pub async fn run_chat(
 
     let completion_menu = Box::new(IdeMenu::default().with_name("completion_menu"));
 
-    let history_path = data_dir.join("history.txt");
+    let history_path = ctx.data_dir.join("history.txt");
     let history = match FileBackedHistory::with_file(1000, history_path) {
         Ok(h) => Box::new(h),
         Err(_) => Box::new(reedline::FileBackedHistory::default()),
@@ -1080,22 +1139,25 @@ pub async fn run_chat(
         left: String,
     }
     impl reedline::Prompt for SimplePrompt {
-        fn render_prompt_left(&self) -> std::borrow::Cow<str> {
+        fn render_prompt_left(&self) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed(&self.left)
         }
-        fn render_prompt_right(&self) -> std::borrow::Cow<str> {
+        fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed("")
         }
-        fn render_prompt_indicator(&self, _: reedline::PromptEditMode) -> std::borrow::Cow<str> {
+        fn render_prompt_indicator(
+            &self,
+            _: reedline::PromptEditMode,
+        ) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed("")
         }
-        fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<str> {
+        fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed("::: ")
         }
         fn render_prompt_history_search_indicator(
             &self,
             _: reedline::PromptHistorySearch,
-        ) -> std::borrow::Cow<str> {
+        ) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed("? ")
         }
     }
@@ -1131,10 +1193,11 @@ pub async fn run_chat(
             match handle_slash_command(&trimmed, &mut ctx).await {
                 SlashResult::Quit => break,
                 SlashResult::Handled => continue,
-                SlashResult::NewSession(rs, mp, new_id) => {
+                SlashResult::NewSession(rs, mp, new_id, registry) => {
                     ctx.runtime_session = rs;
                     ctx.mind_palace = mp;
                     ctx.session_id = new_id;
+                    ctx.registry = registry;
                     ctx.runtime_guards = GuardChain::from_config(&ctx.config.guards);
                     ctx.runtime_state = RuntimeState::new(ctx.runtime_session.mode.clone());
                     if let Ok(Some(session_record)) =
@@ -1242,7 +1305,7 @@ async fn run_selector_loop(
 enum SlashResult {
     Quit,
     Handled,
-    NewSession(RuntimeSession, MindPalace, String),
+    NewSession(RuntimeSession, MindPalace, String, Arc<ToolRegistry>),
     NotHandled(String),
 }
 
@@ -1263,20 +1326,20 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 .await
                 .ok();
             let model = configured_model(&ctx.config, None);
-            let tool_names = active_tool_names(&ctx.registry);
             match create_fresh_runtime_session(
                 ctx.session_db.clone(),
                 ctx.memory_store.clone(),
+                ctx.llm.clone(),
+                &ctx.config,
                 ctx.runtime_session.mode.clone(),
                 model,
                 ctx.system_prompt.clone(),
-                tool_names,
             )
             .await
             {
-                Ok((new_id, rs, mp)) => {
+                Ok((new_id, rs, mp, registry)) => {
                     println!("Started new session: {}", &new_id[..8.min(new_id.len())]);
-                    return SlashResult::NewSession(rs, mp, new_id);
+                    return SlashResult::NewSession(rs, mp, new_id, registry);
                 }
                 Err(error) => eprintln!("Error: {}", error),
             }
@@ -1328,7 +1391,17 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                             &s.id[..8.min(s.id.len())],
                             s.title.as_deref().unwrap_or("untitled"),
                         );
-                        return SlashResult::NewSession(rs, mp, s.id.clone());
+                        let registry = Arc::new(
+                            build_tool_registry(
+                                &ctx.config,
+                                Some(ctx.session_db.clone()),
+                                Some(ctx.memory_store.clone()),
+                                Some(ctx.llm.clone()),
+                                Some(s.id.clone()),
+                            )
+                            .await,
+                        );
+                        return SlashResult::NewSession(rs, mp, s.id.clone(), registry);
                     }
                     println!("Session not found: {}", args);
                 }
@@ -2031,22 +2104,30 @@ mod tests {
     async fn create_fresh_runtime_session_writes_semantic_complete_startup_metadata() {
         let session_db = Arc::new(SessionDB::open(":memory:").await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(":memory:").await.unwrap());
+        let config = HolmesConfig::default();
+        let llm = Arc::new(LlmClient::new(&config));
         let system_prompt = "semantic startup prompt".to_string();
-        let tool_names = vec!["bash".to_string(), "read".to_string()];
 
-        let (session_id, runtime_session, _mind_palace) = create_fresh_runtime_session(
+        let (session_id, runtime_session, _mind_palace, registry) = create_fresh_runtime_session(
             session_db.clone(),
             memory_store,
+            llm,
+            &config,
             SessionMode::SecurityResearch,
             Some("startup-model".into()),
             system_prompt.clone(),
-            tool_names.clone(),
         )
         .await
         .unwrap();
 
         assert_eq!(runtime_session.id, session_id);
         assert_eq!(runtime_session.mode, SessionMode::SecurityResearch);
+
+        let actual_tool_names = active_tool_names(&registry);
+        assert!(
+            actual_tool_names.contains(&"spawn_subagent".to_string()),
+            "fresh runtime registry should include session-bound subagent tool: {actual_tool_names:?}"
+        );
 
         let replayed = session_db
             .replay_session_context(&session_id)
@@ -2058,7 +2139,62 @@ mod tests {
             Some(system_prompt.as_str())
         );
         assert_eq!(replayed.model.as_deref(), Some("startup-model"));
-        assert_eq!(replayed.active_tools, tool_names);
+        assert_eq!(replayed.active_tools, actual_tool_names);
+    }
+
+    #[tokio::test]
+    async fn slash_new_writes_active_tools_from_new_runtime_registry() {
+        let session_db = Arc::new(SessionDB::open(":memory:").await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(":memory:").await.unwrap());
+        let config = HolmesConfig::default();
+        let llm = Arc::new(LlmClient::new(&config));
+        let system_prompt = "semantic startup prompt".to_string();
+        let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
+
+        let (session_id, runtime_session, mind_palace, registry) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            llm.clone(),
+            &config,
+            SessionMode::Pentest,
+            Some("startup-model".into()),
+            system_prompt.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut ctx = ChatContext {
+            session_id,
+            session_db: session_db.clone(),
+            memory_store: memory_store.clone(),
+            llm: llm.clone(),
+            registry,
+            guards,
+            runtime_guards: GuardChain::from_config(&config.guards),
+            selector: Selector::new(),
+            runtime_session,
+            mind_palace,
+            runtime_state: RuntimeState::new(SessionMode::Pentest),
+            queued_turns: VecDeque::new(),
+            steering_notes: Vec::new(),
+            system_prompt,
+            config,
+            data_dir: PathBuf::from("."),
+            command_registry: CommandRegistry::default(),
+        };
+
+        let SlashResult::NewSession(new_runtime_session, _new_mind_palace, new_id, new_registry) =
+            handle_slash_command("/new", &mut ctx).await
+        else {
+            panic!("/new should create a new session");
+        };
+
+        assert_eq!(new_runtime_session.id, new_id);
+        let actual_tool_names = active_tool_names(&new_registry);
+        assert!(actual_tool_names.contains(&"spawn_subagent".to_string()));
+        let replayed = session_db.replay_session_context(&new_id).await.unwrap();
+        assert!(replayed.semantic_complete, "{:?}", replayed.warnings);
+        assert_eq!(replayed.active_tools, actual_tool_names);
     }
 
     #[test]

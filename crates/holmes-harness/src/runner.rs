@@ -15,7 +15,6 @@ use holmes_runtime::{RuntimeSink, RuntimeYield, StreamEvent};
 use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
 use holmes_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::llm::ScriptedLlmBackend;
 use crate::scenario::{
@@ -40,6 +39,36 @@ fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
     names
 }
 
+fn deterministic_startup_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .expect("valid deterministic harness timestamp")
+        .with_timezone(&chrono::Utc)
+}
+
+fn deterministic_session_id(scenario: &HarnessScenario) -> String {
+    let sanitized = scenario
+        .name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if sanitized.is_empty() {
+        "harness-scenario".into()
+    } else {
+        format!("harness-{sanitized}")
+    }
+}
+
 async fn append_harness_startup_metadata(
     session_db: &SessionDB,
     session_id: &str,
@@ -49,8 +78,9 @@ async fn append_harness_startup_metadata(
     system_prompt: String,
     tags: Vec<String>,
     tool_names: Vec<String>,
+    startup_time: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let now = chrono::Utc::now();
+    let now = startup_time;
     let events = [
         Event::SessionCreated {
             id: session_id.to_string(),
@@ -102,7 +132,8 @@ impl HarnessRunner {
 
     pub async fn run(&self, scenario: HarnessScenario) -> Result<HarnessReport> {
         let session_mode = scenario.mode();
-        let session_id = Uuid::new_v4().to_string();
+        let startup_time = deterministic_startup_time();
+        let session_id = deterministic_session_id(&scenario);
         let session_db = Arc::new(SessionDB::open(":memory:").await?);
         let memory_store = Arc::new(MemoryStore::open(":memory:").await?);
         let system_prompt = format!(
@@ -136,6 +167,7 @@ impl HarnessRunner {
             system_prompt.clone(),
             tags,
             active_tool_names(&tools),
+            startup_time,
         )
         .await?;
 

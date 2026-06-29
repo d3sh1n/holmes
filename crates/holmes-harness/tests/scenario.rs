@@ -66,6 +66,56 @@ expectations:
 }
 
 #[tokio::test]
+async fn startup_metadata_is_deterministic() {
+    let scenario: HarnessScenario = serde_yaml::from_str(
+        r#"
+name: Deterministic Name!
+turns:
+  - input: hello
+scripted_responses:
+  - content: '<holmes_decision>{"type":"answer","message":"ok"}</holmes_decision>'
+expectations:
+  final_contains: [ok]
+  max_errors: 0
+"#,
+    )
+    .expect("parse scenario");
+
+    let report = HarnessRunner::new()
+        .run(scenario)
+        .await
+        .expect("run scenario");
+
+    assert!(report.success, "{:#?}", report.failed_expectations);
+    assert_eq!(report.session_id, "harness-deterministic-name");
+
+    let expected_timestamp = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let created = report
+        .events
+        .iter()
+        .find_map(|event| match &event.event {
+            Event::SessionCreated { id, created_at, .. } => Some((id, created_at)),
+            _ => None,
+        })
+        .expect("session_created event");
+    assert_eq!(created.0, "harness-deterministic-name");
+    assert_eq!(*created.1, expected_timestamp);
+
+    let prompt_timestamp = report
+        .events
+        .iter()
+        .find_map(|event| match &event.event {
+            Event::SessionSystemPromptSet { timestamp, .. } => Some(timestamp),
+            _ => None,
+        })
+        .expect("session_system_prompt_set event");
+    assert_eq!(*prompt_timestamp, expected_timestamp);
+}
+
+#[tokio::test]
 async fn runs_long_compression_scenario() {
     let scenario_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/long-compression.yaml");
