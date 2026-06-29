@@ -1,7 +1,7 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::types::*;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -273,6 +273,7 @@ impl SessionDB {
         &self,
         session_id: &str,
     ) -> Result<std::path::PathBuf, SessionError> {
+        validate_session_id_for_path(session_id)?;
         let path = self.sessions_dir.join(session_id);
         tokio::fs::create_dir_all(&path).await?;
         Ok(path)
@@ -299,8 +300,46 @@ impl SessionDB {
         &self,
         path: &str,
     ) -> Result<CompactionArchive, SessionError> {
+        self.validate_archive_path(path).await?;
         let content = tokio::fs::read_to_string(path).await?;
         Ok(serde_json::from_str(&content)?)
+    }
+
+    async fn validate_archive_path(&self, path: &str) -> Result<PathBuf, SessionError> {
+        let requested = Path::new(path);
+        let canonical_sessions_dir = canonicalize_existing_or_parent(&self.sessions_dir).await?;
+
+        let canonical_requested = match tokio::fs::canonicalize(requested).await {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = requested.parent().ok_or_else(|| {
+                    SessionError::Other(format!(
+                        "compaction archive path '{}' has no parent directory",
+                        path
+                    ))
+                })?;
+                let canonical_parent = tokio::fs::canonicalize(parent).await?;
+                if !canonical_parent.starts_with(&canonical_sessions_dir) {
+                    return Err(SessionError::Other(format!(
+                        "compaction archive path '{}' is outside sessions directory '{}'",
+                        path,
+                        canonical_sessions_dir.display()
+                    )));
+                }
+                return Ok(requested.to_path_buf());
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        if !canonical_requested.starts_with(&canonical_sessions_dir) {
+            return Err(SessionError::Other(format!(
+                "compaction archive path '{}' is outside sessions directory '{}'",
+                path,
+                canonical_sessions_dir.display()
+            )));
+        }
+
+        Ok(canonical_requested)
     }
 
     pub async fn list_sessions(
@@ -930,9 +969,59 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("session not found: {0}")]
     NotFound(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 // === Helper functions ===
+
+fn validate_session_id_for_path(session_id: &str) -> Result<(), SessionError> {
+    if session_id.is_empty() {
+        return Err(SessionError::Other(
+            "invalid session id: cannot be empty".into(),
+        ));
+    }
+
+    let path = Path::new(session_id);
+    if path.is_absolute() {
+        return Err(SessionError::Other(format!(
+            "invalid session id '{}': absolute paths are not allowed",
+            session_id
+        )));
+    }
+
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == session_id => Ok(()),
+        _ => Err(SessionError::Other(format!(
+            "invalid session id '{}': must be a single path component without separators or '..'",
+            session_id
+        ))),
+    }
+}
+
+async fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, SessionError> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                SessionError::Other(format!(
+                    "path '{}' has no parent directory to canonicalize",
+                    path.display()
+                ))
+            })?;
+            let canonical_parent = tokio::fs::canonicalize(parent).await?;
+            let file_name = path.file_name().ok_or_else(|| {
+                SessionError::Other(format!(
+                    "path '{}' has no final component to canonicalize",
+                    path.display()
+                ))
+            })?;
+            Ok(canonical_parent.join(file_name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Parse an event_data JSON blob back into an `Event`.
 ///
