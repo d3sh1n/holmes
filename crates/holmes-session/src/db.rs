@@ -1,22 +1,29 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::types::*;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::compaction_archive::CompactionArchive;
 use crate::schema;
 use crate::write_contention::WriteContention;
 
 pub struct SessionDB {
     conn: Arc<Mutex<Connection>>,
+    sessions_dir: PathBuf,
     write_contention: WriteContention,
     write_count: Arc<Mutex<u64>>,
 }
 
 impl SessionDB {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
+        let sessions_dir = path
+            .parent()
+            .map(|parent| parent.join("sessions"))
+            .unwrap_or_else(|| PathBuf::from("sessions"));
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON;",
         )?;
@@ -46,6 +53,7 @@ impl SessionDB {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            sessions_dir,
             write_contention: WriteContention::new(),
             write_count: Arc::new(Mutex::new(0)),
         })
@@ -105,6 +113,10 @@ impl SessionDB {
                 Ok::<_, rusqlite::Error>(())
             }
         }).await?;
+
+        let session_dir = self.sessions_dir.join(&id);
+        std::fs::create_dir_all(session_dir.join("tool-results")).ok();
+        std::fs::create_dir_all(session_dir.join("compactions")).ok();
 
         Ok(Session {
             id,
@@ -255,6 +267,40 @@ impl SessionDB {
             events.push(row?);
         }
         Ok(events)
+    }
+
+    pub async fn session_workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<std::path::PathBuf, SessionError> {
+        let path = self.sessions_dir.join(session_id);
+        tokio::fs::create_dir_all(&path).await?;
+        Ok(path)
+    }
+
+    pub async fn write_compaction_archive(
+        &self,
+        session_id: &str,
+        compaction_event_index: u64,
+        archive: &CompactionArchive,
+    ) -> Result<String, SessionError> {
+        let dir = self
+            .session_workspace(session_id)
+            .await?
+            .join("compactions");
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("compaction_{compaction_event_index}.json"));
+        let content = serde_json::to_string_pretty(archive)?;
+        tokio::fs::write(&path, content).await?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    pub async fn read_compaction_archive(
+        &self,
+        path: &str,
+    ) -> Result<CompactionArchive, SessionError> {
+        let content = tokio::fs::read_to_string(path).await?;
+        Ok(serde_json::from_str(&content)?)
     }
 
     pub async fn list_sessions(
@@ -880,6 +926,8 @@ pub enum SessionError {
     Database(#[from] rusqlite::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("session not found: {0}")]
     NotFound(String),
 }
