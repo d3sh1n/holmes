@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chrono::Utc;
 use holmes_core::config::{ApiFormat, Config, HolmesConfig};
 use holmes_core::event::{Event, ReportGenerator, ReportType, StoredEvent};
 use holmes_core::session::RuntimeSession;
@@ -132,7 +133,7 @@ fn replay_event_into_runtime(
                 .messages
                 .push(Message::tool_result(call_id, name, content));
         }
-        Event::SessionModeSet { mode } => {
+        Event::SessionModeSet { mode, .. } => {
             session.mode = mode;
         }
         _ => {}
@@ -1623,6 +1624,8 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 let new_mode = parse_mode(args);
                 let event = Event::SessionModeSet {
                     mode: new_mode.clone(),
+                    source: Some("slash_command".into()),
+                    timestamp: Some(Utc::now()),
                 };
                 if let Err(error) = ctx.session_db.append_event(&ctx.session_id, &event).await {
                     eprintln!("Error: {}", error);

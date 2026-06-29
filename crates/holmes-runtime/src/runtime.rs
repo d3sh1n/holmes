@@ -416,6 +416,12 @@ impl AgentRuntime {
                 summary: result.summary.clone(),
                 preserved_keys: result.preserved_keys.clone(),
                 method: result.method.clone(),
+                preserved_head: None,
+                preserved_tail_tokens: None,
+                archive_path: None,
+                archived_event_range: None,
+                trigger: None,
+                timestamp: Some(Utc::now()),
             },
         )
         .await?;
