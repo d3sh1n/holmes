@@ -1,6 +1,8 @@
-use holmes_core::event::Event;
+use holmes_core::event::{Event, StoredEvent};
 use holmes_core::types::*;
+use holmes_core::{CompactionTrigger, CompressionMethod, Role, SummaryMethod};
 use holmes_session::db::*;
+use holmes_session::replay_events;
 use std::path::{Component, Path};
 
 #[tokio::test]
@@ -275,4 +277,240 @@ async fn replay_legacy_session_reports_incomplete() {
     let replayed = db.replay_session_context(&session.id).await.unwrap();
     assert!(!replayed.semantic_complete);
     assert_eq!(replayed.session.messages.len(), 1);
+}
+
+fn stored_event(event_index: u64, event: Event) -> StoredEvent {
+    StoredEvent {
+        id: event_index,
+        session_id: "replay_test".into(),
+        event_index,
+        turn_index: None,
+        timestamp: chrono::Utc::now(),
+        event,
+    }
+}
+
+fn session_created_with_prompt(prompt: &str) -> Event {
+    Event::SessionCreated {
+        id: "replay_test".into(),
+        title: Some("replay".into()),
+        mode: SessionMode::Pentest,
+        model: Some("claude-opus-4-8".into()),
+        system_prompt: Some(prompt.into()),
+        parent_id: None,
+        fork_point: None,
+        created_at: chrono::Utc::now(),
+        tags: vec![],
+    }
+}
+
+#[test]
+fn replay_branch_summary_keeps_primary_prompt_as_only_system_message() {
+    let now = chrono::Utc::now();
+    let replayed = replay_events(
+        "replay_test",
+        &[
+            stored_event(0, session_created_with_prompt("real Holmes prompt")),
+            stored_event(
+                1,
+                Event::SessionSystemPromptSet {
+                    prompt_hash: "hash".into(),
+                    content: "real Holmes prompt".into(),
+                    source: "test".into(),
+                    timestamp: now,
+                },
+            ),
+            stored_event(
+                2,
+                Event::BranchSummary {
+                    from_event_index: 0,
+                    to_event_index: 1,
+                    summary: "branch-only context".into(),
+                    reason: "fork".into(),
+                    method: SummaryMethod::StaticFallback,
+                    timestamp: now,
+                },
+            ),
+        ],
+    );
+
+    let messages = &replayed.session.messages;
+    assert_eq!(messages.first().map(|m| &m.role), Some(&Role::System));
+    assert_eq!(
+        messages.first().and_then(|m| m.content.as_deref()),
+        Some("real Holmes prompt")
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .count(),
+        1
+    );
+    let branch_summary = messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("branch-only context"))
+        })
+        .expect("branch summary should be replayed");
+    assert_ne!(branch_summary.role, Role::System);
+}
+
+#[test]
+fn replay_compaction_summary_replaces_archived_context_range() {
+    let now = chrono::Utc::now();
+    let replayed = replay_events(
+        "replay_test",
+        &[
+            stored_event(0, session_created_with_prompt("system prompt")),
+            stored_event(
+                1,
+                Event::SessionSystemPromptSet {
+                    prompt_hash: "hash".into(),
+                    content: "system prompt".into(),
+                    source: "test".into(),
+                    timestamp: now,
+                },
+            ),
+            stored_event(
+                2,
+                Event::UserMessage {
+                    content: "A".into(),
+                    timestamp: now,
+                },
+            ),
+            stored_event(
+                3,
+                Event::Thinking {
+                    content: "B".into(),
+                    reasoning_type: None,
+                },
+            ),
+            stored_event(
+                4,
+                Event::CompressionApplied {
+                    before_count: 2,
+                    after_count: 1,
+                    summary: "compacted A and B".into(),
+                    preserved_keys: vec![],
+                    method: CompressionMethod::StaticFallback,
+                    preserved_head: None,
+                    preserved_tail_tokens: None,
+                    archive_path: Some("sessions/replay_test/compactions/compaction_4.json".into()),
+                    archived_event_range: Some((2, 3)),
+                    trigger: Some(CompactionTrigger::Manual),
+                    timestamp: Some(now),
+                },
+            ),
+            stored_event(
+                5,
+                Event::UserMessage {
+                    content: "C".into(),
+                    timestamp: now,
+                },
+            ),
+        ],
+    );
+
+    let messages = &replayed.session.messages;
+    assert_eq!(messages.first().map(|m| &m.role), Some(&Role::System));
+    assert_eq!(
+        messages.first().and_then(|m| m.content.as_deref()),
+        Some("system prompt")
+    );
+    let contents = messages
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>();
+    assert!(contents
+        .iter()
+        .any(|content| content.contains("[Compaction summary]\ncompacted A and B")));
+    assert!(contents.iter().any(|content| *content == "C"));
+    assert!(!contents.iter().any(|content| *content == "A"));
+    assert!(!contents.iter().any(|content| *content == "B"));
+}
+
+#[test]
+fn replay_tool_call_followed_by_result_uses_matching_tool_result_id() {
+    let replayed = replay_events(
+        "replay_test",
+        &[
+            stored_event(
+                0,
+                Event::ToolCall {
+                    name: "http_request".into(),
+                    arguments: serde_json::json!({"url": "https://example.com"}),
+                    purpose: Some("fetch".into()),
+                },
+            ),
+            stored_event(
+                1,
+                Event::ToolResult {
+                    name: "http_request".into(),
+                    success: true,
+                    content: "ok".into(),
+                    error: None,
+                    artifacts: vec![],
+                },
+            ),
+        ],
+    );
+
+    assert_eq!(replayed.session.messages.len(), 2);
+    let assistant = &replayed.session.messages[0];
+    assert_eq!(assistant.role, Role::Assistant);
+    let tool_call = assistant
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| calls.first())
+        .expect("tool call should replay as assistant tool call");
+    assert_eq!(tool_call.function.name, "http_request");
+    assert_eq!(
+        tool_call.function.arguments,
+        r#"{"url":"https://example.com"}"#
+    );
+
+    let result = &replayed.session.messages[1];
+    assert_eq!(result.role, Role::Tool);
+    assert_eq!(result.tool_call_id.as_deref(), Some(tool_call.id.as_str()));
+    assert_eq!(result.name.as_deref(), Some("http_request"));
+    assert_eq!(result.content.as_deref(), Some("ok"));
+}
+
+#[test]
+fn replay_orphan_tool_result_becomes_non_tool_historical_context() {
+    let replayed = replay_events(
+        "replay_test",
+        &[stored_event(
+            0,
+            Event::ToolResult {
+                name: "http_request".into(),
+                success: false,
+                content: "orphan output".into(),
+                error: Some("failed".into()),
+                artifacts: vec![],
+            },
+        )],
+    );
+
+    assert!(replayed
+        .session
+        .messages
+        .iter()
+        .all(|message| message.role != Role::Tool));
+    let context = replayed
+        .session
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("orphan output"))
+        })
+        .expect("orphan tool result should be preserved as text context");
+    assert_ne!(context.role, Role::System);
 }

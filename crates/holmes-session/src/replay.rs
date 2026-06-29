@@ -1,6 +1,6 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::session::{RuntimeSession, SessionLineage};
-use holmes_core::{Message, SessionMode, TokenDelta};
+use holmes_core::{FunctionCall, Message, SessionMode, TokenDelta, ToolCall};
 use serde::{Deserialize, Serialize};
 
 use crate::ArchivedEventRange;
@@ -17,12 +17,49 @@ pub struct ReplayedSessionContext {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ReplayMessage {
+    message: Message,
+    origin_event_index: Option<u64>,
+}
+
+impl ReplayMessage {
+    fn new(message: Message, origin_event_index: impl Into<Option<u64>>) -> Self {
+        Self {
+            message,
+            origin_event_index: origin_event_index.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionReplayMarker {
     pub event_index: u64,
     pub summary: String,
     pub archive_path: Option<String>,
     pub archived_event_range: Option<ArchivedEventRange>,
+}
+fn replace_archived_messages_with_summary(
+    messages: &mut Vec<ReplayMessage>,
+    range: ArchivedEventRange,
+    summary_message: ReplayMessage,
+) {
+    let first_archived_position = messages.iter().position(|message| {
+        message
+            .origin_event_index
+            .is_some_and(|event_index| event_index >= range.start && event_index <= range.end)
+    });
+
+    messages.retain(|message| {
+        !message
+            .origin_event_index
+            .is_some_and(|event_index| event_index >= range.start && event_index <= range.end)
+    });
+
+    let insert_position = first_archived_position
+        .unwrap_or(messages.len())
+        .min(messages.len());
+    messages.insert(insert_position, summary_message);
 }
 
 pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessionContext {
@@ -38,10 +75,11 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
         .unwrap_or_else(chrono::Utc::now);
 
     let mut active_tools = Vec::new();
-    let mut messages = Vec::new();
+    let mut messages: Vec<ReplayMessage> = Vec::new();
     let mut compactions = Vec::new();
     let mut branch_summaries = Vec::new();
     let mut warnings = Vec::new();
+    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
 
     let mut saw_session_created = false;
     let mut saw_system_prompt = false;
@@ -92,7 +130,10 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
             }
             Event::BranchSummary { summary, .. } => {
                 branch_summaries.push(summary.clone());
-                messages.push(Message::system(format!("[Branch summary]\n{summary}")));
+                messages.push(ReplayMessage::new(
+                    Message::user(format!("[Branch summary]\n{summary}")),
+                    stored.event_index,
+                ));
             }
             Event::CompressionApplied {
                 summary,
@@ -100,33 +141,83 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
                 archived_event_range,
                 ..
             } => {
+                let archived_event_range =
+                    archived_event_range.map(|(start, end)| ArchivedEventRange { start, end });
                 compactions.push(CompactionReplayMarker {
                     event_index: stored.event_index,
                     summary: summary.clone(),
                     archive_path: archive_path.clone(),
-                    archived_event_range: archived_event_range
-                        .map(|(start, end)| ArchivedEventRange { start, end }),
+                    archived_event_range,
                 });
-                messages.push(Message::assistant(format!(
-                    "[Compaction summary]\n{summary}"
-                )));
+
+                let summary_message = ReplayMessage::new(
+                    Message::assistant(format!("[Compaction summary]\n{summary}")),
+                    stored.event_index,
+                );
+                if let Some(range) = archived_event_range {
+                    replace_archived_messages_with_summary(&mut messages, range, summary_message);
+                } else {
+                    warnings.push(format!(
+                        "compression_applied event {} missing archived_event_range; appending compaction summary",
+                        stored.event_index
+                    ));
+                    messages.push(summary_message);
+                }
             }
-            Event::UserMessage { content, .. } => messages.push(Message::user(content.clone())),
-            Event::Thinking { content, .. } => messages.push(Message::assistant(content.clone())),
-            Event::ToolResult { name, content, .. } => messages.push(Message::tool_result(
-                format!("replay-tool-call-{}", stored.event_index),
-                name.clone(),
-                content.clone(),
+            Event::UserMessage { content, .. } => messages.push(ReplayMessage::new(
+                Message::user(content.clone()),
+                stored.event_index,
             )),
-            Event::ToolCall { .. } => {}
+            Event::Thinking { content, .. } => messages.push(ReplayMessage::new(
+                Message::assistant(content.clone()),
+                stored.event_index,
+            )),
+            Event::ToolCall {
+                name, arguments, ..
+            } => {
+                let tool_call = ToolCall {
+                    id: format!("replay-tool-call-{}", stored.event_index),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: name.clone(),
+                        arguments: arguments.to_string(),
+                    },
+                };
+                pending_tool_calls.push(tool_call.clone());
+                messages.push(ReplayMessage::new(
+                    Message::assistant_with_tool_calls(vec![tool_call]),
+                    stored.event_index,
+                ));
+            }
+            Event::ToolResult { name, content, .. } => {
+                if let Some(position) = pending_tool_calls
+                    .iter()
+                    .position(|call| call.function.name == *name)
+                {
+                    let tool_call = pending_tool_calls.remove(position);
+                    messages.push(ReplayMessage::new(
+                        Message::tool_result(tool_call.id, name.clone(), content.clone()),
+                        stored.event_index,
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "tool_result event {} for '{}' has no preceding tool_call; replaying as text context",
+                        stored.event_index, name
+                    ));
+                    messages.push(ReplayMessage::new(
+                        Message::user(format!("[Tool result: {name}]\n{content}")),
+                        stored.event_index,
+                    ));
+                }
+            }
             _ => {}
         }
     }
 
     if let Some(prompt) = &system_prompt {
-        if !matches!(messages.first(), Some(message) if message.role == holmes_core::Role::System && message.content.as_deref() == Some(prompt.as_str()))
+        if !matches!(messages.first(), Some(replay_message) if replay_message.message.role == holmes_core::Role::System && replay_message.message.content.as_deref() == Some(prompt.as_str()))
         {
-            messages.insert(0, Message::system(prompt.clone()));
+            messages.insert(0, ReplayMessage::new(Message::system(prompt.clone()), None));
         }
     }
 
@@ -147,6 +238,11 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
     if !saw_active_tools {
         warnings.push("active_tools_set event missing; replayed context may be incomplete".into());
     }
+
+    let messages = messages
+        .into_iter()
+        .map(|replay_message| replay_message.message)
+        .collect();
 
     let session = RuntimeSession {
         id: session_id.to_string(),
