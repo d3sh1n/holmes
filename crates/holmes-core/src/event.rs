@@ -621,6 +621,10 @@ impl Event {
             Event::ActiveToolsSet {
                 tool_names, source, ..
             } => format!("active_tools source={} {}", source, tool_names.join(" ")),
+            Event::SessionModeSet { mode, source, .. } => match source {
+                Some(source) => format!("session_mode source={} {:?}", source, mode),
+                None => format!("session_mode {:?}", mode),
+            },
             Event::BranchSummary {
                 summary, reason, ..
             } => format!("branch_summary reason={} {}", reason, summary),
@@ -757,6 +761,11 @@ mod tests {
     fn semantic_events_have_text_and_categories() {
         let now = Utc::now();
         let events = vec![
+            Event::SessionModeSet {
+                mode: SessionMode::SecurityResearch,
+                source: Some("startup".into()),
+                timestamp: Some(now),
+            },
             Event::SessionSystemPromptSet {
                 prompt_hash: "hash123".into(),
                 content: "system prompt content".into(),
@@ -798,15 +807,20 @@ mod tests {
         ];
 
         assert_eq!(events[0].category(), "session");
-        assert!(events[0].content_text().contains("system prompt content"));
+        assert!(
+            events[0].content_text().contains("SecurityResearch")
+                || events[0].content_text().contains("security_research")
+        );
         assert_eq!(events[1].category(), "session");
-        assert!(events[1].content_text().contains("claude-sonnet-4-6"));
+        assert!(events[1].content_text().contains("system prompt content"));
         assert_eq!(events[2].category(), "session");
-        assert!(events[2].content_text().contains("http_request"));
-        assert_eq!(events[3].category(), "context");
-        assert!(events[3].content_text().contains("idor evidence"));
+        assert!(events[2].content_text().contains("claude-sonnet-4-6"));
+        assert_eq!(events[3].category(), "session");
+        assert!(events[3].content_text().contains("http_request"));
         assert_eq!(events[4].category(), "context");
-        assert!(events[4].content_text().contains("auth investigation"));
+        assert!(events[4].content_text().contains("idor evidence"));
+        assert_eq!(events[5].category(), "context");
+        assert!(events[5].content_text().contains("auth investigation"));
 
         for event in events {
             let encoded = serde_json::to_string(&event).expect("serialize event");
