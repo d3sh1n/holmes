@@ -4,6 +4,7 @@ use holmes_core::types::*;
 
 use crate::compaction_archive::CompactionArchive;
 use crate::db::{CreateSessionParams, SearchResult, SessionDB, SessionError};
+use crate::replay::ReplayedSessionContext;
 
 #[async_trait(?Send)]
 pub trait SessionStore {
@@ -12,6 +13,11 @@ pub trait SessionStore {
     async fn append_event(&self, session_id: &str, event: &Event) -> Result<u64, SessionError>;
 
     async fn get_events(&self, session_id: &str) -> Result<Vec<StoredEvent>, SessionError>;
+
+    async fn replay_session_context(
+        &self,
+        session_id: &str,
+    ) -> Result<ReplayedSessionContext, SessionError>;
 
     async fn session_workspace(&self, session_id: &str)
         -> Result<std::path::PathBuf, SessionError>;
@@ -80,6 +86,13 @@ impl SessionStore for SessionDB {
 
     async fn get_events(&self, session_id: &str) -> Result<Vec<StoredEvent>, SessionError> {
         SessionDB::get_events(self, session_id).await
+    }
+
+    async fn replay_session_context(
+        &self,
+        session_id: &str,
+    ) -> Result<ReplayedSessionContext, SessionError> {
+        SessionDB::replay_session_context(self, session_id).await
     }
 
     async fn session_workspace(

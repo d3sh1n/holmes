@@ -139,3 +139,140 @@ async fn rejects_invalid_session_workspace_ids() {
     let error = db.session_workspace("").await.unwrap_err();
     assert!(error.to_string().contains("invalid session id"));
 }
+#[tokio::test]
+async fn replay_complete_semantic_session_restores_metadata_and_messages() {
+    let db = SessionDB::open(":memory:").await.unwrap();
+    let session = db
+        .create_session(CreateSessionParams {
+            id: Some("semantic_session".into()),
+            title: Some("semantic".into()),
+            mode: Some(SessionMode::Pentest),
+            model: Some("claude-sonnet-4-6".into()),
+            system_prompt: Some("old table prompt".into()),
+            parent_session_id: None,
+            fork_point: None,
+            source: Some("test".into()),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+
+    db.append_event(
+        &session.id,
+        &Event::SessionCreated {
+            id: session.id.clone(),
+            title: session.title.clone(),
+            mode: SessionMode::Pentest,
+            model: Some("claude-sonnet-4-6".into()),
+            system_prompt: Some("semantic prompt".into()),
+            parent_id: None,
+            fork_point: None,
+            created_at: now,
+            tags: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    db.append_event(
+        &session.id,
+        &Event::SessionSystemPromptSet {
+            prompt_hash: "hash-semantic".into(),
+            content: "semantic prompt".into(),
+            source: "startup".into(),
+            timestamp: now,
+        },
+    )
+    .await
+    .unwrap();
+    db.append_event(
+        &session.id,
+        &Event::SessionModeSet {
+            mode: SessionMode::SecurityResearch,
+            source: Some("startup".into()),
+            timestamp: Some(now),
+        },
+    )
+    .await
+    .unwrap();
+    db.append_event(
+        &session.id,
+        &Event::SessionModelSet {
+            model: "claude-opus-4-8".into(),
+            provider: Some("default".into()),
+            source: "startup".into(),
+            timestamp: now,
+        },
+    )
+    .await
+    .unwrap();
+    db.append_event(
+        &session.id,
+        &Event::ActiveToolsSet {
+            tool_names: vec!["http_request".into(), "report_finding".into()],
+            source: "startup".into(),
+            timestamp: now,
+        },
+    )
+    .await
+    .unwrap();
+    db.append_event(
+        &session.id,
+        &Event::UserMessage {
+            content: "hello".into(),
+            timestamp: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let replayed = db.replay_session_context(&session.id).await.unwrap();
+    assert!(replayed.semantic_complete);
+    assert_eq!(replayed.system_prompt.as_deref(), Some("semantic prompt"));
+    assert_eq!(replayed.model.as_deref(), Some("claude-opus-4-8"));
+    assert_eq!(
+        replayed.active_tools,
+        vec!["http_request", "report_finding"]
+    );
+    assert_eq!(replayed.session.mode, SessionMode::SecurityResearch);
+    assert_eq!(
+        replayed.session.messages[0].content.as_deref(),
+        Some("semantic prompt")
+    );
+    assert_eq!(
+        replayed.session.messages.last().unwrap().content.as_deref(),
+        Some("hello")
+    );
+}
+
+#[tokio::test]
+async fn replay_legacy_session_reports_incomplete() {
+    let db = SessionDB::open(":memory:").await.unwrap();
+    let session = db
+        .create_session(CreateSessionParams {
+            id: Some("legacy_session".into()),
+            title: Some("legacy".into()),
+            mode: Some(SessionMode::Pentest),
+            model: None,
+            system_prompt: None,
+            parent_session_id: None,
+            fork_point: None,
+            source: Some("test".into()),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    db.append_event(
+        &session.id,
+        &Event::UserMessage {
+            content: "legacy hello".into(),
+            timestamp: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let replayed = db.replay_session_context(&session.id).await.unwrap();
+    assert!(!replayed.semantic_complete);
+    assert_eq!(replayed.session.messages.len(), 1);
+}

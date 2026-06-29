@@ -269,6 +269,14 @@ impl SessionDB {
         Ok(events)
     }
 
+    pub async fn replay_session_context(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::ReplayedSessionContext, SessionError> {
+        let events = self.get_events(session_id).await?;
+        Ok(crate::replay::replay_events(session_id, &events))
+    }
+
     pub async fn session_workspace(
         &self,
         session_id: &str,
