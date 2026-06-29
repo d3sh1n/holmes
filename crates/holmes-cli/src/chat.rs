@@ -17,7 +17,7 @@ use holmes_session::selector::Selector;
 use holmes_tools::ToolRegistry;
 use reedline::{
     default_emacs_keybindings, Completer, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers,
-    Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, MenuBuilder,
+    MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -96,8 +96,10 @@ async fn build_tool_registry(
     session_id: Option<String>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    
-    let runner = if let (Some(db), Some(ms), Some(l), Some(sid)) = (session_db, memory_store, llm, session_id) {
+
+    let runner = if let (Some(db), Some(ms), Some(l), Some(sid)) =
+        (session_db, memory_store, llm, session_id)
+    {
         Some(std::sync::Arc::new(crate::subagent::CliSubagentRunner {
             session_db: db,
             memory_store: ms,
@@ -389,6 +391,154 @@ fn indent_block(content: &str) -> String {
         .map(|line| format!("    {}", line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn prompt_hash(prompt: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn configured_model(config: &HolmesConfig, override_model: Option<String>) -> Option<String> {
+    override_model.or_else(|| {
+        let role = &config.llm.roles.attack_agent;
+        config
+            .llm
+            .providers
+            .iter()
+            .find(|provider| &provider.name == role)
+            .or_else(|| config.llm.providers.first())
+            .map(|provider| provider.model.clone())
+    })
+}
+
+fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
+    let mut names = registry
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+async fn append_startup_metadata_events(
+    session_db: &SessionDB,
+    id: &str,
+    title: Option<String>,
+    mode: SessionMode,
+    model: Option<String>,
+    system_prompt: String,
+    parent_id: Option<String>,
+    fork_point: Option<u64>,
+    tags: Vec<String>,
+    tool_names: Vec<String>,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    session_db
+        .append_event(
+            id,
+            &Event::SessionCreated {
+                id: id.to_string(),
+                title,
+                mode: mode.clone(),
+                model: model.clone(),
+                system_prompt: Some(system_prompt.clone()),
+                parent_id,
+                fork_point,
+                created_at: now,
+                tags,
+            },
+        )
+        .await?;
+    session_db
+        .append_event(
+            id,
+            &Event::SessionSystemPromptSet {
+                prompt_hash: prompt_hash(&system_prompt),
+                content: system_prompt,
+                source: "startup".into(),
+                timestamp: now,
+            },
+        )
+        .await?;
+    session_db
+        .append_event(
+            id,
+            &Event::SessionModeSet {
+                mode,
+                source: Some("startup".into()),
+                timestamp: Some(now),
+            },
+        )
+        .await?;
+    session_db
+        .append_event(
+            id,
+            &Event::SessionModelSet {
+                model: model.unwrap_or_else(|| "unknown".into()),
+                provider: None,
+                source: "startup".into(),
+                timestamp: now,
+            },
+        )
+        .await?;
+    session_db
+        .append_event(
+            id,
+            &Event::ActiveToolsSet {
+                tool_names,
+                source: "startup".into(),
+                timestamp: now,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn create_fresh_runtime_session(
+    session_db: Arc<SessionDB>,
+    memory_store: Arc<MemoryStore>,
+    mode: SessionMode,
+    model: Option<String>,
+    system_prompt: String,
+    tool_names: Vec<String>,
+) -> anyhow::Result<(String, RuntimeSession, MindPalace)> {
+    let session = session_db
+        .create_session(CreateSessionParams {
+            id: None,
+            title: None,
+            mode: Some(mode.clone()),
+            model: model.clone(),
+            system_prompt: Some(system_prompt.clone()),
+            parent_session_id: None,
+            fork_point: None,
+            source: Some("cli".into()),
+            tags: vec![],
+        })
+        .await?;
+    let session_id = session.id.clone();
+    append_startup_metadata_events(
+        &session_db,
+        &session_id,
+        session.title,
+        mode.clone(),
+        model,
+        system_prompt.clone(),
+        None,
+        None,
+        session.tags,
+        tool_names,
+    )
+    .await?;
+    let mind_palace = MindPalace::new(session_db, memory_store);
+    Ok((
+        session_id.clone(),
+        RuntimeSession::new(session_id, mode).with_system_prompt(&system_prompt),
+        mind_palace,
+    ))
 }
 
 async fn run_runtime_input(
@@ -751,6 +901,9 @@ pub async fn run_chat(
     let runtime_guards = GuardChain::from_config(&config.guards);
     let llm = Arc::new(LlmClient::new(&config));
     let mode = parse_mode(&mode_str);
+    let startup_model = configured_model(&config, model.clone());
+    let initial_registry = build_tool_registry(&config, None, None, None, None).await;
+    let tool_names = active_tool_names(&initial_registry);
 
     // Create RuntimeSession
     let (session_id, runtime_session, mind_palace, is_resume) = if let Some(id) = resume_id {
@@ -780,50 +933,28 @@ pub async fn run_chat(
             eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
             (s.id.clone(), session, mp, true)
         } else {
-            let session = session_db
-                .create_session(CreateSessionParams {
-                    id: None,
-                    title: None,
-                    mode: Some(mode.clone()),
-                    model: model.clone(),
-                    system_prompt: Some(system_prompt.clone()),
-                    parent_session_id: None,
-                    fork_point: None,
-                    source: Some("cli".into()),
-                    tags: vec![],
-                })
-                .await?;
-            let mp = MindPalace::new(session_db.clone(), memory_store.clone());
-            let sid = session.id.clone();
-            (
-                session.id,
-                RuntimeSession::new(sid, mode.clone()).with_system_prompt(&system_prompt),
-                mp,
-                false,
+            let (session_id, runtime_session, mind_palace) = create_fresh_runtime_session(
+                session_db.clone(),
+                memory_store.clone(),
+                mode.clone(),
+                startup_model.clone(),
+                system_prompt.clone(),
+                tool_names.clone(),
             )
+            .await?;
+            (session_id, runtime_session, mind_palace, false)
         }
     } else {
-        let session = session_db
-            .create_session(CreateSessionParams {
-                id: None,
-                title: None,
-                mode: Some(mode.clone()),
-                model: model.clone(),
-                system_prompt: Some(system_prompt.clone()),
-                parent_session_id: None,
-                fork_point: None,
-                source: Some("cli".into()),
-                tags: vec![],
-            })
-            .await?;
-        let mp = MindPalace::new(session_db.clone(), memory_store.clone());
-        let sid = session.id.clone();
-        (
-            session.id,
-            RuntimeSession::new(sid, mode.clone()).with_system_prompt(&system_prompt),
-            mp,
-            false,
+        let (session_id, runtime_session, mind_palace) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            mode.clone(),
+            startup_model.clone(),
+            system_prompt.clone(),
+            tool_names.clone(),
         )
+        .await?;
+        (session_id, runtime_session, mind_palace, false)
     };
 
     let registry = Arc::new(
@@ -909,10 +1040,7 @@ pub async fn run_chat(
         commands: ctx.command_registry.all_command_hints(),
     });
 
-    let completion_menu = Box::new(
-        IdeMenu::default()
-            .with_name("completion_menu")
-    );
+    let completion_menu = Box::new(IdeMenu::default().with_name("completion_menu"));
 
     let history_path = data_dir.join("history.txt");
     let history = match FileBackedHistory::with_file(1000, history_path) {
@@ -952,11 +1080,24 @@ pub async fn run_chat(
         left: String,
     }
     impl reedline::Prompt for SimplePrompt {
-        fn render_prompt_left(&self) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed(&self.left) }
-        fn render_prompt_right(&self) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("") }
-        fn render_prompt_indicator(&self, _: reedline::PromptEditMode) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("") }
-        fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("::: ") }
-        fn render_prompt_history_search_indicator(&self, _: reedline::PromptHistorySearch) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("? ") }
+        fn render_prompt_left(&self) -> std::borrow::Cow<str> {
+            std::borrow::Cow::Borrowed(&self.left)
+        }
+        fn render_prompt_right(&self) -> std::borrow::Cow<str> {
+            std::borrow::Cow::Borrowed("")
+        }
+        fn render_prompt_indicator(&self, _: reedline::PromptEditMode) -> std::borrow::Cow<str> {
+            std::borrow::Cow::Borrowed("")
+        }
+        fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<str> {
+            std::borrow::Cow::Borrowed("::: ")
+        }
+        fn render_prompt_history_search_indicator(
+            &self,
+            _: reedline::PromptHistorySearch,
+        ) -> std::borrow::Cow<str> {
+            std::borrow::Cow::Borrowed("? ")
+        }
     }
 
     loop {
@@ -965,7 +1106,9 @@ pub async fn run_chat(
         } else {
             "» "
         };
-        let prompt = SimplePrompt { left: prompt_str.to_string() };
+        let prompt = SimplePrompt {
+            left: prompt_str.to_string(),
+        };
 
         let sig = rl.read_line(&prompt);
         let trimmed = match sig {
@@ -1119,28 +1262,23 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 .end_session(&ctx.session_id, EndReason::UserQuit)
                 .await
                 .ok();
-            let session = ctx
-                .session_db
-                .create_session(CreateSessionParams {
-                    id: None,
-                    title: None,
-                    mode: Some(ctx.runtime_session.mode.clone()),
-                    model: None,
-                    system_prompt: Some(ctx.system_prompt.clone()),
-                    parent_session_id: None,
-                    fork_point: None,
-                    source: Some("cli".into()),
-                    tags: vec![],
-                })
-                .await
-                .ok();
-            if let Some(s) = session {
-                let new_id = s.id.clone();
-                let mp = MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
-                let rs = RuntimeSession::new(new_id.clone(), ctx.runtime_session.mode.clone())
-                    .with_system_prompt(&ctx.system_prompt);
-                println!("Started new session: {}", &new_id[..8.min(new_id.len())]);
-                return SlashResult::NewSession(rs, mp, new_id);
+            let model = configured_model(&ctx.config, None);
+            let tool_names = active_tool_names(&ctx.registry);
+            match create_fresh_runtime_session(
+                ctx.session_db.clone(),
+                ctx.memory_store.clone(),
+                ctx.runtime_session.mode.clone(),
+                model,
+                ctx.system_prompt.clone(),
+                tool_names,
+            )
+            .await
+            {
+                Ok((new_id, rs, mp)) => {
+                    println!("Started new session: {}", &new_id[..8.min(new_id.len())]);
+                    return SlashResult::NewSession(rs, mp, new_id);
+                }
+                Err(error) => eprintln!("Error: {}", error),
             }
             SlashResult::Handled
         }
@@ -1685,13 +1823,16 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
 
         "mcp" => {
             if args == "reload" {
-                let registry = Arc::new(build_tool_registry(
-                    &ctx.config,
-                    Some(ctx.session_db.clone()),
-                    Some(ctx.memory_store.clone()),
-                    Some(ctx.llm.clone()),
-                    Some(ctx.session_id.clone()),
-                ).await);
+                let registry = Arc::new(
+                    build_tool_registry(
+                        &ctx.config,
+                        Some(ctx.session_db.clone()),
+                        Some(ctx.memory_store.clone()),
+                        Some(ctx.llm.clone()),
+                        Some(ctx.session_id.clone()),
+                    )
+                    .await,
+                );
                 let mut selector = Selector::new();
                 for wf in workflows::create_builtin_workflows(
                     ctx.llm.clone(),
@@ -1856,6 +1997,69 @@ pub async fn list_sessions() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_model_prefers_override_then_role_provider() {
+        let mut config = HolmesConfig::default();
+        config.llm.roles.attack_agent = "main".into();
+        config
+            .llm
+            .providers
+            .push(holmes_core::config::ProviderConfig {
+                name: "main".into(),
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                api_key_env: None,
+                model: "role-model".into(),
+                api_format: ApiFormat::Anthropic,
+                priority: 0,
+                max_retries: 3,
+                rpm_limit: 60,
+            });
+
+        assert_eq!(
+            configured_model(&config, Some("override".into())).as_deref(),
+            Some("override")
+        );
+        assert_eq!(
+            configured_model(&config, None).as_deref(),
+            Some("role-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_fresh_runtime_session_writes_semantic_complete_startup_metadata() {
+        let session_db = Arc::new(SessionDB::open(":memory:").await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(":memory:").await.unwrap());
+        let system_prompt = "semantic startup prompt".to_string();
+        let tool_names = vec!["bash".to_string(), "read".to_string()];
+
+        let (session_id, runtime_session, _mind_palace) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store,
+            SessionMode::SecurityResearch,
+            Some("startup-model".into()),
+            system_prompt.clone(),
+            tool_names.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runtime_session.id, session_id);
+        assert_eq!(runtime_session.mode, SessionMode::SecurityResearch);
+
+        let replayed = session_db
+            .replay_session_context(&session_id)
+            .await
+            .unwrap();
+        assert!(replayed.semantic_complete, "{:?}", replayed.warnings);
+        assert_eq!(
+            replayed.system_prompt.as_deref(),
+            Some(system_prompt.as_str())
+        );
+        assert_eq!(replayed.model.as_deref(), Some("startup-model"));
+        assert_eq!(replayed.active_tools, tool_names);
+    }
 
     #[test]
     fn folded_tool_output_summarizes_command_json() {

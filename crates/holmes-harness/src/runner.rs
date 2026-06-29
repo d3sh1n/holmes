@@ -1,4 +1,5 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +23,75 @@ use crate::scenario::{
 };
 use crate::tool::HarnessMockTool;
 
+fn prompt_hash(prompt: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
+    let mut names = registry
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+async fn append_harness_startup_metadata(
+    session_db: &SessionDB,
+    session_id: &str,
+    title: Option<String>,
+    mode: holmes_core::types::SessionMode,
+    model: String,
+    system_prompt: String,
+    tags: Vec<String>,
+    tool_names: Vec<String>,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let events = [
+        Event::SessionCreated {
+            id: session_id.to_string(),
+            title,
+            mode: mode.clone(),
+            model: Some(model.clone()),
+            system_prompt: Some(system_prompt.clone()),
+            parent_id: None,
+            fork_point: None,
+            created_at: now,
+            tags,
+        },
+        Event::SessionSystemPromptSet {
+            prompt_hash: prompt_hash(&system_prompt),
+            content: system_prompt,
+            source: "harness_startup".into(),
+            timestamp: now,
+        },
+        Event::SessionModeSet {
+            mode,
+            source: Some("harness_startup".into()),
+            timestamp: Some(now),
+        },
+        Event::SessionModelSet {
+            model,
+            provider: None,
+            source: "harness_startup".into(),
+            timestamp: now,
+        },
+        Event::ActiveToolsSet {
+            tool_names,
+            source: "harness_startup".into(),
+            timestamp: now,
+        },
+    ];
+    for event in events {
+        session_db.append_event(session_id, &event).await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HarnessRunner;
 
@@ -40,19 +110,34 @@ impl HarnessRunner {
             scenario.name
         );
 
+        let model = "scripted".to_string();
+        let title = Some(format!("Harness: {}", scenario.name));
+        let tags = vec!["harness".into()];
         session_db
             .create_session(CreateSessionParams {
                 id: Some(session_id.clone()),
-                title: Some(format!("Harness: {}", scenario.name)),
+                title: title.clone(),
                 mode: Some(session_mode.clone()),
-                model: Some("scripted".into()),
+                model: Some(model.clone()),
                 system_prompt: Some(system_prompt.clone()),
                 parent_session_id: None,
                 fork_point: None,
                 source: Some("harness".into()),
-                tags: vec!["harness".into()],
+                tags: tags.clone(),
             })
             .await?;
+        let tools = Arc::new(build_tool_registry(&scenario)?);
+        append_harness_startup_metadata(
+            &session_db,
+            &session_id,
+            title,
+            session_mode.clone(),
+            model,
+            system_prompt.clone(),
+            tags,
+            active_tool_names(&tools),
+        )
+        .await?;
 
         let session = RuntimeSession::new(session_id.clone(), session_mode.clone())
             .with_system_prompt(&system_prompt);
@@ -63,7 +148,6 @@ impl HarnessRunner {
                 .into_iter()
                 .map(|response| response.into_llm_response()),
         ));
-        let tools = Arc::new(build_tool_registry(&scenario)?);
         let mind_palace = MindPalace::new(session_db.clone(), memory_store.clone());
         let context = RuntimeContext::new(
             session,
