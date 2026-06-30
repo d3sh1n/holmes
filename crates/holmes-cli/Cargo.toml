@@ -13,6 +13,7 @@ holmes-session = { path = "../holmes-session" }
 holmes-mind-palace = { path = "../holmes-mind-palace" }
 holmes-llm = { path = "../holmes-llm" }
 holmes-tools = { path = "../holmes-tools" }
+holmes-browser = { path = "../holmes-browser" }
 holmes-guards = { path = "../holmes-guards" }
 holmes-runtime = { path = "../holmes-runtime" }
 holmes-harness = { path = "../holmes-harness" }

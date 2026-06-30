@@ -92,6 +92,7 @@ impl SubagentRunner for CliSubagentRunner {
             &mut registry,
             &self.config,
             Some(Arc::new(self.clone())),
+            None,
         );
         holmes_tools::mcp::register_mcp_tools(&mut registry, &self.config.mcp.servers).await;
         let tool_names = active_tool_names(&registry);

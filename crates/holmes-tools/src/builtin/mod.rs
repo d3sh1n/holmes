@@ -9,14 +9,16 @@ pub mod report_recon;
 pub mod subagent;
 
 use crate::registry::ToolRegistry;
+use holmes_browser::BrowserManager;
 use holmes_core::config::HolmesConfig;
 use holmes_core::subagent::SubagentRunner;
 use std::sync::Arc;
 
 pub fn register_all(
-    registry: &mut ToolRegistry, 
+    registry: &mut ToolRegistry,
     _config: &HolmesConfig,
     runner: Option<Arc<dyn SubagentRunner>>,
+    browser: Option<Arc<BrowserManager>>,
 ) {
     registry.register(Box::new(execute_command::ExecuteCommandTool));
     registry.register(Box::new(execute_python::ExecutePythonTool));
@@ -30,5 +32,8 @@ pub fn register_all(
 
     if let Some(r) = runner {
         registry.register(Box::new(subagent::SpawnSubagentTool::new(r)));
+    }
+    if let Some(mgr) = browser {
+        registry.register(Box::new(browser::BrowserTool::new(mgr)));
     }
 }

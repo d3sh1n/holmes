@@ -97,6 +97,7 @@ async fn build_tool_registry(
     memory_store: Option<Arc<MemoryStore>>,
     llm: Option<Arc<LlmClient>>,
     session_id: Option<String>,
+    browser: Option<Arc<holmes_browser::BrowserManager>>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
@@ -114,7 +115,7 @@ async fn build_tool_registry(
         None
     };
 
-    holmes_tools::builtin::register_all(&mut registry, config, runner);
+    holmes_tools::builtin::register_all(&mut registry, config, runner, browser);
     holmes_tools::mcp::register_mcp_tools(&mut registry, &config.mcp.servers).await;
     registry
 }
@@ -1469,6 +1470,7 @@ async fn create_fresh_runtime_session(
             Some(memory_store.clone()),
             Some(llm),
             Some(session_id.clone()),
+        None,
         )
         .await,
     );
@@ -1564,6 +1566,7 @@ pub(crate) async fn create_chat_context(
                 Some(memory_store.clone()),
                 Some(llm.clone()),
                 Some(id.clone()),
+            None,
             )
             .await,
         );
@@ -1599,6 +1602,7 @@ pub(crate) async fn create_chat_context(
                     Some(memory_store.clone()),
                     Some(llm.clone()),
                     Some(s.id.clone()),
+                None,
                 )
                 .await,
             );
@@ -2159,6 +2163,7 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                                 Some(ctx.memory_store.clone()),
                                 Some(ctx.llm.clone()),
                                 Some(s.id.clone()),
+                            None,
                             )
                             .await,
                         );
@@ -2297,6 +2302,7 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                                             Some(ctx.memory_store.clone()),
                                             Some(ctx.llm.clone()),
                                             Some(new_session.id.clone()),
+                                        None,
                                         )
                                         .await,
                                     );
@@ -3123,6 +3129,7 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                         Some(ctx.memory_store.clone()),
                         Some(ctx.llm.clone()),
                         Some(ctx.session_id.clone()),
+                    None,
                     )
                     .await,
                 );
