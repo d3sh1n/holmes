@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::Utc;
-use holmes_core::config::{ApiFormat, Config, HolmesConfig};
+use holmes_core::config::{resolve_attack_model_provider, ApiFormat, Config, HolmesConfig, ResolvedModel};
 use holmes_core::event::{Event, ReportGenerator, ReportType, StoredEvent};
 use holmes_core::session::RuntimeSession;
 use holmes_core::tool_types::{Message, Role};
@@ -393,26 +393,6 @@ fn indent_block(content: &str) -> String {
         .join("\n")
 }
 
-fn prompt_hash(prompt: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    prompt.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn configured_model(config: &HolmesConfig, override_model: Option<String>) -> Option<String> {
-    override_model.or_else(|| {
-        let role = &config.llm.roles.attack_agent;
-        config
-            .llm
-            .providers
-            .iter()
-            .find(|provider| &provider.name == role)
-            .or_else(|| config.llm.providers.first())
-            .map(|provider| provider.model.clone())
-    })
-}
-
 fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
     let mut names = registry
         .definitions()
@@ -429,7 +409,7 @@ async fn append_startup_metadata_events(
     id: &str,
     title: Option<String>,
     mode: SessionMode,
-    model: Option<String>,
+    resolved_model: Option<ResolvedModel>,
     system_prompt: String,
     parent_id: Option<String>,
     fork_point: Option<u64>,
@@ -443,7 +423,7 @@ async fn append_startup_metadata_events(
                 id: id.to_string(),
                 title,
                 mode: mode.clone(),
-                model: model.clone(),
+                model: resolved_model.as_ref().map(|resolved| resolved.model.clone()),
                 system_prompt: Some(system_prompt.clone()),
                 parent_id,
                 fork_point,
@@ -456,7 +436,7 @@ async fn append_startup_metadata_events(
         .append_event(
             id,
             &Event::SessionSystemPromptSet {
-                prompt_hash: prompt_hash(&system_prompt),
+                prompt_hash: holmes_core::stable_prompt_hash(&system_prompt),
                 content: system_prompt,
                 source: "startup".into(),
                 timestamp: now,
@@ -477,8 +457,11 @@ async fn append_startup_metadata_events(
         .append_event(
             id,
             &Event::SessionModelSet {
-                model: model.unwrap_or_else(|| "unknown".into()),
-                provider: None,
+                model: resolved_model
+                    .as_ref()
+                    .map(|resolved| resolved.model.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+                provider: resolved_model.and_then(|resolved| resolved.provider),
                 source: "startup".into(),
                 timestamp: now,
             },
@@ -512,7 +495,7 @@ async fn create_fresh_runtime_session(
     llm: Arc<LlmClient>,
     config: &HolmesConfig,
     mode: SessionMode,
-    model: Option<String>,
+    resolved_model: Option<ResolvedModel>,
     system_prompt: String,
 ) -> anyhow::Result<(String, RuntimeSession, MindPalace, Arc<ToolRegistry>)> {
     let session = session_db
@@ -520,7 +503,7 @@ async fn create_fresh_runtime_session(
             id: None,
             title: None,
             mode: Some(mode.clone()),
-            model: model.clone(),
+            model: resolved_model.as_ref().map(|resolved| resolved.model.clone()),
             system_prompt: Some(system_prompt.clone()),
             parent_session_id: None,
             fork_point: None,
@@ -529,18 +512,28 @@ async fn create_fresh_runtime_session(
         })
         .await?;
     let session_id = session.id.clone();
-    let startup_timestamp = append_startup_metadata_events(
+    let startup_timestamp = match append_startup_metadata_events(
         &session_db,
         &session_id,
         session.title,
         mode.clone(),
-        model,
+        resolved_model,
         system_prompt.clone(),
         None,
         None,
         session.tags,
     )
-    .await?;
+    .await
+    {
+        Ok(timestamp) => timestamp,
+        Err(error) => {
+            session_db
+                .end_session(&session_id, EndReason::Error)
+                .await
+                .ok();
+            return Err(error);
+        }
+    };
     let registry = Arc::new(
         build_tool_registry(
             config,
@@ -551,13 +544,20 @@ async fn create_fresh_runtime_session(
         )
         .await,
     );
-    append_active_tools_startup_metadata_event(
+    if let Err(error) = append_active_tools_startup_metadata_event(
         &session_db,
         &session_id,
         active_tool_names(&registry),
         startup_timestamp,
     )
-    .await?;
+    .await
+    {
+        session_db
+            .end_session(&session_id, EndReason::Error)
+            .await
+            .ok();
+        return Err(error);
+    }
     let mind_palace = MindPalace::new(session_db, memory_store);
     Ok((
         session_id.clone(),
@@ -605,7 +605,7 @@ pub(crate) async fn create_chat_context(
     let runtime_guards = GuardChain::from_config(&config.guards);
     let llm = Arc::new(LlmClient::new(&config));
     let mode = parse_mode(&mode_str);
-    let startup_model = configured_model(&config, model);
+    let startup_model = resolve_attack_model_provider(&config, model);
 
     let (session_id, runtime_session, mind_palace, registry, is_resume) = if let Some(id) =
         resume_id
@@ -1325,7 +1325,7 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 .end_session(&ctx.session_id, EndReason::UserQuit)
                 .await
                 .ok();
-            let model = configured_model(&ctx.config, None);
+            let model = resolve_attack_model_provider(&ctx.config, None);
             match create_fresh_runtime_session(
                 ctx.session_db.clone(),
                 ctx.memory_store.clone(),
@@ -1485,7 +1485,16 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
             } else {
                 Some(args.to_string())
             };
-            let fork_point = ctx.runtime_session.message_count() as u64;
+            let fork_point = match ctx.session_db.get_events(&ctx.session_id).await {
+                Ok(events) => events
+                    .last()
+                    .map(|event| event.event_index)
+                    .unwrap_or_else(|| ctx.runtime_session.message_count() as u64),
+                Err(error) => {
+                    eprintln!("Error: {}", error);
+                    return SlashResult::Handled;
+                }
+            };
             match ctx
                 .session_db
                 .fork_session(
@@ -1496,6 +1505,54 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 .await
             {
                 Ok(new_session) => {
+                    let branch_metadata = append_startup_metadata_events(
+                        &ctx.session_db,
+                        &new_session.id,
+                        new_session.title.clone(),
+                        new_session.mode.clone(),
+                        new_session.model.clone().map(|model| ResolvedModel {
+                            model,
+                            provider: resolve_attack_model_provider(&ctx.config, None)
+                                .and_then(|resolved| resolved.provider),
+                        }),
+                        new_session
+                            .system_prompt
+                            .clone()
+                            .unwrap_or_else(|| ctx.system_prompt.clone()),
+                        Some(ctx.session_id.clone()),
+                        Some(fork_point),
+                        new_session.tags.clone(),
+                    )
+                    .await;
+
+                    match branch_metadata {
+                        Ok(startup_timestamp) => {
+                            if let Err(error) = append_active_tools_startup_metadata_event(
+                                &ctx.session_db,
+                                &new_session.id,
+                                active_tool_names(&ctx.registry),
+                                startup_timestamp,
+                            )
+                            .await
+                            {
+                                ctx.session_db
+                                    .end_session(&new_session.id, EndReason::Error)
+                                    .await
+                                    .ok();
+                                eprintln!("Error: {}", error);
+                                return SlashResult::Handled;
+                            }
+                        }
+                        Err(error) => {
+                            ctx.session_db
+                                .end_session(&new_session.id, EndReason::Error)
+                                .await
+                                .ok();
+                            eprintln!("Error: {}", error);
+                            return SlashResult::Handled;
+                        }
+                    }
+
                     println!(
                         "Branched to: {} ({})",
                         &new_session.id[..8.min(new_session.id.len())],
@@ -2071,33 +2128,161 @@ pub async fn list_sessions() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+
     #[test]
     fn configured_model_prefers_override_then_role_provider() {
         let mut config = HolmesConfig::default();
         config.llm.roles.attack_agent = "main".into();
-        config
-            .llm
-            .providers
-            .push(holmes_core::config::ProviderConfig {
-                name: "main".into(),
-                base_url: "http://localhost".into(),
-                api_key: String::new(),
-                api_key_env: None,
-                model: "role-model".into(),
-                api_format: ApiFormat::Anthropic,
-                priority: 0,
-                max_retries: 3,
-                rpm_limit: 60,
-            });
+        config.llm.providers.push(holmes_core::config::ProviderConfig {
+            name: "main".into(),
+            base_url: "http://localhost".into(),
+            api_key: String::new(),
+            api_key_env: None,
+            model: "role-model".into(),
+            api_format: ApiFormat::Anthropic,
+            priority: 0,
+            max_retries: 3,
+            rpm_limit: 60,
+        });
 
+        let override_resolved = resolve_attack_model_provider(&config, Some("override".into()));
         assert_eq!(
-            configured_model(&config, Some("override".into())).as_deref(),
+            override_resolved
+                .as_ref()
+                .map(|resolved| resolved.model.as_str()),
             Some("override")
         );
         assert_eq!(
-            configured_model(&config, None).as_deref(),
+            override_resolved.and_then(|resolved| resolved.provider),
+            None
+        );
+
+        let role_resolved = resolve_attack_model_provider(&config, None);
+        assert_eq!(
+            role_resolved
+                .as_ref()
+                .map(|resolved| resolved.model.as_str()),
             Some("role-model")
         );
+        assert_eq!(
+            role_resolved.and_then(|resolved| resolved.provider),
+            Some("main".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_branch_uses_latest_event_index_and_writes_child_startup_metadata() {
+        let session_db = Arc::new(SessionDB::open(":memory:").await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(":memory:").await.unwrap());
+        let config = HolmesConfig::default();
+        let llm = Arc::new(LlmClient::new(&config));
+        let system_prompt = "semantic startup prompt".to_string();
+        let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
+
+        let (session_id, runtime_session, mind_palace, registry) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            llm.clone(),
+            &config,
+            SessionMode::Pentest,
+            Some(ResolvedModel {
+                model: "startup-model".into(),
+                provider: Some("startup-provider".into()),
+            }),
+            system_prompt.clone(),
+        )
+        .await
+        .unwrap();
+
+        session_db
+            .append_event(
+                &session_id,
+                &Event::UserMessage {
+                    content: "first turn".into(),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let parent_latest_index = session_db
+            .get_events(&session_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .event_index;
+        assert!(parent_latest_index > runtime_session.message_count() as u64);
+
+        let mut ctx = ChatContext {
+            session_id: session_id.clone(),
+            session_db: session_db.clone(),
+            memory_store: memory_store.clone(),
+            llm: llm.clone(),
+            registry,
+            guards,
+            runtime_guards: GuardChain::from_config(&config.guards),
+            selector: Selector::new(),
+            runtime_session,
+            mind_palace,
+            runtime_state: RuntimeState::new(SessionMode::Pentest),
+            queued_turns: VecDeque::new(),
+            steering_notes: Vec::new(),
+            system_prompt,
+            config,
+            data_dir: PathBuf::from("."),
+            command_registry: CommandRegistry::default(),
+        };
+
+        let result = handle_slash_command("/branch child", &mut ctx).await;
+        assert!(matches!(result, SlashResult::Handled));
+
+        let sessions = session_db
+            .list_sessions(&SessionFilter {
+                include_children: true,
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let child_summary = sessions
+            .into_iter()
+            .find(|session| session.parent_session_id.as_deref() == Some(session_id.as_str()))
+            .expect("branch child created");
+        let child = session_db
+            .get_session(&child_summary.id)
+            .await
+            .unwrap()
+            .expect("child session record");
+        assert_eq!(child.fork_point, Some(parent_latest_index));
+
+        let replayed = session_db.replay_session_context(&child.id).await.unwrap();
+        assert!(replayed.semantic_complete, "{:?}", replayed.warnings);
+        assert_eq!(replayed.session.id, child.id);
+        assert_eq!(
+            replayed.session.lineage.parent_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(replayed.session.lineage.fork_point, Some(parent_latest_index));
+        assert_eq!(replayed.model.as_deref(), Some("startup-model"));
+        assert_eq!(replayed.active_tools, active_tool_names(&ctx.registry));
+
+        let child_events = session_db.get_events(&child.id).await.unwrap();
+        assert!(child_events.iter().any(|stored| {
+            matches!(
+                &stored.event,
+                Event::UserMessage { content, .. } if content == "first turn"
+            )
+        }));
+        assert!(child_events.iter().any(|stored| {
+            matches!(
+                &stored.event,
+                Event::SessionCreated { id, parent_id, fork_point, .. }
+                    if id == &child.id
+                        && parent_id.as_deref() == Some(session_id.as_str())
+                        && *fork_point == Some(parent_latest_index)
+            )
+        }));
     }
 
     #[tokio::test]
@@ -2114,7 +2299,10 @@ mod tests {
             llm,
             &config,
             SessionMode::SecurityResearch,
-            Some("startup-model".into()),
+            Some(ResolvedModel {
+                model: "startup-model".into(),
+                provider: None,
+            }),
             system_prompt.clone(),
         )
         .await
@@ -2157,7 +2345,10 @@ mod tests {
             llm.clone(),
             &config,
             SessionMode::Pentest,
-            Some("startup-model".into()),
+            Some(ResolvedModel {
+                model: "startup-model".into(),
+                provider: None,
+            }),
             system_prompt.clone(),
         )
         .await

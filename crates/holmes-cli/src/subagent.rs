@@ -3,7 +3,7 @@ use chrono::Utc;
 use holmes_core::event::Event;
 use holmes_core::session::RuntimeSession;
 use holmes_core::subagent::SubagentRunner;
-use holmes_core::types::{SessionMode, SubAgentResult, SubAgentTask};
+use holmes_core::types::{EndReason, SessionMode, SubAgentResult, SubAgentTask};
 use holmes_guards::GuardChain;
 use holmes_llm::client::LlmClient;
 use holmes_mind_palace::MindPalace;
@@ -14,28 +14,10 @@ use holmes_runtime::yield_stream::{RuntimeSink, RuntimeYield};
 use holmes_runtime::StreamEvent;
 use holmes_session::{memory_store::MemoryStore, SessionDB};
 use holmes_tools::registry::ToolRegistry;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use holmes_core::config::Config;
-
-fn prompt_hash(prompt: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    prompt.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn configured_attack_model(config: &Config) -> Option<String> {
-    let role = &config.llm.roles.attack_agent;
-    config
-        .llm
-        .providers
-        .iter()
-        .find(|provider| &provider.name == role)
-        .or_else(|| config.llm.providers.first())
-        .map(|provider| provider.model.clone())
-}
+use holmes_core::config::{resolve_attack_model_provider, Config};
 
 fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
     let mut names = registry
@@ -82,9 +64,15 @@ impl SubagentRunner for CliSubagentRunner {
             "You are Holmes subagent for parent session {}. Context: {}",
             self.parent_session_id, task.context_summary
         );
-        let model = configured_attack_model(&self.config).unwrap_or_else(|| "unknown".into());
+        let resolved_model = resolve_attack_model_provider(&self.config, None);
+        let model = resolved_model
+            .as_ref()
+            .map(|resolved| resolved.model.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let provider = resolved_model.and_then(|resolved| resolved.provider);
 
-        self.session_db
+        let _sub_session = self
+            .session_db
             .create_session(holmes_session::db::CreateSessionParams {
                 id: Some(sub_session_id.clone()),
                 title: Some("Subagent".into()),
@@ -121,7 +109,7 @@ impl SubagentRunner for CliSubagentRunner {
                 tags: vec!["subagent".into()],
             },
             Event::SessionSystemPromptSet {
-                prompt_hash: prompt_hash(&system_prompt),
+                prompt_hash: holmes_core::stable_prompt_hash(&system_prompt),
                 content: system_prompt.clone(),
                 source: "startup".into(),
                 timestamp: now,
@@ -133,7 +121,7 @@ impl SubagentRunner for CliSubagentRunner {
             },
             Event::SessionModelSet {
                 model: model.clone(),
-                provider: None,
+                provider: provider.clone(),
                 source: "startup".into(),
                 timestamp: now,
             },
@@ -144,10 +132,13 @@ impl SubagentRunner for CliSubagentRunner {
             },
         ];
         for event in startup_events {
-            self.session_db
-                .append_event(&sub_session_id, &event)
-                .await
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = self.session_db.append_event(&sub_session_id, &event).await {
+                self.session_db
+                    .end_session(&sub_session_id, EndReason::Error)
+                    .await
+                    .ok();
+                return Err(error.to_string());
+            }
         }
 
         let session = RuntimeSession::new(sub_session_id.clone(), mode.clone())

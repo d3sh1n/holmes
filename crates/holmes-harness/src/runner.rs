@@ -1,5 +1,4 @@
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,12 +20,6 @@ use crate::scenario::{
     HarnessEventPayloadExpectation, HarnessExpectations, HarnessScenario, HarnessTool,
 };
 use crate::tool::HarnessMockTool;
-
-fn prompt_hash(prompt: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    prompt.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
 
 fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
     let mut names = registry
@@ -94,7 +87,7 @@ async fn append_harness_startup_metadata(
             tags,
         },
         Event::SessionSystemPromptSet {
-            prompt_hash: prompt_hash(&system_prompt),
+            prompt_hash: holmes_core::stable_prompt_hash(&system_prompt),
             content: system_prompt,
             source: "harness_startup".into(),
             timestamp: now,
@@ -158,7 +151,7 @@ impl HarnessRunner {
             })
             .await?;
         let tools = Arc::new(build_tool_registry(&scenario)?);
-        append_harness_startup_metadata(
+        if let Err(error) = append_harness_startup_metadata(
             &session_db,
             &session_id,
             title,
@@ -169,7 +162,14 @@ impl HarnessRunner {
             active_tool_names(&tools),
             startup_time,
         )
-        .await?;
+        .await
+        {
+            session_db
+                .end_session(&session_id, holmes_core::EndReason::Error)
+                .await
+                .ok();
+            return Err(error);
+        }
 
         let session = RuntimeSession::new(session_id.clone(), session_mode.clone())
             .with_system_prompt(&system_prompt);

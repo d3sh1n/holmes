@@ -155,6 +155,37 @@ impl Default for ApiFormat {
     }
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub model: String,
+    pub provider: Option<String>,
+}
+
+pub fn resolve_attack_model_provider(
+    config: &HolmesConfig,
+    override_model: Option<String>,
+) -> Option<ResolvedModel> {
+    if let Some(model) = override_model {
+        return Some(ResolvedModel {
+            model,
+            provider: None,
+        });
+    }
+
+    let role = &config.llm.roles.attack_agent;
+    config
+        .llm
+        .providers
+        .iter()
+        .find(|provider| &provider.name == role)
+        .or_else(|| config.llm.providers.iter().min_by_key(|provider| provider.priority))
+        .map(|provider| ResolvedModel {
+            model: provider.model.clone(),
+            provider: Some(provider.name.clone()),
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleConfig {
     pub attack_agent: String,
@@ -429,6 +460,83 @@ impl Default for HolmesConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn resolve_attack_model_provider_prefers_override_then_role_provider() {
+        let mut config = HolmesConfig::default();
+        config.llm.roles.attack_agent = "main".into();
+        config.llm.providers.push(ProviderConfig {
+            name: "main".into(),
+            base_url: "http://localhost".into(),
+            api_key: String::new(),
+            api_key_env: None,
+            model: "role-model".into(),
+            api_format: ApiFormat::Anthropic,
+            priority: 0,
+            max_retries: 3,
+            rpm_limit: 60,
+        });
+
+        let override_resolved = resolve_attack_model_provider(&config, Some("override".into()));
+        assert_eq!(
+            override_resolved
+                .as_ref()
+                .map(|resolved| resolved.model.as_str()),
+            Some("override")
+        );
+        assert_eq!(
+            override_resolved.and_then(|resolved| resolved.provider),
+            None
+        );
+
+        let role_resolved = resolve_attack_model_provider(&config, None);
+        assert_eq!(
+            role_resolved
+                .as_ref()
+                .map(|resolved| resolved.model.as_str()),
+            Some("role-model")
+        );
+        assert_eq!(
+            role_resolved.and_then(|resolved| resolved.provider),
+            Some("main".into())
+        );
+    }
+
+    #[test]
+    fn resolve_attack_model_provider_falls_back_to_lowest_priority_provider() {
+        let mut config = HolmesConfig::default();
+        config.llm.roles.attack_agent = "missing".into();
+        config.llm.providers = vec![
+            ProviderConfig {
+                name: "listed-first".into(),
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                api_key_env: None,
+                model: "listed-first-model".into(),
+                api_format: ApiFormat::Anthropic,
+                priority: 20,
+                max_retries: 3,
+                rpm_limit: 60,
+            },
+            ProviderConfig {
+                name: "highest-priority".into(),
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                api_key_env: None,
+                model: "highest-priority-model".into(),
+                api_format: ApiFormat::Anthropic,
+                priority: 1,
+                max_retries: 3,
+                rpm_limit: 60,
+            },
+        ];
+
+        let resolved = resolve_attack_model_provider(&config, None).expect("provider selected");
+
+        assert_eq!(resolved.model, "highest-priority-model");
+        assert_eq!(resolved.provider.as_deref(), Some("highest-priority"));
+    }
 
     #[test]
     fn compressor_defaults_enable_static_compaction() {

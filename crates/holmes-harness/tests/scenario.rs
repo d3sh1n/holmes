@@ -104,15 +104,23 @@ expectations:
     assert_eq!(created.0, "harness-deterministic-name");
     assert_eq!(*created.1, expected_timestamp);
 
-    let prompt_timestamp = report
+    let prompt_metadata = report
         .events
         .iter()
         .find_map(|event| match &event.event {
-            Event::SessionSystemPromptSet { timestamp, .. } => Some(timestamp),
+            Event::SessionSystemPromptSet {
+                prompt_hash,
+                timestamp,
+                ..
+            } => Some((prompt_hash, timestamp)),
             _ => None,
         })
         .expect("session_system_prompt_set event");
-    assert_eq!(*prompt_timestamp, expected_timestamp);
+    assert_eq!(
+        prompt_metadata.0,
+        "27f09f96e8ec41f95a274560736cdda417e696ec8651179cb4bc5d2fa7edb79d"
+    );
+    assert_eq!(*prompt_metadata.1, expected_timestamp);
 }
 
 #[tokio::test]
