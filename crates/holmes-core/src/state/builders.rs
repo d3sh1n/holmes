@@ -126,6 +126,26 @@ impl AttackState {
         &mut self.evidence_bundle
     }
 
+    /// **Blessed writer for the validated zone.**
+    ///
+    /// In production code only `SkepticGate` (a PostGuard) should call this
+    /// path — it owns the contract that a `Finding` has passed evidence
+    /// cross-checks before being recorded. Callers in other production
+    /// modules should treat findings as read-only via `findings()`.
+    ///
+    /// The key is `finding.id`; an existing entry with the same id is
+    /// overwritten (matches the previous `findings_mut().insert(..)` behavior
+    /// SkepticGate relied on).
+    pub fn record_finding(&mut self, finding: Finding) {
+        self.findings.insert(finding.id.clone(), finding);
+    }
+
+    /// Raw mutable access to the validated zone.
+    ///
+    /// ⚠ Only `SkepticGate` (via `record_finding`) and test fixtures should
+    /// reach in here. Touching this from production paths outside SkepticGate
+    /// breaks the four-zone invariant that validated findings are gated by
+    /// evidence cross-checks. Use `record_finding` for the blessed path.
     pub fn findings_mut(&mut self) -> &mut HashMap<String, Finding> {
         &mut self.findings
     }

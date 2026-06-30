@@ -77,7 +77,7 @@ impl PostGuard for SkepticGate {
                     .to_string(),
                 attack_type,
             };
-            state.findings_mut().insert(title, finding);
+            state.record_finding(finding);
             return;
         }
 
@@ -94,7 +94,7 @@ impl PostGuard for SkepticGate {
                 .to_string(),
             attack_type,
         };
-        state.findings_mut().insert(title, finding);
+        state.record_finding(finding);
     }
 }
 

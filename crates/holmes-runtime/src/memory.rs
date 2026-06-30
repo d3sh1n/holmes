@@ -141,7 +141,11 @@ impl MemoryEngine {
     }
 }
 
-async fn append_and_ingest(context: &mut RuntimeContext, event: Event) -> Result<(), RuntimeError> {
+async fn append_and_ingest(context: &mut RuntimeContext, mut event: Event) -> Result<(), RuntimeError> {
+    let middlewares = context.middlewares.clone();
+    for mw in &middlewares {
+        mw.before_event_persist(context, &mut event).await?;
+    }
     context
         .session_db
         .append_event(&context.session_id, &event)
@@ -165,7 +169,7 @@ mod tests {
     use holmes_core::{LlmResponse, SessionMode};
     use holmes_guards::GuardChain;
     use holmes_mind_palace::MindPalace;
-    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
+    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
     use holmes_tools::ToolRegistry;
 
     use crate::context::RuntimeState;

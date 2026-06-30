@@ -8,7 +8,7 @@ Scope: AI-native runtime architecture for Holmes
 
 Holmes should become a real-time collaborative security research agent, not a pure automation script and not a simple CLI wrapper around LLM tool calls. The runtime must make Holmes worthy of the name: observant, evidence-driven, conversational, able to reason about hypotheses, able to pause and ask Watson for judgment, and able to preserve a complete case record.
 
-The current project has many of the right pieces: `RuntimeSession`, event sourcing, `MindPalace`, `ToolRegistry`, `GuardChain`, LLM providers, workflows, setup, and slash commands. The main problem is that these pieces are not joined into one cognitive loop. The REPL currently uses a simplified workflow loop, while the more complete `agent_loop.rs` is not the primary path. Browser, MCP, goal mode, long-term memory recall, and structured evidence are also partially implemented but not wired into the agent's main behavior.
+The project has many of the right pieces: `RuntimeSession`, event sourcing, `MindPalace`, `ToolRegistry`, `GuardChain`, LLM providers, workflows, setup, and slash commands. This design originally targeted the split between the workflow loop and the older `agent_loop.rs`; Phase 1 has since converged normal chat and one-shot queries on `holmes-runtime::AgentRuntime`, and the legacy CLI loop has been removed. Browser, MCP, goal mode, long-term memory recall, and structured evidence are still areas that need continued hardening inside the unified runtime.
 
 This design introduces a new `holmes-runtime` crate as the single engine used by CLI chat, one-shot queries, future goal mode, and future sub-agents.
 
@@ -216,7 +216,7 @@ Execution order:
 7. Append `Event::ToolResult`.
 8. Emit `RuntimeYield::ToolFinished`.
 
-This replaces the current split between `workflows.rs::run_agent_turn` and `agent_loop.rs`.
+This replaces the historical split between `workflows.rs::run_agent_turn` and `agent_loop.rs`; the current primary path is `AgentRuntime`.
 
 ### EvidenceEngine
 
@@ -294,7 +294,7 @@ Goal: create a unified runtime and route normal chat and one-shot through it.
 Implementation scope:
 
 - Add `holmes-runtime`.
-- Move or port the complete logic from `agent_loop.rs` into runtime components.
+- Keep the legacy `agent_loop.rs` removed; new behavior belongs in runtime components.
 - Use `ActionEngine` as the only tool execution path for new runtime flows.
 - Make normal REPL messages call `AgentRuntime::run_turn`.
 - Make `holmes -q` call `AgentRuntime::run_oneshot`.
@@ -412,11 +412,11 @@ Required tests:
 
 ## Migration Notes
 
-`crates/holmes-cli/src/agent_loop.rs` should either move into `holmes-runtime` or become a small compatibility wrapper. It should not remain a second primary loop.
+`crates/holmes-cli/src/agent_loop.rs` has been removed. It should not be reintroduced as a second primary loop; new execution behavior belongs in `holmes-runtime`.
 
-`crates/holmes-cli/src/workflows.rs` can remain for selector tests during Phase 1, but normal chat and one-shot should stop using its internal `run_agent_turn`.
+`crates/holmes-cli/src/workflows.rs` can remain for selector tests and compatibility, but normal chat and one-shot should keep using `AgentRuntime`.
 
-`GuardChain::from_config` should eventually respect boolean config flags, but Phase 1 should not focus on making Holmes stronger through more hard restrictions.
+`GuardChain::from_config` now respects boolean config flags. The next step is to keep those controls understandable in the TUI and documented for users.
 
 `http_request` read-only semantics should be revisited later. The runtime design can handle this by classifying tool effects and exposing them to deliberation.
 
@@ -425,4 +425,3 @@ Required tests:
 The chosen approach is the aggressive runtime architecture. The project should not merely patch the existing workflow loop. The runtime must preserve real-time conversation as a first-class behavior.
 
 The implementation should begin with Phase 1, because all other capabilities need a single runtime path before they can become reliable.
-

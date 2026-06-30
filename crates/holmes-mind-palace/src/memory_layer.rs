@@ -1,6 +1,6 @@
 use holmes_core::event::Event;
 use holmes_core::types::*;
-use holmes_session::db::SessionDB;
+use holmes_session::SessionStore;
 use holmes_session::memory_store::{MemoryEntry, MemoryStore};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,12 +8,12 @@ use std::sync::Arc;
 pub struct MemoryLayer {
     pub(crate) session_events: Vec<Event>,
     long_term: Arc<MemoryStore>,
-    session_db: Arc<SessionDB>,
+    session_db: Arc<dyn SessionStore>,
     recall_cache: HashMap<String, Vec<Memory>>,
 }
 
 impl MemoryLayer {
-    pub fn new(session_db: Arc<SessionDB>, long_term: Arc<MemoryStore>) -> Self {
+    pub fn new(session_db: Arc<dyn SessionStore>, long_term: Arc<MemoryStore>) -> Self {
         Self {
             session_events: Vec::new(),
             long_term,

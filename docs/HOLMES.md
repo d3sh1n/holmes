@@ -30,9 +30,9 @@ Holmes is a CLI-native AI agent for penetration testing, security research, code
 - **Event Sourcing** — Every state change is an immutable event, enabling full session replay
 - **RuntimeYield Stream** — SDK-like structured stream for messages, permissions, tools, compaction, and results
 - **PermissionPolicy** — Central tool authorization layer with default, plan, read-only, dont-ask, and bypass modes
-- **GuardChain** — 3 pre-guards + 5 post-guards for safety and evidence extraction
+- **GuardChain** — Configurable pre/post guards for safety, evidence extraction, loop prevention, and read-state tracking
 - **Harness** — Agent OS testbench for deterministic runtime scenarios
-- **10 built-in tools** — Shell execution, HTTP requests, Python scripting, browser automation, MCP
+- **Core tools + MCP** — Shell execution, HTTP requests, Python scripting, reporting, hypotheses, optional subagents, and MCP-backed tools
 
 ### Design Metaphor
 
@@ -129,10 +129,10 @@ holmes/
 │   ├── holmes-llm/        # Anthropic Messages client, failover, rate limiting
 │   ├── holmes-runtime/    # Agent loop, RuntimeYield stream, permissions, deduction, learning, compaction
 │   ├── holmes-tools/      # Tool trait, ToolRegistry, built-in tools, MCP integration
-│   ├── holmes-guards/     # GuardChain: 3 PreGuards + 5 PostGuards
+│   ├── holmes-guards/     # GuardChain: configurable pre/post guards
 │   ├── holmes-mind-palace/# Memory Layer + Context Layer + Dashboard Layer
 │   ├── holmes-harness/    # Deterministic agent OS testbench
-│   └── holmes-cli/        # CLI binary: REPL, slash commands, setup wizard, workflows, goal loop
+│   └── holmes-cli/        # CLI binary: full-screen TUI, legacy REPL, slash commands, setup wizard
 ```
 
 ### Dependency Graph
@@ -158,18 +158,13 @@ User Input
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│  holmes-cli (REPL)                                  │
+│  holmes-cli (Reedline REPL / full-screen TUI)       │
 │                                                     │
 │  /slash command? → CommandRegistry.dispatch()       │
-│  normal message  → ChatWorkflow.forward(session)    │
+│  normal message  → AgentRuntime::run_turn()         │
+│  one-shot query  → AgentRuntime::run_oneshot()      │
 │                                                     │
-│  Selector.select(session) → Workflow.forward()      │
-│       │                                               │
-│       └── ReconWorkflow / AnalysisWorkflow /         │
-│           ExploitWorkflow / ReportWorkflow           │
-│                   │                                   │
-│                   ▼                                   │
-│           Runtime Agent Loop                          │
+│           Unified Runtime Loop                        │
 │           ┌──────────────────────────┐               │
 │           │ LlmClient.chat_completion│               │
 │           │        ↓                  │               │
@@ -190,6 +185,8 @@ User Input
 └─────────────────────────────────────────────────────┘
 ```
 
+Selector/workflow code remains available for compatibility and tests, but normal interactive turns and one-shot queries use `holmes-runtime::AgentRuntime` as the primary path.
+
 ### Event Sourcing
 
 All state changes are immutable `Event` records stored in SQLite. This means:
@@ -206,39 +203,70 @@ All state changes are immutable `Event` records stored in SQLite. This means:
 ### Commands
 
 ```bash
-holmes                      # Start interactive chat (default)
-holmes chat                 # Same as above
+holmes                      # Start full-screen TUI with a fresh session
+holmes chat                 # Same default full-screen TUI
+holmes tui                  # Explicit full-screen TUI
+holmes repl                 # Legacy Reedline line REPL
+holmes --repl               # Same legacy REPL through the default command
 holmes sessions             # List recent sessions
 holmes setup                # Interactive LLM provider configuration
 holmes version              # Show version
 
 # Session management
 holmes -r <id>              # Resume a specific session
-holmes -c                   # Continue the most recent session
+holmes -c                   # Continue the most recent session; Holmes does not auto-continue
 holmes -q "query"           # One-shot non-interactive query
 holmes -m <model>           # Override model
 holmes --mode audit         # Set session mode
 ```
 
-### Interactive REPL
+### Full-Screen TUI
 
+Holmes starts in a Pi-style full-screen TUI backed by the same `AgentRuntime` as one-shot and Reedline chat. It keeps the chat transcript, editor, session navigation, event timeline, permissions, and guards in one terminal app shell.
+
+By default, `holmes` starts a fresh session. Use `holmes -c` to continue the most recent session or `holmes -r <id>` to resume a specific case.
+
+```text
+Holmes TUI  session=3f2a1c8d  mode=Pentest  permission=default
+--------------------------------------------------------------------------------
+Watson: 扫描 target.com 的开放端口
+
+Holmes: 我会先确认授权范围，然后选择只读探测。
+
+Tool:   http_request ok - output folded (512 chars, 12 lines)
+
+--------------------------------------------------------------------------------
+Watson > /dashboard
+Ctrl+L commands  Ctrl+N new  Ctrl+B fork  Ctrl+O tool output
+F1 help  F2 tree  F3 events  F4 permissions  F5 guards  F6 sessions
 ```
-╔══════════════════════════════════════════════╗
-║  Holmes — AI Security Research Agent         ║
-║  Type /help for commands, /quit to exit      ║
-╚══════════════════════════════════════════════╝
 
-> 扫描 target.com 的开放端口
-🤔 
-Holmes: 我将使用 nmap 扫描 target.com 的开放端口...
-  → recon
+| Key | Action |
+|-----|--------|
+| `F1` | Help and keybinding reference |
+| `F2` | Searchable session tree; `Enter` resumes, `f` forks selected session |
+| `F3` | Current session event timeline; `Enter`/`f` forks from selected event |
+| `F4` | PermissionPolicy panel; cycle modes, edit allow/deny lists |
+| `F5` | GuardChain panel; toggle guards, adjust repetition window |
+| `F6` | Flat recent-session selector |
+| `Ctrl+L` | Slash command palette |
+| `Ctrl+N` | New session |
+| `Ctrl+B` | Fork current session at latest event |
+| `Ctrl+O` | Toggle folded/full tool output |
+| `PgUp` / `PgDn` | Scroll transcript |
 
-> /dashboard
-  [攻击面]
-    主机: 1, 服务: 5, 端点: 12, 凭据: 0
-  [漏洞发现]
-    Open SSH 7.4 (中危)
+The TUI follows Pi's session-tree semantics: switching sessions does not mark the previous session as ended; it simply moves the current leaf.
+
+### Legacy REPL
+
+The Reedline REPL remains available for line-oriented workflows:
+
+```bash
+holmes repl
+holmes --repl
 ```
+
+Type `/` and press `Tab` to see slash commands and completions.
 
 ### One-shot Mode
 
@@ -262,7 +290,10 @@ All commands are available in the REPL by typing `/` followed by the command nam
 | `/sessions` | `/history` | List recent sessions |
 | `/session` | — | Show current session details |
 | `/rename <title>` | `/title` | Rename current session |
-| `/branch [title]` | `/fork` | Fork new session from current point |
+| `/branch [title]` | `/fork` | Fork new session from the latest event and switch to it |
+| `/tree` | — | Show the session tree |
+| `/tree events [limit]` | — | Show the current session event timeline |
+| `/tree fork <event_index> [title]` | — | Fork from a specific event and switch to it |
 | `/compress` | `/compact` | Manually trigger context compression |
 | `/retry` | — | Discard last turn, re-answer |
 | `/undo` | — | Undo last turn (back to user input) |
@@ -291,7 +322,24 @@ Goal behavior:
 | `/provider` | Show current provider info |
 | `/mode <pentest\|audit\|reverse\|research>` | Switch working mode |
 | `/config` | Show current configuration |
-| `/config set <key> <value>` | Modify configuration |
+| `/config set <key> <value>` | For safety settings, use `/permissions` or `/guards`; edit YAML for other keys |
+
+### Safety Controls
+
+| Command | Description |
+|---------|-------------|
+| `/permissions` | Explain the current permission mode, allow list, deny list, and read-only auto-approval |
+| `/permissions mode <default\|plan\|read-only\|accept-edits\|dont-ask\|bypass>` | Switch tool authorization mode |
+| `/permissions allow <tool\|prefix*\|*suffix>` | Add an allow pattern |
+| `/permissions deny <tool\|prefix*\|*suffix>` | Add a deny pattern |
+| `/permissions remove <allow\|deny> <pattern>` | Remove a policy pattern |
+| `/permissions auto-read-only <on\|off>` | Toggle automatic approval for read-only tools |
+| `/permissions reset` | Restore default permission policy |
+| `/guards` | Explain enabled guard checks |
+| `/guards enable <guard-name>` | Enable one guard |
+| `/guards disable <guard-name>` | Disable one guard |
+| `/guards all <on\|off>` | Enable or disable all guard checks |
+| `/guards window <count>` | Set the repetition guard window |
 
 ### Tools
 
@@ -423,18 +471,20 @@ The Mind Palace is Holmes' unified cognitive system with three layers:
 
 ### GuardChain
 
-Three PreGuards (block before execution) + five PostGuards (process results, update state):
+GuardChain is assembled from `guards:` config and can be inspected or changed from the TUI with `/guards`:
 
 | Guard | Type | Function |
 |-------|------|----------|
 | `ImmutableFieldGuard` | Pre | Blocks requests to non-target hosts/IPs |
 | `DangerousCommandGuard` | Pre | Blocks destructive commands (`rm -rf`, fork bombs, container escapes) |
 | `RepetitionGuard` | Pre | Blocks the 4th repeat of the same semantic signature |
+| `FileTrackerPreGuard` | Pre | Seeds read/write state before file-affecting tools |
 | `AttackSurfaceUpdater` | Post | Extracts ports, services, tech stack, endpoints |
 | `EvidenceExtractor` | Post | Extracts credentials, object references |
 | `SkepticGate` | Post | Validates findings against action history |
 | `FailureTracker` | Post | Tracks consecutive failures |
 | `Soft404Detector` | Post | Fingerprints soft-404 responses |
+| `FileTrackerPostGuard` | Post | Records read/write effects after file-affecting tools |
 
 ### Event System
 
@@ -465,7 +515,7 @@ SQLite + FTS5 for persistent session storage. Key features:
 
 ### Tool System
 
-Nine built-in tools, extensible via the `Tool` trait and MCP:
+The CLI registers these core tools, then extends them with optional subagent and MCP tools:
 
 | Tool | Description | Read-only |
 |------|-------------|-----------|
@@ -478,7 +528,9 @@ Nine built-in tools, extensible via the `Tool` trait and MCP:
 | `add_hypothesis` | Register attack hypothesis | No |
 | `reject_hypothesis` | Reject active hypothesis | No |
 | `confirm_hypothesis` | Confirm active hypothesis with evidence | No |
-| `browser` | Playwright browser automation (when enabled) | No |
+| `spawn_subagent` | Delegate a task to a nested Holmes runtime when subagents are enabled | No |
+
+The browser tool module is still present for future registration, but it is not part of the current default `register_all` path.
 
 ### LLM Layer
 
@@ -700,7 +752,8 @@ agent:
   generate_reports: true
 
 permissions:
-  # default | plan | read_only | dont_ask | bypass
+  # YAML values: default | plan | read_only | accept_edits | dont_ask | bypass
+  # TUI aliases: /permissions mode read-only | accept-edits | dont-ask
   mode: default
   allowed_tools: []
   disallowed_tools: []
@@ -745,6 +798,7 @@ guards:
   skeptic_gate: true
   failure_tracker: true
   soft404: true
+  read_state_seeding: true
 
 memory:
   db_path: data/memory.db
@@ -786,9 +840,9 @@ holmes/
     ├── holmes-session/        # SessionDB, MemoryStore, Selector
     ├── holmes-llm/            # Multi-provider LLM client
     ├── holmes-tools/          # Tool trait, ToolRegistry, built-in tools, MCP
-    ├── holmes-guards/         # GuardChain (PreGuards + PostGuards)
+    ├── holmes-guards/         # GuardChain (configurable pre/post guards)
     ├── holmes-mind-palace/    # Mind Palace (memory + context + dashboard)
-    └── holmes-cli/            # CLI binary (REPL, setup, slash commands, workflows)
+    └── holmes-cli/            # CLI binary (full-screen TUI, legacy REPL, setup, slash commands)
 ```
 
 ### Key Design Decisions

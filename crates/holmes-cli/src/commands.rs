@@ -122,6 +122,13 @@ impl Default for CommandRegistry {
             args_hint: None,
         });
         registry.register(CommandDef {
+            name: "tree",
+            aliases: &[],
+            description: "显示会话树、事件时间线，或从指定事件分叉",
+            category: "会话管理",
+            args_hint: Some("[events|fork <event_index> [title]]"),
+        });
+        registry.register(CommandDef {
             name: "rename",
             aliases: &["title"],
             description: "重命名当前会话",
@@ -238,6 +245,20 @@ impl Default for CommandRegistry {
             description: "显示或修改当前配置",
             category: "配置",
             args_hint: Some("[set <key> <value>]"),
+        });
+        registry.register(CommandDef {
+            name: "permissions",
+            aliases: &["permission", "perm"],
+            description: "查看或调整工具权限策略",
+            category: "配置",
+            args_hint: Some("[mode|allow|deny|remove|auto-read-only|reset]"),
+        });
+        registry.register(CommandDef {
+            name: "guards",
+            aliases: &["guard"],
+            description: "查看或开关 GuardChain 防护层",
+            category: "配置",
+            args_hint: Some("[enable|disable|all|window]"),
         });
 
         // Tools

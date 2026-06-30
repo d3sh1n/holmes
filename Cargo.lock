@@ -691,6 +691,7 @@ dependencies = [
  "holmes-mind-palace",
  "holmes-session",
  "holmes-tools",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

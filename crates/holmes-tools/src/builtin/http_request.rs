@@ -96,9 +96,13 @@ impl Tool for HttpRequestTool {
             .collect();
         let body = resp.text().await.unwrap_or_default();
         let truncated = if body.len() > BODY_LIMIT {
+            let mut limit = BODY_LIMIT;
+            while limit > 0 && !body.is_char_boundary(limit) {
+                limit -= 1;
+            }
             format!(
                 "{}...[truncated, {} total]",
-                &body[..BODY_LIMIT],
+                &body[..limit],
                 body.len()
             )
         } else {

@@ -48,7 +48,11 @@ impl ActionEngine {
             if !decision.allowed {
                 record_tool_call(context, call).await?;
                 record_tool_blocked(context, call, "permission", &decision.reason).await?;
-                let result = ToolResult::blocked(&call.id, decision.reason);
+                let mut result = ToolResult::blocked(&call.id, decision.reason);
+                let middlewares = context.middlewares.clone();
+                for mw in &middlewares {
+                    mw.after_tool_call(context, &mut result).await?;
+                }
                             for hook in &self.hooks {
                 let _ = hook.post_tool_use(call, &result);
             }
@@ -72,7 +76,11 @@ impl ActionEngine {
             if let Some(reason) = hook_blocked {
                 record_tool_call(context, call).await?;
                 record_tool_blocked(context, call, "hook", &reason).await?;
-                let result = ToolResult::blocked(&call.id, reason);
+                let mut result = ToolResult::blocked(&call.id, reason);
+                let middlewares = context.middlewares.clone();
+                for mw in &middlewares {
+                    mw.after_tool_call(context, &mut result).await?;
+                }
                             for hook in &self.hooks {
                 let _ = hook.post_tool_use(call, &result);
             }
@@ -92,7 +100,11 @@ impl ActionEngine {
             record_tool_call(context, call).await?;
 
             let result = if !context.tools.contains(&call.function.name) {
-                let result = context.tools.execute(call).await;
+                let mut result = context.tools.execute(call).await;
+                let middlewares = context.middlewares.clone();
+                for mw in &middlewares {
+                    mw.after_tool_call(context, &mut result).await?;
+                }
                 record_tool_result(context, call, &result).await?;
                 result
             } else {
@@ -103,9 +115,18 @@ impl ActionEngine {
 
                 if !verdict.allowed {
                     record_tool_blocked(context, call, "guard", &verdict.guidance).await?;
-                    ToolResult::blocked(&call.id, verdict.guidance)
+                    let mut result = ToolResult::blocked(&call.id, verdict.guidance);
+                    let middlewares = context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.after_tool_call(context, &mut result).await?;
+                    }
+                    result
                 } else {
-                    let result = context.tools.execute(call).await;
+                    let mut result = context.tools.execute(call).await;
+                    let middlewares = context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.after_tool_call(context, &mut result).await?;
+                    }
                     record_tool_result(context, call, &result).await?;
 
                     context
@@ -177,7 +198,11 @@ async fn record_tool_blocked(
     append_and_ingest(context, blocked_event).await
 }
 
-async fn append_and_ingest(context: &mut RuntimeContext, event: Event) -> Result<(), RuntimeError> {
+async fn append_and_ingest(context: &mut RuntimeContext, mut event: Event) -> Result<(), RuntimeError> {
+    let middlewares = context.middlewares.clone();
+    for mw in &middlewares {
+        mw.before_event_persist(context, &mut event).await?;
+    }
     context
         .session_db
         .append_event(&context.session_id, &event)
@@ -207,7 +232,7 @@ mod tests {
     use holmes_guards::traits::{PostGuard, PreGuard};
     use holmes_guards::GuardChain;
     use holmes_mind_palace::MindPalace;
-    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
+    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
     use holmes_tools::{Tool, ToolRegistry};
 
     use crate::context::{RuntimeContext, RuntimeState};

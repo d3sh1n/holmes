@@ -1090,7 +1090,7 @@ mod tests {
     use holmes_core::{LlmResponse, SessionMode};
     use holmes_guards::GuardChain;
     use holmes_mind_palace::MindPalace;
-    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
+    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
     use holmes_tools::ToolRegistry;
 
     use crate::context::{DeductionHypothesisStatus, RuntimeState};

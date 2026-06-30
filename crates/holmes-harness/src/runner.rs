@@ -11,7 +11,7 @@ use holmes_mind_palace::MindPalace;
 use holmes_runtime::context::{RuntimeContext, RuntimeState};
 use holmes_runtime::runtime::{AgentRuntime, TurnOutcome};
 use holmes_runtime::{RuntimeSink, RuntimeYield, StreamEvent};
-use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
+use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
 use holmes_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -33,7 +33,7 @@ impl HarnessRunner {
     pub async fn run(&self, scenario: HarnessScenario) -> Result<HarnessReport> {
         let session_mode = scenario.mode();
         let session_id = Uuid::new_v4().to_string();
-        let session_db = Arc::new(SessionDB::open(":memory:").await?);
+        let session_db: Arc<dyn SessionStore> = Arc::new(SessionDB::open(":memory:").await?);
         let memory_store = Arc::new(MemoryStore::open(":memory:").await?);
         let system_prompt = format!(
             "You are Holmes running inside a deterministic harness scenario named {}.",

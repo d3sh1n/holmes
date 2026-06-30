@@ -1,5 +1,5 @@
 use anyhow::Context;
-use holmes_core::config::{ApiFormat, Config, HolmesConfig};
+use holmes_core::config::{ApiFormat, Config, GuardConfig, HolmesConfig, PermissionMode};
 use holmes_core::event::{Event, ReportGenerator, ReportType, StoredEvent};
 use holmes_core::session::RuntimeSession;
 use holmes_core::tool_types::{Message, Role};
@@ -10,15 +10,15 @@ use holmes_mind_palace::MindPalace;
 use holmes_runtime::deliberation::LlmBackend;
 use holmes_runtime::runtime::{AgentRuntime, TurnOutcome};
 use holmes_runtime::{RuntimeContext, RuntimeSink, RuntimeState, RuntimeYield, StreamEvent};
-use holmes_session::db::{CreateSessionParams, SessionDB};
 use holmes_session::memory_store::MemoryStore;
 use holmes_session::selector::Selector;
+use holmes_session::{CreateSessionParams, SessionDB, SessionStore};
 use holmes_tools::ToolRegistry;
 use reedline::{
     default_emacs_keybindings, Completer, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers,
-    Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, MenuBuilder,
+    MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -70,7 +70,7 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
-fn parse_mode(s: &str) -> SessionMode {
+pub(crate) fn parse_mode(s: &str) -> SessionMode {
     match s.to_lowercase().as_str() {
         "code_audit" | "audit" | "code-audit" => SessionMode::CodeAudit,
         "reverse" | "re" => SessionMode::Reverse,
@@ -89,14 +89,16 @@ fn api_format_label(fmt: &ApiFormat) -> &'static str {
 
 async fn build_tool_registry(
     config: &Config,
-    session_db: Option<Arc<SessionDB>>,
+    session_db: Option<Arc<dyn SessionStore>>,
     memory_store: Option<Arc<MemoryStore>>,
     llm: Option<Arc<LlmClient>>,
     session_id: Option<String>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    
-    let runner = if let (Some(db), Some(ms), Some(l), Some(sid)) = (session_db, memory_store, llm, session_id) {
+
+    let runner = if let (Some(db), Some(ms), Some(l), Some(sid)) =
+        (session_db, memory_store, llm, session_id)
+    {
         Some(std::sync::Arc::new(crate::subagent::CliSubagentRunner {
             session_db: db,
             memory_store: ms,
@@ -113,36 +115,82 @@ async fn build_tool_registry(
     registry
 }
 
-fn replay_event_into_runtime(
+fn replay_events_into_runtime(
     session: &mut RuntimeSession,
     mind_palace: &mut MindPalace,
-    event: Event,
+    events: &[StoredEvent],
 ) {
-    mind_palace.ingest(event.clone());
-    match event {
-        Event::UserMessage { content, .. } => {
-            session.messages.push(Message::user(content));
+    use holmes_core::tool_types::{FunctionCall, Role, ToolCall};
+
+    let mut pending_tool_calls = Vec::<(String, String)>::new(); // (tool_name, call_id)
+
+    for se in events {
+        let event = se.event.clone();
+        mind_palace.ingest(event.clone());
+        match event {
+            Event::UserMessage { content, .. } => {
+                session.messages.push(Message::user(content));
+            }
+            Event::Thinking { content, .. } => {
+                session.messages.push(Message::assistant(content));
+            }
+            Event::ToolCall {
+                name, arguments, ..
+            } => {
+                let call_id = format!("replayed-{}", uuid::Uuid::new_v4());
+                let tool_call = ToolCall {
+                    id: call_id.clone(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: name.clone(),
+                        arguments: arguments.to_string(),
+                    },
+                };
+                pending_tool_calls.push((name.clone(), call_id));
+
+                if let Some(last_msg) = session.messages.last_mut() {
+                    if last_msg.role == Role::Assistant {
+                        if let Some(ref mut tc) = last_msg.tool_calls {
+                            tc.push(tool_call);
+                        } else {
+                            last_msg.tool_calls = Some(vec![tool_call]);
+                        }
+                    } else {
+                        session
+                            .messages
+                            .push(Message::assistant_with_tool_calls(vec![tool_call]));
+                    }
+                } else {
+                    session
+                        .messages
+                        .push(Message::assistant_with_tool_calls(vec![tool_call]));
+                }
+            }
+            Event::ToolResult { name, content, .. } => {
+                let matched_idx = pending_tool_calls
+                    .iter()
+                    .position(|(tname, _)| tname == &name);
+                let call_id = if let Some(idx) = matched_idx {
+                    pending_tool_calls.remove(idx).1
+                } else {
+                    format!("replayed-orphan-{}", session.messages.len())
+                };
+                session
+                    .messages
+                    .push(Message::tool_result(call_id, name, content));
+            }
+            Event::SessionModeSet { mode } => {
+                session.mode = mode;
+            }
+            _ => {}
         }
-        Event::Thinking { content, .. } => {
-            session.messages.push(Message::assistant(content));
-        }
-        Event::ToolResult { name, content, .. } => {
-            let call_id = format!("replayed-{}", session.messages.len());
-            session
-                .messages
-                .push(Message::tool_result(call_id, name, content));
-        }
-        Event::SessionModeSet { mode } => {
-            session.mode = mode;
-        }
-        _ => {}
     }
 }
 
 /// Mutable runtime context for the chat REPL — shared with all slash command handlers.
 pub struct ChatContext {
     pub session_id: String,
-    pub session_db: Arc<SessionDB>,
+    pub session_db: Arc<dyn SessionStore>,
     pub memory_store: Arc<MemoryStore>,
     pub llm: Arc<LlmClient>,
     pub registry: Arc<ToolRegistry>,
@@ -158,6 +206,456 @@ pub struct ChatContext {
     pub config: Config,
     pub data_dir: PathBuf,
     pub command_registry: CommandRegistry,
+}
+
+pub(crate) fn save_config(ctx: &ChatContext) -> anyhow::Result<()> {
+    let path = ctx.data_dir.join("config.yaml");
+    let yaml = serde_yaml::to_string(&ctx.config)?;
+    std::fs::write(&path, yaml)
+        .with_context(|| format!("failed to write config at {}", path.display()))?;
+    Ok(())
+}
+
+fn rebuild_selector(ctx: &mut ChatContext) {
+    let mut selector = Selector::new();
+    for wf in workflows::create_builtin_workflows(
+        ctx.llm.clone(),
+        ctx.registry.clone(),
+        ctx.guards.clone(),
+    ) {
+        selector.register(wf);
+    }
+    ctx.selector = selector;
+}
+
+pub(crate) fn refresh_guard_chain(ctx: &mut ChatContext) {
+    ctx.runtime_guards = GuardChain::from_config(&ctx.config.guards);
+    ctx.guards = Arc::new(Mutex::new(GuardChain::from_config(&ctx.config.guards)));
+    rebuild_selector(ctx);
+}
+
+pub(crate) async fn load_session_runtime(
+    ctx: &ChatContext,
+    session_id: &str,
+    mode: SessionMode,
+) -> anyhow::Result<(RuntimeSession, MindPalace)> {
+    let events = ctx.session_db.get_events(session_id).await?;
+    let mut mind_palace = MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
+    let mut runtime_session =
+        RuntimeSession::new(session_id.to_string(), mode).with_system_prompt(&ctx.system_prompt);
+    replay_events_into_runtime(&mut runtime_session, &mut mind_palace, &events);
+    Ok((runtime_session, mind_palace))
+}
+
+fn print_session_tree(sessions: &[SessionSummary], current_id: &str) {
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        return;
+    }
+
+    let mut children: BTreeMap<Option<String>, Vec<usize>> = BTreeMap::new();
+    for (idx, session) in sessions.iter().enumerate() {
+        children
+            .entry(session.parent_session_id.clone())
+            .or_default()
+            .push(idx);
+    }
+    for indexes in children.values_mut() {
+        indexes.sort_by_key(|idx| {
+            std::cmp::Reverse(
+                sessions[*idx]
+                    .last_active
+                    .unwrap_or(sessions[*idx].started_at),
+            )
+        });
+    }
+
+    println!("Session tree:");
+    let mut visited = BTreeSet::new();
+    if let Some(roots) = children.get(&None) {
+        for (pos, idx) in roots.iter().enumerate() {
+            print_session_tree_node(
+                sessions,
+                &children,
+                *idx,
+                "",
+                pos + 1 == roots.len(),
+                current_id,
+                &mut visited,
+            );
+        }
+    }
+
+    for (idx, session) in sessions.iter().enumerate() {
+        if !visited.contains(&session.id) {
+            let last = idx + 1 == sessions.len();
+            print_session_tree_node(sessions, &children, idx, "", last, current_id, &mut visited);
+        }
+    }
+
+    println!(
+        "\nUse /resume <id> to switch, /tree events to inspect this session, or /tree fork <event_index> [title]."
+    );
+}
+
+fn print_session_tree_node(
+    sessions: &[SessionSummary],
+    children: &BTreeMap<Option<String>, Vec<usize>>,
+    idx: usize,
+    prefix: &str,
+    is_last: bool,
+    current_id: &str,
+    visited: &mut BTreeSet<String>,
+) {
+    let session = &sessions[idx];
+    if !visited.insert(session.id.clone()) {
+        return;
+    }
+
+    let connector = if prefix.is_empty() {
+        ""
+    } else if is_last {
+        "└─ "
+    } else {
+        "├─ "
+    };
+    let current = if session.id == current_id { "→" } else { " " };
+    let title = session.title.as_deref().unwrap_or("(untitled)");
+    let preview = session.preview.as_deref().unwrap_or("");
+    let active_at = session.last_active.unwrap_or(session.started_at);
+    println!(
+        "{}{}{} {}  {:?}  {} msg  {}  {}",
+        prefix,
+        connector,
+        current,
+        short_id(&session.id),
+        session.mode,
+        session.message_count,
+        format_relative_time(active_at),
+        truncate_chars(title, 36),
+    );
+    if !preview.trim().is_empty() {
+        println!(
+            "{}{}    {}",
+            prefix,
+            if prefix.is_empty() { "" } else { "  " },
+            truncate_chars(preview.trim(), 72),
+        );
+    }
+
+    let child_prefix = if prefix.is_empty() {
+        String::new()
+    } else if is_last {
+        format!("{prefix}   ")
+    } else {
+        format!("{prefix}│  ")
+    };
+    if let Some(child_indexes) = children.get(&Some(session.id.clone())) {
+        for (pos, child_idx) in child_indexes.iter().enumerate() {
+            print_session_tree_node(
+                sessions,
+                children,
+                *child_idx,
+                &child_prefix,
+                pos + 1 == child_indexes.len(),
+                current_id,
+                visited,
+            );
+        }
+    }
+}
+
+fn print_event_timeline(events: &[StoredEvent], limit: usize) {
+    if events.is_empty() {
+        println!("No events recorded in this session.");
+        return;
+    }
+
+    let start = events.len().saturating_sub(limit);
+    println!("Current session events:");
+    for event in &events[start..] {
+        println!(
+            "  {:>4}  {:<24} {}",
+            event.event_index,
+            event_type_label(&event.event),
+            truncate_chars(&event_summary(&event.event), 92),
+        );
+    }
+    if start > 0 {
+        println!("  ... {} earlier event(s) hidden", start);
+    }
+}
+
+pub(crate) fn event_type_label(event: &Event) -> &'static str {
+    match event {
+        Event::UserMessage { .. } => "user",
+        Event::Thinking { .. } => "assistant",
+        Event::ToolCall { .. } => "tool_call",
+        Event::ToolResult { .. } => "tool_result",
+        Event::ToolBlocked { .. } => "tool_blocked",
+        Event::TurnComplete { .. } => "turn_complete",
+        Event::GoalSet { .. } => "goal_set",
+        Event::GoalEvaluated { .. } => "goal_evaluated",
+        Event::GoalCleared { .. } => "goal_cleared",
+        Event::EvidenceObserved { .. } => "evidence",
+        Event::FactRecorded { .. } => "fact",
+        Event::HypothesisProposed { .. } => "hypothesis",
+        Event::HypothesisSupported { .. } => "hypothesis_supported",
+        Event::HypothesisContradicted { .. } => "hypothesis_contradicted",
+        Event::HypothesisRejected { .. } => "hypothesis_rejected",
+        Event::HypothesisConfirmed { .. } => "hypothesis_confirmed",
+        Event::ConclusionDrawn { .. } => "conclusion",
+        Event::ReflectionRecorded { .. } => "reflection",
+        Event::MemoryStored { .. } => "memory_stored",
+        Event::MemoryRecalled { .. } => "memory_recalled",
+        Event::CompressionApplied { .. } => "compression",
+        Event::ContextSnapshotTaken { .. } => "snapshot",
+        Event::ReportGenerated { .. } => "report",
+        Event::SubAgentSpawned { .. } => "subagent_spawned",
+        Event::SubAgentCompleted { .. } => "subagent_done",
+        Event::SubAgentProgress { .. } => "subagent_progress",
+        _ => "event",
+    }
+}
+
+pub(crate) fn event_summary(event: &Event) -> String {
+    match event {
+        Event::UserMessage { content, .. } => content.clone(),
+        Event::Thinking { content, .. } => content.clone(),
+        Event::ToolCall {
+            name, arguments, ..
+        } => format!("{name} {arguments}"),
+        Event::ToolResult {
+            name,
+            success,
+            content,
+            ..
+        } => format!(
+            "{name} [{}] {content}",
+            if *success { "ok" } else { "failed" }
+        ),
+        Event::ToolBlocked {
+            tool_name, reason, ..
+        } => format!("{tool_name}: {reason}"),
+        Event::GoalSet { condition, .. } => condition.clone(),
+        Event::GoalEvaluated {
+            satisfied, reason, ..
+        } => format!("satisfied={satisfied}: {reason}"),
+        Event::GoalCleared { reason } => reason.clone(),
+        Event::EvidenceObserved {
+            evidence_id,
+            summary,
+            ..
+        } => {
+            format!("{evidence_id}: {summary}")
+        }
+        Event::FactRecorded {
+            fact_id, statement, ..
+        } => format!("{fact_id}: {statement}"),
+        Event::HypothesisProposed {
+            hypothesis_id,
+            statement,
+            ..
+        } => format!("{hypothesis_id}: {statement}"),
+        Event::HypothesisSupported {
+            hypothesis_id,
+            evidence_id,
+            ..
+        } => format!("{hypothesis_id} supported by {evidence_id}"),
+        Event::HypothesisContradicted {
+            hypothesis_id,
+            evidence_id,
+            ..
+        } => format!("{hypothesis_id} contradicted by {evidence_id}"),
+        Event::HypothesisRejected {
+            hypothesis_id,
+            reason,
+        } => format!("{hypothesis_id}: {reason}"),
+        Event::HypothesisConfirmed {
+            hypothesis_id,
+            conclusion,
+            ..
+        } => format!("{hypothesis_id}: {conclusion}"),
+        Event::ConclusionDrawn { conclusion, .. } => conclusion.clone(),
+        Event::ReflectionRecorded {
+            diagnosis,
+            lessons_learned,
+            ..
+        } => format!("{diagnosis}; next: {lessons_learned}"),
+        Event::MemoryStored { content, .. } => content.clone(),
+        Event::MemoryRecalled { memory_ids, .. } => format!("{} memory item(s)", memory_ids.len()),
+        Event::CompressionApplied {
+            before_count,
+            after_count,
+            summary,
+            ..
+        } => format!("{before_count} -> {after_count}: {summary}"),
+        Event::ContextSnapshotTaken { summary, .. } => summary.clone(),
+        Event::ReportGenerated { file_path, .. } => file_path.clone(),
+        Event::TurnComplete { event_range, .. } => {
+            format!("events {}..{}", event_range.0, event_range.1)
+        }
+        _ => event.content_text(),
+    }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn parse_bool_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enable" | "enabled" => Some(true),
+        "off" | "false" | "no" | "0" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn print_permissions(ctx: &ChatContext) {
+    let permissions = &ctx.config.permissions;
+    println!("Permissions:");
+    println!("  Mode: {}", permissions.mode);
+    println!(
+        "  Auto-approve read-only tools: {}",
+        if permissions.auto_approve_read_only {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!(
+        "  Allowlist: {}",
+        if permissions.allowed_tools.is_empty() {
+            "(empty: all tools are eligible)".into()
+        } else {
+            permissions.allowed_tools.join(", ")
+        }
+    );
+    println!(
+        "  Denylist:  {}",
+        if permissions.disallowed_tools.is_empty() {
+            "(empty)".into()
+        } else {
+            permissions.disallowed_tools.join(", ")
+        }
+    );
+    println!("\nModes:");
+    println!("  default      read-only tools auto-run; other tools remain policy-controlled");
+    println!("  plan         block all tools; Holmes must plan or ask Watson");
+    println!("  read-only    allow only read-only tools");
+    println!("  accept-edits allow mutating tools while guards still run");
+    println!("  dont-ask     non-interactive autonomy; policy lists still apply");
+    println!("  bypass       maximum autonomy; GuardChain still applies");
+}
+
+fn print_guards(config: &GuardConfig) {
+    println!("GuardChain:");
+    println!(
+        "  immutable-field    {}  blocks overwriting protected state",
+        on_off(config.immutable_field)
+    );
+    println!(
+        "  dangerous-command  {}  blocks obviously destructive shell actions",
+        on_off(config.dangerous_command)
+    );
+    println!(
+        "  repetition         {}  blocks repeated low-value tool loops",
+        on_off(config.repetition)
+    );
+    println!(
+        "  attack-surface     {}  extracts ports, services, endpoints, credentials",
+        on_off(config.attack_surface)
+    );
+    println!(
+        "  evidence-extractor {}  extracts findings and evidence bundles",
+        on_off(config.evidence_extractor)
+    );
+    println!(
+        "  skeptic-gate       {}  keeps weak findings from becoming conclusions",
+        on_off(config.skeptic_gate)
+    );
+    println!(
+        "  failure-tracker    {}  records failed actions for reflection",
+        on_off(config.failure_tracker)
+    );
+    println!(
+        "  soft404            {}  detects false-positive HTTP probes",
+        on_off(config.soft404)
+    );
+    println!(
+        "  read-state-seeding {}  lets read tools seed guard state safely",
+        on_off(config.read_state_seeding)
+    );
+    println!("  repetition-window  {}", config.repetition_window);
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on "
+    } else {
+        "off"
+    }
+}
+
+fn set_guard_flag(config: &mut GuardConfig, name: &str, enabled: bool) -> Option<&'static str> {
+    match normalize_guard_name(name).as_str() {
+        "immutable_field" => {
+            config.immutable_field = enabled;
+            Some("immutable-field")
+        }
+        "dangerous_command" => {
+            config.dangerous_command = enabled;
+            Some("dangerous-command")
+        }
+        "repetition" => {
+            config.repetition = enabled;
+            Some("repetition")
+        }
+        "attack_surface" => {
+            config.attack_surface = enabled;
+            Some("attack-surface")
+        }
+        "evidence_extractor" => {
+            config.evidence_extractor = enabled;
+            Some("evidence-extractor")
+        }
+        "skeptic_gate" => {
+            config.skeptic_gate = enabled;
+            Some("skeptic-gate")
+        }
+        "failure_tracker" => {
+            config.failure_tracker = enabled;
+            Some("failure-tracker")
+        }
+        "soft404" => {
+            config.soft404 = enabled;
+            Some("soft404")
+        }
+        "read_state_seeding" => {
+            config.read_state_seeding = enabled;
+            Some("read-state-seeding")
+        }
+        _ => None,
+    }
+}
+
+fn set_all_guard_flags(config: &mut GuardConfig, enabled: bool) {
+    config.immutable_field = enabled;
+    config.dangerous_command = enabled;
+    config.repetition = enabled;
+    config.attack_surface = enabled;
+    config.evidence_extractor = enabled;
+    config.skeptic_gate = enabled;
+    config.failure_tracker = enabled;
+    config.soft404 = enabled;
+    config.read_state_seeding = enabled;
+}
+
+fn normalize_guard_name(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_")
 }
 
 struct CliRuntimeSink;
@@ -290,7 +788,7 @@ fn short_call_id(call_id: &str) -> String {
     format!("{head}...{tail}")
 }
 
-fn folded_tool_output_summary(content: &str) -> String {
+pub(crate) fn folded_tool_output_summary(content: &str) -> String {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return "no output".into();
@@ -368,7 +866,7 @@ fn folded_tool_output_preview(content: &str) -> Option<String> {
     Some(truncate_chars(&single_line, MAX_PREVIEW_CHARS))
 }
 
-fn truncate_chars(content: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
         return content.to_string();
     }
@@ -390,10 +888,11 @@ fn indent_block(content: &str) -> String {
         .join("\n")
 }
 
-async fn run_runtime_input(
+pub(crate) async fn run_runtime_input_with_sink<S: RuntimeSink>(
     ctx: &mut ChatContext,
     input: String,
     oneshot: bool,
+    sink: &mut S,
 ) -> anyhow::Result<TurnOutcome> {
     apply_steering_notes(ctx).await?;
 
@@ -420,11 +919,10 @@ async fn run_runtime_input(
         ctx.config.clone(),
     );
     let mut runtime = AgentRuntime::new(runtime_context);
-    let mut sink = CliRuntimeSink;
     let result = if oneshot {
-        runtime.run_oneshot(input, &mut sink).await
+        runtime.run_oneshot(input, sink).await
     } else {
-        runtime.run_turn(input, &mut sink).await
+        runtime.run_turn(input, sink).await
     };
     let runtime_context = runtime.into_context();
 
@@ -435,6 +933,15 @@ async fn run_runtime_input(
     ctx.runtime_state = runtime_context.state;
 
     result.map_err(Into::into)
+}
+
+pub(crate) async fn run_runtime_input(
+    ctx: &mut ChatContext,
+    input: String,
+    oneshot: bool,
+) -> anyhow::Result<TurnOutcome> {
+    let mut sink = CliRuntimeSink;
+    run_runtime_input_with_sink(ctx, input, oneshot, &mut sink).await
 }
 
 async fn compact_chat_context(
@@ -497,7 +1004,7 @@ async fn apply_steering_notes(ctx: &mut ChatContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn drain_queued_turns(ctx: &mut ChatContext) {
+pub(crate) async fn drain_queued_turns(ctx: &mut ChatContext) {
     while let Some(input) = ctx.queued_turns.pop_front() {
         println!("Queued turn: {}", input);
         match run_runtime_input(ctx, input, false).await {
@@ -519,9 +1026,7 @@ async fn rebuild_runtime_from_events(ctx: &mut ChatContext) -> anyhow::Result<()
     let mut mind_palace = MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
     let mut runtime_session =
         RuntimeSession::new(ctx.session_id.clone(), mode).with_system_prompt(&ctx.system_prompt);
-    for stored in events {
-        replay_event_into_runtime(&mut runtime_session, &mut mind_palace, stored.event);
-    }
+    replay_events_into_runtime(&mut runtime_session, &mut mind_palace, &events);
 
     let mut runtime_state = RuntimeState::new(runtime_session.mode.clone());
     if let Some(session) = session_record {
@@ -716,13 +1221,48 @@ fn push_report_section(out: &mut String, title: &str, items: &[String]) {
     out.push('\n');
 }
 
-pub async fn run_chat(
+async fn create_fresh_runtime_session(
+    session_db: Arc<dyn SessionStore>,
+    memory_store: Arc<MemoryStore>,
+    mode: SessionMode,
+    model: Option<String>,
+    system_prompt: String,
+) -> anyhow::Result<(String, RuntimeSession, MindPalace, bool)> {
+    let session = session_db
+        .create_session(CreateSessionParams {
+            id: None,
+            title: None,
+            mode: Some(mode.clone()),
+            model,
+            system_prompt: Some(system_prompt.clone()),
+            parent_session_id: None,
+            fork_point: None,
+            source: Some("cli".into()),
+            tags: vec![],
+        })
+        .await?;
+    let mp = MindPalace::new(session_db.clone(), memory_store);
+    let sid = session.id.clone();
+    Ok((
+        session.id,
+        RuntimeSession::new(sid, mode).with_system_prompt(&system_prompt),
+        mp,
+        false,
+    ))
+}
+
+pub(crate) struct ChatStartup {
+    pub ctx: ChatContext,
+    pub is_resume: bool,
+}
+
+pub(crate) async fn create_chat_context(
     resume_id: Option<String>,
     continue_last: bool,
-    query: Option<String>,
     model: Option<String>,
     mode_str: String,
-) -> anyhow::Result<()> {
+    announce: bool,
+) -> anyhow::Result<Option<ChatStartup>> {
     let data_dir = holmes_data_dir();
     std::fs::create_dir_all(&data_dir)?;
 
@@ -735,13 +1275,14 @@ pub async fn run_chat(
         std::fs::write(&config_path, yaml)?;
         eprintln!("Created default config at {}", config_path.display());
         eprintln!("Please edit it to configure your LLM provider and API key.");
-        return Ok(());
+        return Ok(None);
     };
     let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let system_prompt = build_system_prompt(SYSTEM_PROMPT, &config, &project_dir);
+    let mode = parse_mode(&mode_str);
+    let system_prompt = build_system_prompt(SYSTEM_PROMPT, &config, &project_dir, mode.clone());
 
     let db_path = data_dir.join("holmes.db");
-    let session_db = Arc::new(SessionDB::open(&db_path).await?);
+    let session_db: Arc<dyn SessionStore> = Arc::new(SessionDB::open(&db_path).await?);
 
     let memory_path = data_dir.join("memory.db");
     let memory_store = Arc::new(MemoryStore::open(&memory_path).await?);
@@ -749,7 +1290,6 @@ pub async fn run_chat(
     let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
     let runtime_guards = GuardChain::from_config(&config.guards);
     let llm = Arc::new(LlmClient::new(&config));
-    let mode = parse_mode(&mode_str);
 
     // Create RuntimeSession
     let (session_id, runtime_session, mind_palace, is_resume) = if let Some(id) = resume_id {
@@ -757,10 +1297,10 @@ pub async fn run_chat(
         let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
         let mut session =
             RuntimeSession::new(id.clone(), mode.clone()).with_system_prompt(&system_prompt);
-        for se in &events {
-            replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
+        replay_events_into_runtime(&mut session, &mut mp, &events);
+        if announce {
+            eprintln!("↻ Resumed session {}", &id[..8.min(id.len())]);
         }
-        eprintln!("↻ Resumed session {}", &id[..8.min(id.len())]);
         (id, session, mp, true)
     } else if continue_last {
         let filter = SessionFilter {
@@ -773,56 +1313,30 @@ pub async fn run_chat(
             let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
             let mut session =
                 RuntimeSession::new(s.id.clone(), mode.clone()).with_system_prompt(&system_prompt);
-            for se in &events {
-                replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
+            replay_events_into_runtime(&mut session, &mut mp, &events);
+            if announce {
+                eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
             }
-            eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
             (s.id.clone(), session, mp, true)
         } else {
-            let session = session_db
-                .create_session(CreateSessionParams {
-                    id: None,
-                    title: None,
-                    mode: Some(mode.clone()),
-                    model: model.clone(),
-                    system_prompt: Some(system_prompt.clone()),
-                    parent_session_id: None,
-                    fork_point: None,
-                    source: Some("cli".into()),
-                    tags: vec![],
-                })
-                .await?;
-            let mp = MindPalace::new(session_db.clone(), memory_store.clone());
-            let sid = session.id.clone();
-            (
-                session.id,
-                RuntimeSession::new(sid, mode.clone()).with_system_prompt(&system_prompt),
-                mp,
-                false,
+            create_fresh_runtime_session(
+                session_db.clone(),
+                memory_store.clone(),
+                mode.clone(),
+                model.clone(),
+                system_prompt.clone(),
             )
+            .await?
         }
     } else {
-        let session = session_db
-            .create_session(CreateSessionParams {
-                id: None,
-                title: None,
-                mode: Some(mode.clone()),
-                model: model.clone(),
-                system_prompt: Some(system_prompt.clone()),
-                parent_session_id: None,
-                fork_point: None,
-                source: Some("cli".into()),
-                tags: vec![],
-            })
-            .await?;
-        let mp = MindPalace::new(session_db.clone(), memory_store.clone());
-        let sid = session.id.clone();
-        (
-            session.id,
-            RuntimeSession::new(sid, mode.clone()).with_system_prompt(&system_prompt),
-            mp,
-            false,
+        create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            mode.clone(),
+            model.clone(),
+            system_prompt.clone(),
         )
+        .await?
     };
 
     let registry = Arc::new(
@@ -845,7 +1359,7 @@ pub async fn run_chat(
     if let Some(session_record) = session_db.get_session(&session_id).await? {
         runtime_state.active_goal = session_record.goal_condition;
     }
-    let mut ctx = ChatContext {
+    let ctx = ChatContext {
         session_id,
         session_db: session_db.clone(),
         memory_store: memory_store.clone(),
@@ -865,6 +1379,22 @@ pub async fn run_chat(
         command_registry: CommandRegistry::default(),
     };
 
+    Ok(Some(ChatStartup { ctx, is_resume }))
+}
+
+pub async fn run_chat(
+    resume_id: Option<String>,
+    continue_last: bool,
+    query: Option<String>,
+    model: Option<String>,
+    mode_str: String,
+) -> anyhow::Result<()> {
+    let Some(ChatStartup { mut ctx, is_resume }) =
+        create_chat_context(resume_id, continue_last, model, mode_str, true).await?
+    else {
+        return Ok(());
+    };
+
     // One-shot query
     if let Some(q) = query {
         let _ = run_runtime_input(&mut ctx, q, true).await?;
@@ -875,15 +1405,60 @@ pub async fn run_chat(
     }
 
     // Interactive REPL
+    let initial_sessions = ctx
+        .session_db
+        .list_sessions(&SessionFilter {
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_default();
+
     #[derive(Clone)]
     struct CommandCompleter {
         commands: Vec<(String, String)>,
+        sessions: Vec<SessionSummary>,
     }
 
     impl Completer for CommandCompleter {
         fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
             let mut suggestions = Vec::new();
-            if line.starts_with('/') {
+            if line.starts_with("/resume ")
+                || (line.starts_with("/resume")
+                    && line.len() > 7
+                    && line.chars().nth(7) == Some(' '))
+            {
+                let prefix = if line[..pos].len() > 8 {
+                    &line[8..pos]
+                } else {
+                    ""
+                };
+                for (i, s) in self.sessions.iter().enumerate() {
+                    let num = (i + 1).to_string();
+                    let title = s.title.as_deref().unwrap_or("-");
+                    let preview = s.preview.as_deref().unwrap_or("");
+                    if num.starts_with(prefix)
+                        || s.id.starts_with(prefix)
+                        || title.to_lowercase().contains(&prefix.to_lowercase())
+                    {
+                        suggestions.push(Suggestion {
+                            value: num.clone(),
+                            description: Some(format!("{} - {}", title, preview)),
+                            extra: None,
+                            span: Span::new(8, pos),
+                            append_whitespace: false,
+                            match_indices: None,
+                            display_override: Some(format!(
+                                "{}  {:<20}  {}",
+                                num,
+                                title,
+                                &s.id[..8.min(s.id.len())]
+                            )),
+                            style: None,
+                        });
+                    }
+                }
+            } else if line.starts_with('/') {
                 let word = &line[..pos];
                 for (cmd, desc) in &self.commands {
                     if cmd.starts_with(word) {
@@ -906,14 +1481,12 @@ pub async fn run_chat(
 
     let completer = Box::new(CommandCompleter {
         commands: ctx.command_registry.all_command_hints(),
+        sessions: initial_sessions,
     });
 
-    let completion_menu = Box::new(
-        IdeMenu::default()
-            .with_name("completion_menu")
-    );
+    let completion_menu = Box::new(IdeMenu::default().with_name("completion_menu"));
 
-    let history_path = data_dir.join("history.txt");
+    let history_path = ctx.data_dir.join("history.txt");
     let history = match FileBackedHistory::with_file(1000, history_path) {
         Ok(h) => Box::new(h),
         Err(_) => Box::new(reedline::FileBackedHistory::default()),
@@ -951,11 +1524,27 @@ pub async fn run_chat(
         left: String,
     }
     impl reedline::Prompt for SimplePrompt {
-        fn render_prompt_left(&self) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed(&self.left) }
-        fn render_prompt_right(&self) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("") }
-        fn render_prompt_indicator(&self, _: reedline::PromptEditMode) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("") }
-        fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("::: ") }
-        fn render_prompt_history_search_indicator(&self, _: reedline::PromptHistorySearch) -> std::borrow::Cow<str> { std::borrow::Cow::Borrowed("? ") }
+        fn render_prompt_left(&self) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed(&self.left)
+        }
+        fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed("")
+        }
+        fn render_prompt_indicator(
+            &self,
+            _: reedline::PromptEditMode,
+        ) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed("")
+        }
+        fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed("::: ")
+        }
+        fn render_prompt_history_search_indicator(
+            &self,
+            _: reedline::PromptHistorySearch,
+        ) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed("? ")
+        }
     }
 
     loop {
@@ -964,7 +1553,9 @@ pub async fn run_chat(
         } else {
             "» "
         };
-        let prompt = SimplePrompt { left: prompt_str.to_string() };
+        let prompt = SimplePrompt {
+            left: prompt_str.to_string(),
+        };
 
         let sig = rl.read_line(&prompt);
         let trimmed = match sig {
@@ -1043,7 +1634,7 @@ async fn run_selector_loop(
     selector: &Selector,
     session: &mut RuntimeSession,
     llm: &Arc<LlmClient>,
-    session_db: &SessionDB,
+    session_db: &dyn SessionStore,
     session_id: &str,
 ) -> anyhow::Result<()> {
     // Run the chat workflow first (handles user input directly)
@@ -1095,7 +1686,7 @@ async fn run_selector_loop(
     Ok(())
 }
 
-enum SlashResult {
+pub(crate) enum SlashResult {
     Quit,
     Handled,
     NewSession(RuntimeSession, MindPalace, String),
@@ -1103,7 +1694,7 @@ enum SlashResult {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult {
+pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult {
     let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
     let cmd = parts[0].to_lowercase();
     let args = parts.get(1).copied().unwrap_or("").trim();
@@ -1154,7 +1745,56 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
 
         "resume" => {
             if args.is_empty() {
-                println!("Usage: /resume <id|title>");
+                let filter = SessionFilter {
+                    limit: Some(20),
+                    ..Default::default()
+                };
+                match ctx.session_db.list_sessions(&filter).await {
+                    Ok(sessions) => {
+                        if sessions.is_empty() {
+                            println!("No sessions found.");
+                        } else {
+                            println!("Recent sessions:\n");
+                            println!(
+                                "{:<4} {:<27} {:<51} {:<12} {}",
+                                "#", "Title", "Preview", "Last Active", "ID"
+                            );
+                            println!("{}", "-".repeat(101));
+                            for (i, s) in sessions.iter().enumerate() {
+                                let num = i + 1;
+                                let title = s.title.as_deref().unwrap_or("-");
+                                let preview = s.preview.as_deref().unwrap_or("");
+
+                                let truncated_title = if title.chars().count() > 25 {
+                                    format!("{}...", title.chars().take(22).collect::<String>())
+                                } else {
+                                    title.to_string()
+                                };
+                                let truncated_preview = if preview.chars().count() > 48 {
+                                    format!("{}...", preview.chars().take(45).collect::<String>())
+                                } else {
+                                    preview.to_string()
+                                };
+
+                                let relative_time = if let Some(dt) = s.last_active {
+                                    format_relative_time(dt)
+                                } else {
+                                    format_relative_time(s.started_at)
+                                };
+
+                                println!(
+                                    "{:<4} {:<27} {:<51} {:<12} {}",
+                                    num, truncated_title, truncated_preview, relative_time, s.id
+                                );
+                            }
+                            println!("\nUse /resume <number>, /resume <session id>, or /resume <session title> to continue.");
+                            println!("Example: /resume 2");
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to list sessions: {}", e);
+                    }
+                }
                 return SlashResult::Handled;
             }
             let filter = SessionFilter {
@@ -1163,9 +1803,18 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
             };
             match ctx.session_db.list_sessions(&filter).await {
                 Ok(sessions) => {
-                    let target = sessions
-                        .iter()
-                        .find(|s| s.id.starts_with(args) || s.title.as_deref() == Some(args));
+                    let target = if let Ok(num) = args.parse::<usize>() {
+                        if num >= 1 && num <= sessions.len() {
+                            Some(&sessions[num - 1])
+                        } else {
+                            None
+                        }
+                    } else {
+                        sessions
+                            .iter()
+                            .find(|s| s.id.starts_with(args) || s.title.as_deref() == Some(args))
+                    };
+
                     if let Some(s) = target {
                         ctx.session_db
                             .end_session(&ctx.session_id, EndReason::UserQuit)
@@ -1181,14 +1830,51 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                             MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
                         let mut rs = RuntimeSession::new(s.id.clone(), s.mode.clone())
                             .with_system_prompt(&ctx.system_prompt);
-                        for se in &events {
-                            replay_event_into_runtime(&mut rs, &mut mp, se.event.clone());
-                        }
                         println!(
-                            "↻ Resumed session {} ({})",
+                            "↻ Resuming session {} ({}) and replaying history...",
                             &s.id[..8.min(s.id.len())],
                             s.title.as_deref().unwrap_or("untitled"),
                         );
+                        replay_events_into_runtime(&mut rs, &mut mp, &events);
+                        for se in &events {
+                            match &se.event {
+                                Event::UserMessage { content, .. } => {
+                                    println!("\n> {}", content);
+                                }
+                                Event::Thinking { content, .. } => {
+                                    print_holmes(content);
+                                }
+                                Event::ToolCall { name, .. } => {
+                                    print_tool_started(name, None);
+                                }
+                                Event::ToolResult {
+                                    name,
+                                    success,
+                                    content,
+                                    ..
+                                } => {
+                                    print_tool_finished(name, *success, content);
+                                }
+                                Event::ToolBlocked {
+                                    tool_name, reason, ..
+                                } => {
+                                    print_permission_decision(tool_name, false, reason);
+                                }
+                                Event::GoalSet { condition, .. } => {
+                                    println!("  goal set: {}", condition);
+                                }
+                                Event::GoalEvaluated {
+                                    satisfied, reason, ..
+                                } => {
+                                    println!(
+                                        "  goal evaluated: satisfied={}, {}",
+                                        satisfied, reason
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        println!();
                         return SlashResult::NewSession(rs, mp, s.id.clone());
                     }
                     println!("Session not found: {}", args);
@@ -1255,6 +1941,96 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
             SlashResult::Handled
         }
 
+        "tree" => {
+            if args.is_empty() {
+                match ctx
+                    .session_db
+                    .list_sessions(&SessionFilter {
+                        include_children: true,
+                        limit: Some(200),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(sessions) => print_session_tree(&sessions, &ctx.session_id),
+                    Err(error) => eprintln!("Error: {}", error),
+                }
+                return SlashResult::Handled;
+            }
+
+            let mut parts = args.split_whitespace();
+            match parts.next().unwrap_or_default() {
+                "events" | "timeline" => {
+                    let limit = parts
+                        .next()
+                        .and_then(|raw| raw.parse::<usize>().ok())
+                        .unwrap_or(80);
+                    match ctx.session_db.get_events(&ctx.session_id).await {
+                        Ok(events) => print_event_timeline(&events, limit),
+                        Err(error) => eprintln!("Error: {}", error),
+                    }
+                }
+                "fork" | "branch" => {
+                    let Some(index_raw) = parts.next() else {
+                        println!("Usage: /tree fork <event_index> [title]");
+                        return SlashResult::Handled;
+                    };
+                    let Ok(fork_point) = index_raw.parse::<u64>() else {
+                        println!("Invalid event_index: {index_raw}");
+                        return SlashResult::Handled;
+                    };
+                    let title = parts.collect::<Vec<_>>().join(" ");
+                    let title = if title.trim().is_empty() {
+                        format!("branch at event {fork_point}")
+                    } else {
+                        title
+                    };
+                    match ctx
+                        .session_db
+                        .fork_session(&ctx.session_id, fork_point, &title)
+                        .await
+                    {
+                        Ok(new_session) => {
+                            match load_session_runtime(
+                                ctx,
+                                &new_session.id,
+                                new_session.mode.clone(),
+                            )
+                            .await
+                            {
+                                Ok((runtime_session, mind_palace)) => {
+                                    println!(
+                                        "Branched to {} at event_index={fork_point}.",
+                                        short_id(&new_session.id)
+                                    );
+                                    return SlashResult::NewSession(
+                                        runtime_session,
+                                        mind_palace,
+                                        new_session.id,
+                                    );
+                                }
+                                Err(error) => {
+                                    eprintln!("Branch created but reload failed: {}", error)
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("Error: {}", error),
+                    }
+                }
+                "help" => {
+                    println!("Usage:");
+                    println!("  /tree                         Show session tree");
+                    println!("  /tree events [limit]          Show current session event timeline");
+                    println!("  /tree fork <event_index> [title]");
+                }
+                other => {
+                    println!("Unknown /tree action: {other}");
+                    println!("Use /tree help for options.");
+                }
+            }
+            SlashResult::Handled
+        }
+
         "rename" | "title" => {
             if args.is_empty() {
                 if let Ok(Some(s)) = ctx.session_db.get_session(&ctx.session_id).await {
@@ -1269,26 +2045,43 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
 
         "branch" | "fork" => {
             let title = if args.is_empty() {
-                None
+                "branch".to_string()
             } else {
-                Some(args.to_string())
+                args.to_string()
             };
-            let fork_point = ctx.runtime_session.message_count() as u64;
+            let events = match ctx.session_db.get_events(&ctx.session_id).await {
+                Ok(events) => events,
+                Err(error) => {
+                    eprintln!("Error: {}", error);
+                    return SlashResult::Handled;
+                }
+            };
+            let fork_point = events
+                .last()
+                .map(|event| event.event_index)
+                .unwrap_or_default();
             match ctx
                 .session_db
-                .fork_session(
-                    &ctx.session_id,
-                    fork_point,
-                    title.as_deref().unwrap_or("branch"),
-                )
+                .fork_session(&ctx.session_id, fork_point, &title)
                 .await
             {
                 Ok(new_session) => {
-                    println!(
-                        "Branched to: {} ({})",
-                        &new_session.id[..8.min(new_session.id.len())],
-                        new_session.title.as_deref().unwrap_or("untitled"),
-                    );
+                    match load_session_runtime(ctx, &new_session.id, new_session.mode.clone()).await
+                    {
+                        Ok((runtime_session, mind_palace)) => {
+                            println!(
+                                "Branched to: {} ({})",
+                                short_id(&new_session.id),
+                                new_session.title.as_deref().unwrap_or("untitled"),
+                            );
+                            return SlashResult::NewSession(
+                                runtime_session,
+                                mind_palace,
+                                new_session.id,
+                            );
+                        }
+                        Err(error) => eprintln!("Branch created but reload failed: {}", error),
+                    }
                 }
                 Err(e) => eprintln!("Error: {}", e),
             }
@@ -1639,7 +2432,7 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
         "config" => {
             if args.starts_with("set ") {
                 println!(
-                    "Config editing not yet supported in REPL. Edit {} directly.",
+                    "Use /permissions or /guards for runtime safety settings. For other keys, edit {} directly.",
                     ctx.data_dir.join("config.yaml").display(),
                 );
             } else {
@@ -1654,6 +2447,247 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                         "disabled"
                     },
                 );
+            }
+            SlashResult::Handled
+        }
+
+        "permissions" | "permission" | "perm" => {
+            if args.is_empty() || matches!(args, "status" | "show") {
+                print_permissions(ctx);
+                return SlashResult::Handled;
+            }
+
+            let mut parts = args.split_whitespace();
+            match parts.next().unwrap_or_default() {
+                "mode" => {
+                    let Some(mode_raw) = parts.next() else {
+                        println!("Usage: /permissions mode <default|plan|read-only|accept-edits|dont-ask|bypass>");
+                        return SlashResult::Handled;
+                    };
+                    match mode_raw.parse::<PermissionMode>() {
+                        Ok(mode) => {
+                            ctx.config.permissions.mode = mode;
+                            match save_config(ctx) {
+                                Ok(()) => println!(
+                                    "Permission mode set to {}.",
+                                    ctx.config.permissions.mode
+                                ),
+                                Err(error) => eprintln!("Config save failed: {}", error),
+                            }
+                        }
+                        Err(error) => println!("{}", error),
+                    }
+                }
+                "allow" => {
+                    let Some(pattern) = parts.next() else {
+                        println!("Usage: /permissions allow <tool|pattern>");
+                        return SlashResult::Handled;
+                    };
+                    if !ctx
+                        .config
+                        .permissions
+                        .allowed_tools
+                        .iter()
+                        .any(|p| p == pattern)
+                    {
+                        ctx.config
+                            .permissions
+                            .allowed_tools
+                            .push(pattern.to_string());
+                    }
+                    match save_config(ctx) {
+                        Ok(()) => println!("Allowed tool pattern: {pattern}"),
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "deny" | "disallow" => {
+                    let Some(pattern) = parts.next() else {
+                        println!("Usage: /permissions deny <tool|pattern>");
+                        return SlashResult::Handled;
+                    };
+                    if !ctx
+                        .config
+                        .permissions
+                        .disallowed_tools
+                        .iter()
+                        .any(|p| p == pattern)
+                    {
+                        ctx.config
+                            .permissions
+                            .disallowed_tools
+                            .push(pattern.to_string());
+                    }
+                    match save_config(ctx) {
+                        Ok(()) => println!("Denied tool pattern: {pattern}"),
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "remove" | "rm" => {
+                    let list = parts.next().unwrap_or_default();
+                    let Some(pattern) = parts.next() else {
+                        println!("Usage: /permissions remove <allow|deny> <tool|pattern>");
+                        return SlashResult::Handled;
+                    };
+                    match list {
+                        "allow" | "allowed" => {
+                            ctx.config
+                                .permissions
+                                .allowed_tools
+                                .retain(|p| p != pattern);
+                        }
+                        "deny" | "denied" | "disallow" => {
+                            ctx.config
+                                .permissions
+                                .disallowed_tools
+                                .retain(|p| p != pattern);
+                        }
+                        _ => {
+                            println!("Expected allow or deny, got: {list}");
+                            return SlashResult::Handled;
+                        }
+                    }
+                    match save_config(ctx) {
+                        Ok(()) => println!("Removed {pattern} from {list}."),
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "auto-read-only" | "readonly-auto" => {
+                    let Some(value_raw) = parts.next() else {
+                        println!("Usage: /permissions auto-read-only <on|off>");
+                        return SlashResult::Handled;
+                    };
+                    let Some(value) = parse_bool_flag(value_raw) else {
+                        println!("Expected on/off, got: {value_raw}");
+                        return SlashResult::Handled;
+                    };
+                    ctx.config.permissions.auto_approve_read_only = value;
+                    match save_config(ctx) {
+                        Ok(()) => println!(
+                            "Auto-approve read-only tools: {}.",
+                            if value { "on" } else { "off" }
+                        ),
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "reset" => {
+                    ctx.config.permissions.mode = PermissionMode::Default;
+                    ctx.config.permissions.allowed_tools.clear();
+                    ctx.config.permissions.disallowed_tools.clear();
+                    ctx.config.permissions.auto_approve_read_only = true;
+                    match save_config(ctx) {
+                        Ok(()) => println!("Permissions reset to default."),
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "help" => {
+                    println!("Usage:");
+                    println!("  /permissions");
+                    println!(
+                        "  /permissions mode <default|plan|read-only|accept-edits|dont-ask|bypass>"
+                    );
+                    println!("  /permissions allow <tool|prefix*|*suffix>");
+                    println!("  /permissions deny <tool|prefix*|*suffix>");
+                    println!("  /permissions remove <allow|deny> <pattern>");
+                    println!("  /permissions auto-read-only <on|off>");
+                    println!("  /permissions reset");
+                }
+                other => {
+                    println!("Unknown /permissions action: {other}");
+                    println!("Use /permissions help for options.");
+                }
+            }
+            SlashResult::Handled
+        }
+
+        "guards" | "guard" => {
+            if args.is_empty() || matches!(args, "status" | "show") {
+                print_guards(&ctx.config.guards);
+                return SlashResult::Handled;
+            }
+
+            let mut parts = args.split_whitespace();
+            match parts.next().unwrap_or_default() {
+                "enable" | "on" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /guards enable <guard-name>");
+                        return SlashResult::Handled;
+                    };
+                    match set_guard_flag(&mut ctx.config.guards, name, true) {
+                        Some(label) => {
+                            refresh_guard_chain(ctx);
+                            match save_config(ctx) {
+                                Ok(()) => println!("Guard enabled: {label}"),
+                                Err(error) => eprintln!("Config save failed: {}", error),
+                            }
+                        }
+                        None => println!("Unknown guard: {name}"),
+                    }
+                }
+                "disable" | "off" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /guards disable <guard-name>");
+                        return SlashResult::Handled;
+                    };
+                    match set_guard_flag(&mut ctx.config.guards, name, false) {
+                        Some(label) => {
+                            refresh_guard_chain(ctx);
+                            match save_config(ctx) {
+                                Ok(()) => println!("Guard disabled: {label}"),
+                                Err(error) => eprintln!("Config save failed: {}", error),
+                            }
+                        }
+                        None => println!("Unknown guard: {name}"),
+                    }
+                }
+                "all" => {
+                    let Some(value_raw) = parts.next() else {
+                        println!("Usage: /guards all <on|off>");
+                        return SlashResult::Handled;
+                    };
+                    let Some(value) = parse_bool_flag(value_raw) else {
+                        println!("Expected on/off, got: {value_raw}");
+                        return SlashResult::Handled;
+                    };
+                    set_all_guard_flags(&mut ctx.config.guards, value);
+                    refresh_guard_chain(ctx);
+                    match save_config(ctx) {
+                        Ok(()) => {
+                            println!("All guards set to {}.", if value { "on" } else { "off" })
+                        }
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "window" | "repetition-window" => {
+                    let Some(value_raw) = parts.next() else {
+                        println!("Usage: /guards window <count>");
+                        return SlashResult::Handled;
+                    };
+                    let Ok(value) = value_raw.parse::<usize>() else {
+                        println!("Invalid window size: {value_raw}");
+                        return SlashResult::Handled;
+                    };
+                    ctx.config.guards.repetition_window = value.max(1);
+                    refresh_guard_chain(ctx);
+                    match save_config(ctx) {
+                        Ok(()) => println!(
+                            "Repetition guard window set to {}.",
+                            ctx.config.guards.repetition_window
+                        ),
+                        Err(error) => eprintln!("Config save failed: {}", error),
+                    }
+                }
+                "help" => {
+                    println!("Usage:");
+                    println!("  /guards");
+                    println!("  /guards enable <immutable-field|dangerous-command|repetition|attack-surface|evidence-extractor|skeptic-gate|failure-tracker|soft404|read-state-seeding>");
+                    println!("  /guards disable <guard-name>");
+                    println!("  /guards all <on|off>");
+                    println!("  /guards window <count>");
+                }
+                other => {
+                    println!("Unknown /guards action: {other}");
+                    println!("Use /guards help for options.");
+                }
             }
             SlashResult::Handled
         }
@@ -1682,13 +2716,16 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
 
         "mcp" => {
             if args == "reload" {
-                let registry = Arc::new(build_tool_registry(
-                    &ctx.config,
-                    Some(ctx.session_db.clone()),
-                    Some(ctx.memory_store.clone()),
-                    Some(ctx.llm.clone()),
-                    Some(ctx.session_id.clone()),
-                ).await);
+                let registry = Arc::new(
+                    build_tool_registry(
+                        &ctx.config,
+                        Some(ctx.session_db.clone()),
+                        Some(ctx.memory_store.clone()),
+                        Some(ctx.llm.clone()),
+                        Some(ctx.session_id.clone()),
+                    )
+                    .await,
+                );
                 let mut selector = Selector::new();
                 for wf in workflows::create_builtin_workflows(
                     ctx.llm.clone(),
@@ -1826,6 +2863,26 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
     }
 }
 
+pub(crate) fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(dt);
+    if duration.num_days() == 0 {
+        let today = now.date_naive();
+        let dt_day = dt.date_naive();
+        if today == dt_day {
+            "today".to_string()
+        } else if today.pred_opt() == Some(dt_day) {
+            "yesterday".to_string()
+        } else {
+            dt.format("%Y-%m-%d").to_string()
+        }
+    } else if duration.num_days() == 1 {
+        "yesterday".to_string()
+    } else {
+        dt.format("%Y-%m-%d").to_string()
+    }
+}
+
 pub async fn list_sessions() -> anyhow::Result<()> {
     let data_dir = holmes_data_dir();
     std::fs::create_dir_all(&data_dir)?;
@@ -1837,15 +2894,42 @@ pub async fn list_sessions() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?;
-    println!("Recent sessions:");
-    for s in &sessions {
-        let status = if s.ended_at.is_some() {
-            "ended"
-        } else {
-            "active"
-        };
-        let title = s.title.as_deref().unwrap_or("(untitled)");
-        println!("  {}  {:<8}  {}", &s.id[..8.min(s.id.len())], status, title);
+    if sessions.is_empty() {
+        println!("No sessions found.");
+    } else {
+        println!("Recent sessions:\n");
+        println!(
+            "{:<4} {:<27} {:<51} {:<12} {}",
+            "#", "Title", "Preview", "Last Active", "ID"
+        );
+        println!("{}", "-".repeat(101));
+        for (i, s) in sessions.iter().enumerate() {
+            let num = i + 1;
+            let title = s.title.as_deref().unwrap_or("-");
+            let preview = s.preview.as_deref().unwrap_or("");
+
+            let truncated_title = if title.chars().count() > 25 {
+                format!("{}...", title.chars().take(22).collect::<String>())
+            } else {
+                title.to_string()
+            };
+            let truncated_preview = if preview.chars().count() > 48 {
+                format!("{}...", preview.chars().take(45).collect::<String>())
+            } else {
+                preview.to_string()
+            };
+
+            let relative_time = if let Some(dt) = s.last_active {
+                format_relative_time(dt)
+            } else {
+                format_relative_time(s.started_at)
+            };
+
+            println!(
+                "{:<4} {:<27} {:<51} {:<12} {}",
+                num, truncated_title, truncated_preview, relative_time, s.id
+            );
+        }
     }
     Ok(())
 }

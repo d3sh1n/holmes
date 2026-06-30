@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod reflection;
 pub mod runtime;
 pub mod yield_stream;
+pub mod middleware;
 
 pub use compaction::*;
 pub use context::*;
@@ -22,3 +23,4 @@ pub use deliberation::*;
 pub use learning::*;
 pub use permissions::*;
 pub use yield_stream::*;
+pub use middleware::*;

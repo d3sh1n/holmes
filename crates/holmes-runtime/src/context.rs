@@ -7,10 +7,11 @@ use holmes_core::state::{AttackHypothesis, AttackPhase, AttackState};
 use holmes_core::types::SessionMode;
 use holmes_guards::GuardChain;
 use holmes_mind_palace::MindPalace;
-use holmes_session::{memory_store::MemoryStore, SessionDB};
+use holmes_session::{memory_store::MemoryStore, SessionStore};
 use holmes_tools::registry::ToolRegistry;
 
 use crate::deliberation::LlmBackend;
+use crate::middleware::RuntimeMiddleware;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractionMode {
@@ -178,7 +179,7 @@ impl Default for RuntimeState {
 pub struct RuntimeContext {
     pub session: RuntimeSession,
     pub session_id: String,
-    pub session_db: Arc<SessionDB>,
+    pub session_db: Arc<dyn SessionStore>,
     pub memory_store: Arc<MemoryStore>,
     pub mind_palace: MindPalace,
     pub llm: Arc<dyn LlmBackend>,
@@ -186,13 +187,14 @@ pub struct RuntimeContext {
     pub guards: GuardChain,
     pub state: RuntimeState,
     pub config: HolmesConfig,
+    pub middlewares: Vec<Arc<dyn RuntimeMiddleware>>,
 }
 
 impl RuntimeContext {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: RuntimeSession,
-        session_db: Arc<SessionDB>,
+        session_db: Arc<dyn SessionStore>,
         memory_store: Arc<MemoryStore>,
         mind_palace: MindPalace,
         llm: Arc<dyn LlmBackend>,
@@ -213,7 +215,13 @@ impl RuntimeContext {
             guards,
             state,
             config,
+            middlewares: Vec::new(),
         }
+    }
+
+    pub fn with_middlewares(mut self, middlewares: Vec<Arc<dyn RuntimeMiddleware>>) -> Self {
+        self.middlewares = middlewares;
+        self
     }
 }
 

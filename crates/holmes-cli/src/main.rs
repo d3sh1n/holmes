@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use holmes_cli::{chat, setup};
+use holmes_cli::{chat, setup, tui};
 use holmes_harness::{HarnessRunner, HarnessScenario};
 use std::path::PathBuf;
 
@@ -21,6 +21,14 @@ struct Cli {
     #[arg(short, long)]
     query: Option<String>,
 
+    /// Start the legacy line REPL instead of the default full-screen TUI
+    #[arg(long)]
+    repl: bool,
+
+    /// Start the full-screen TUI explicitly
+    #[arg(long)]
+    tui: bool,
+
     /// Model to use
     #[arg(short, long)]
     model: Option<String>,
@@ -32,8 +40,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start interactive chat (default)
-    Chat,
+    /// Start interactive chat (full-screen TUI by default)
+    Chat {
+        /// Start the legacy line REPL instead of the default full-screen TUI
+        #[arg(long)]
+        repl: bool,
+        /// Start the full-screen TUI explicitly
+        #[arg(long)]
+        tui: bool,
+    },
+    /// Start full-screen TUI
+    Tui,
+    /// Start legacy line REPL
+    Repl,
     /// List recent sessions
     Sessions,
     /// Configure LLM provider (interactive wizard)
@@ -61,18 +80,40 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Chat) {
-        Commands::Chat => {
+    match cli.command {
+        None if cli.query.is_some() || cli.repl => {
             chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
         }
-        Commands::Sessions => {
+        None => {
+            tui::run_tui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
+        }
+        Some(Commands::Chat {
+            repl: chat_repl,
+            tui: _chat_tui,
+        }) => {
+            if cli.query.is_some() || cli.repl || chat_repl {
+                chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
+            } else {
+                tui::run_tui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
+            }
+        }
+        Some(Commands::Tui) => {
+            if cli.query.is_some() {
+                eprintln!("tui is interactive; ignoring --query and starting the TUI.");
+            }
+            tui::run_tui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
+        }
+        Some(Commands::Repl) => {
+            chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
+        }
+        Some(Commands::Sessions) => {
             chat::list_sessions().await?;
         }
-        Commands::Setup => {
+        Some(Commands::Setup) => {
             let data_dir = holmes_data_dir();
             setup::run_setup(&data_dir)?;
         }
-        Commands::Harness { scenario } => {
+        Some(Commands::Harness { scenario }) => {
             let scenario = HarnessScenario::from_path(&scenario)?;
             let report = HarnessRunner::new().run(scenario).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -80,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Version => {
+        Some(Commands::Version) => {
             println!("Holmes v{}", env!("CARGO_PKG_VERSION"));
         }
     }

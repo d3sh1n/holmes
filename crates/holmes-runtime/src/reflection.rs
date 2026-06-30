@@ -1,5 +1,3 @@
-use holmes_core::tool_types::LlmResponse;
-
 use crate::deliberation::{RuntimeError, RuntimeErrorKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,14 +39,6 @@ impl ReflectionEngine {
         }
     }
 
-    pub fn assess_response(&self, response: &LlmResponse) -> ReflectionOutcome {
-        if response.tool_calls.is_empty() {
-            ReflectionOutcome::FinalAnswer(response.content.clone().unwrap_or_default())
-        } else {
-            ReflectionOutcome::Continue
-        }
-    }
-
     pub fn assess_error(&self, error: &RuntimeError) -> ReflectionOutcome {
         match error.kind {
             RuntimeErrorKind::NeedsUser => ReflectionOutcome::NeedsUser(error.message.clone()),
@@ -70,50 +60,9 @@ impl Default for ReflectionEngine {
 
 #[cfg(test)]
 mod tests {
-    use holmes_core::{FunctionCall, ToolCall};
-
     use crate::deliberation::{RuntimeError, MISSING_PROVIDER_MESSAGE};
 
     use super::*;
-
-    #[test]
-    fn reflection_returns_final_answer_when_response_has_no_tool_calls() {
-        let engine = ReflectionEngine::new(3);
-        let response = LlmResponse {
-            content: Some("complete".into()),
-            tool_calls: Vec::new(),
-            finish_reason: Some("stop".into()),
-            usage: None,
-        };
-
-        assert_eq!(
-            engine.assess_response(&response),
-            ReflectionOutcome::FinalAnswer("complete".into())
-        );
-    }
-
-    #[test]
-    fn reflection_continues_when_response_has_tool_calls() {
-        let engine = ReflectionEngine::new(3);
-        let response = LlmResponse {
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                call_type: "function".into(),
-                function: FunctionCall {
-                    name: "probe".into(),
-                    arguments: "{}".into(),
-                },
-            }],
-            finish_reason: Some("tool_calls".into()),
-            usage: None,
-        };
-
-        assert_eq!(
-            engine.assess_response(&response),
-            ReflectionOutcome::Continue
-        );
-    }
 
     #[test]
     fn reflection_maps_missing_provider_to_needs_user() {

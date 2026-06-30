@@ -21,8 +21,6 @@ pub struct LearningReview {
 #[derive(Debug, Clone)]
 pub enum LearningCandidate {
     Memory(MemoryCandidate),
-    Skill(SkillCandidate),
-    Rule(RuleCandidate),
 }
 
 #[derive(Debug, Clone)]
@@ -31,27 +29,6 @@ pub struct MemoryCandidate {
     pub content: String,
     pub tags: Vec<String>,
     pub relevance_score: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct SkillCandidate {
-    pub name: String,
-    pub operation: SkillOperation,
-    pub summary: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum SkillOperation {
-    Create,
-    Patch,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuleCandidate {
-    pub path: String,
-    pub content: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -205,28 +182,6 @@ impl LearningEngine {
                         .await?;
                         application.applied += 1;
                     }
-                }
-                LearningCandidate::Skill(_) => {
-                    record_learning_event(
-                        context,
-                        Event::LearningCandidateRejected {
-                            kind: "skill".into(),
-                            reason: "skill learning is not implemented in phase 2".into(),
-                        },
-                    )
-                    .await?;
-                    application.rejected += 1;
-                }
-                LearningCandidate::Rule(_) => {
-                    record_learning_event(
-                        context,
-                        Event::LearningCandidateRejected {
-                            kind: "rule".into(),
-                            reason: "rule learning is not implemented in phase 2".into(),
-                        },
-                    )
-                    .await?;
-                    application.rejected += 1;
                 }
             }
         }
@@ -434,7 +389,7 @@ mod tests {
     use holmes_core::{LlmResponse, SessionMode};
     use holmes_guards::GuardChain;
     use holmes_mind_palace::MindPalace;
-    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
+    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
     use holmes_tools::ToolRegistry;
 
     use crate::context::RuntimeState;

@@ -19,8 +19,18 @@ pub struct ContextLayer {
     pub directive: Option<DirectiveSummary>,
     pub hypothesis: Option<HypothesisState>,
     pub reflections: Vec<ReflectionSummary>,
+    pub pitfalls: Vec<PitfallSummary>,
     pub current_phase: String,
     events_processed: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PitfallSummary {
+    pub intent: String,
+    pub action: String,
+    pub outcome: String,
+    pub is_deceptive: bool,
+    pub conclusion: String,
 }
 
 #[derive(Debug, Clone)]
@@ -114,9 +124,14 @@ impl ContextLayer {
             directive: None,
             hypothesis: None,
             reflections: Vec::new(),
+            pitfalls: Vec::new(),
             current_phase: "initial".into(),
             events_processed: 0,
         }
+    }
+
+    pub fn ingest_pitfall(&mut self, pitfall: PitfallSummary) {
+        self.pitfalls.push(pitfall);
     }
 
     pub fn ingest(&mut self, event: &Event) {
@@ -347,6 +362,16 @@ impl ContextLayer {
                 h.confirmed.len()
             ));
         }
+        if !self.pitfalls.is_empty() {
+            parts.push(format!(
+                "[避坑经验 (Historical Pitfalls)]\n{}",
+                self.pitfalls
+                    .iter()
+                    .map(|p| format!("- 尝试: {} | 结果: {}", p.action, p.conclusion))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
         parts.join("\n")
     }
 
@@ -365,6 +390,9 @@ impl ContextLayer {
     pub fn compress(&mut self) {
         if self.reflections.len() > 5 {
             self.reflections = self.reflections.split_off(self.reflections.len() - 5);
+        }
+        if self.pitfalls.len() > 20 {
+            self.pitfalls = self.pitfalls.split_off(self.pitfalls.len() - 20);
         }
         self.vulnerabilities
             .retain(|v| v.status != FindingStatus::FalsePositive);

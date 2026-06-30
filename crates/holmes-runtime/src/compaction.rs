@@ -3,6 +3,7 @@ use holmes_core::{
     session::RuntimeSession, truncate_str, CompressionMethod, HolmesConfig, Message, Role,
 };
 use std::collections::HashSet;
+use holmes_mind_palace::context_layer::PitfallSummary;
 
 #[derive(Debug, Clone, Default)]
 pub struct CaseCompactor {
@@ -65,6 +66,7 @@ impl CaseCompactor {
         }
 
         let middle = &session.messages[head_end..tail_start];
+        let pitfalls = extract_pitfalls(middle);
         let summary = build_static_summary(session, middle, config);
         let summary_message = Message::assistant(summary.clone());
 
@@ -86,6 +88,7 @@ impl CaseCompactor {
                 "protected_head".into(),
                 "protected_tail".into(),
             ],
+            extracted_pitfalls: pitfalls,
             method: CompressionMethod::StaticFallback,
         }))
     }
@@ -153,6 +156,33 @@ fn build_static_summary(
         summary = truncate_str(&summary, max_summary_bytes).to_string();
     }
     summary
+}
+
+fn extract_pitfalls(middle: &[Message]) -> Vec<PitfallSummary> {
+    let mut pitfalls = Vec::new();
+    for msg in middle {
+        if let Some(content) = &msg.content {
+            let lower = content.to_lowercase();
+            if (lower.contains("204") && (lower.contains("404") || lower.contains("401") || lower.contains("fake"))) 
+                || lower.contains("gateway intercept") 
+                || lower.contains("网关") 
+                || lower.contains("deceptive") {
+                let text = truncate_str(content.trim(), 150).to_string();
+                pitfalls.push(PitfallSummary {
+                    intent: "Extracted during compaction".into(),
+                    action: "Detected anomalous/deceptive response".into(),
+                    outcome: "Suspected environment interference".into(),
+                    is_deceptive: true,
+                    conclusion: text.replace('\n', " "),
+                });
+            }
+        }
+    }
+    // Deduplicate or limit to prevent overwhelming the context
+    if pitfalls.len() > 5 {
+        pitfalls = pitfalls.split_off(pitfalls.len() - 5);
+    }
+    pitfalls
 }
 
 fn sanitize_orphan_tool_messages(messages: &mut Vec<Message>) {
@@ -238,6 +268,7 @@ pub struct CompressionResult {
     pub after_count: usize,
     pub summary: String,
     pub preserved_keys: Vec<String>,
+    pub extracted_pitfalls: Vec<PitfallSummary>,
     pub method: CompressionMethod,
 }
 

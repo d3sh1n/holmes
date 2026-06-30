@@ -115,6 +115,11 @@ impl AgentRuntime {
         input: impl Into<UserTurnInput>,
         sink: &mut dyn RuntimeSink,
     ) -> Result<TurnOutcome, RuntimeError> {
+        let middlewares = self.context.middlewares.clone();
+        for mw in &middlewares {
+            mw.on_session_start(&mut self.context).await?;
+        }
+
         let input = input.into();
         let turn_start_index = self.next_event_index().await?;
         let mut turn_tokens = TokenDelta::default();
@@ -134,6 +139,10 @@ impl AgentRuntime {
         let mut iterations = 0;
         let mut auto_compacted_this_turn = false;
         loop {
+            let middlewares = self.context.middlewares.clone();
+            for mw in &middlewares {
+                mw.before_step(&mut self.context).await?;
+            }
             if let ReflectionOutcome::MaxIterationsReached(message) =
                 self.reflection.assess_iteration_budget(iterations)
             {
@@ -145,6 +154,10 @@ impl AgentRuntime {
                 sink.emit_yield(&self.context.session_id, RuntimeYield::Error {
                     message: message.clone(),
                 });
+                let middlewares = self.context.middlewares.clone();
+                for mw in &middlewares {
+                    mw.after_step(&mut self.context).await?;
+                }
                 return Ok(TurnOutcome::MaxIterationsReached {
                     message,
                     iterations,
@@ -173,17 +186,25 @@ impl AgentRuntime {
                 Ok(delta) => delta,
                 Err(error) => return self.stop_for_error(error, iterations, sink),
             };
+            let middlewares = self.context.middlewares.clone();
+            for mw in &middlewares {
+                mw.on_token_usage(&mut self.context, &token_delta).await?;
+            }
             accumulate_tokens(&mut turn_tokens, &token_delta);
             let response = self.response_for_record(&deliberation.response, &deliberation.parsed);
             self.record_assistant_response(&response).await?;
 
             match deliberation.parsed.decision {
                 HolmesDecision::Answer { message } => {
-                    let content = if message.trim().is_empty() {
+                    let mut content = if message.trim().is_empty() {
                         response.content.clone().unwrap_or_default()
                     } else {
                         message
                     };
+                    let middlewares = self.context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.on_final_answer(&mut self.context, &mut content).await?;
+                    }
                     let event = self.dialogue.format_final_answer(&content);
                     sink.emit_yield(&self.context.session_id, event);
                     if let Err(error) = self.review_learning_for_turn(turn_start_index).await {
@@ -191,17 +212,25 @@ impl AgentRuntime {
                     }
                     self.record_turn_complete(turn_start_index, &turn_tokens)
                         .await?;
+                    let middlewares = self.context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.after_step(&mut self.context).await?;
+                    }
                     return Ok(TurnOutcome::FinalAnswer {
                         content: content.trim().to_string(),
                         iterations,
                     });
                 }
                 HolmesDecision::Finish { summary } => {
-                    let content = if summary.trim().is_empty() {
+                    let mut content = if summary.trim().is_empty() {
                         response.content.clone().unwrap_or_default()
                     } else {
                         summary
                     };
+                    let middlewares = self.context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.on_final_answer(&mut self.context, &mut content).await?;
+                    }
                     if let Err(error) = self.record_goal_evaluated(true, &content, iterations).await
                     {
                         return self.stop_for_error(error, iterations, sink);
@@ -213,6 +242,10 @@ impl AgentRuntime {
                     }
                     self.record_turn_complete(turn_start_index, &turn_tokens)
                         .await?;
+                    let middlewares = self.context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.after_step(&mut self.context).await?;
+                    }
                     return Ok(TurnOutcome::FinalAnswer {
                         content: content.trim().to_string(),
                         iterations,
@@ -242,6 +275,10 @@ impl AgentRuntime {
                     }
                     self.record_turn_complete(turn_start_index, &turn_tokens)
                         .await?;
+                    let middlewares = self.context.middlewares.clone();
+                    for mw in &middlewares {
+                        mw.after_step(&mut self.context).await?;
+                    }
                     return Ok(TurnOutcome::NeedsUser { prompt, iterations });
                 }
                 HolmesDecision::UseTools { rationale, calls } => {
@@ -259,6 +296,17 @@ impl AgentRuntime {
                             "Holmes decided to use tools but did not provide any tool calls.",
                         );
                         return self.stop_for_error(error, iterations, sink);
+                    }
+
+                    let mut calls = calls;
+                    let middlewares = self.context.middlewares.clone();
+                    for call in &mut calls {
+                        let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                            .unwrap_or(serde_json::Value::Null);
+                        for mw in &middlewares {
+                            mw.before_tool_call(&mut self.context, &mut call.function.name, &mut args).await?;
+                        }
+                        call.function.arguments = args.to_string();
                     }
 
                     let action_batch = match self
@@ -348,6 +396,10 @@ impl AgentRuntime {
                     });
                 }
             }
+            let middlewares = self.context.middlewares.clone();
+            for mw in &middlewares {
+                mw.after_step(&mut self.context).await?;
+            }
         }
     }
 
@@ -407,6 +459,10 @@ impl AgentRuntime {
         else {
             return Ok(None);
         };
+
+        for pitfall in &result.extracted_pitfalls {
+            self.context.mind_palace.context.ingest_pitfall(pitfall.clone());
+        }
 
         append_and_ingest(
             &mut self.context,
@@ -764,7 +820,11 @@ fn nonempty(content: impl AsRef<str>) -> Option<String> {
     }
 }
 
-async fn append_and_ingest(context: &mut RuntimeContext, event: Event) -> Result<(), RuntimeError> {
+async fn append_and_ingest(context: &mut RuntimeContext, mut event: Event) -> Result<(), RuntimeError> {
+    let middlewares = context.middlewares.clone();
+    for mw in &middlewares {
+        mw.before_event_persist(context, &mut event).await?;
+    }
     context
         .session_db
         .append_event(&context.session_id, &event)
@@ -797,7 +857,7 @@ mod tests {
     use holmes_guards::traits::{PostGuard, PreGuard};
     use holmes_guards::GuardChain;
     use holmes_mind_palace::MindPalace;
-    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB};
+    use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
     use holmes_tools::{Tool, ToolRegistry};
 
     use crate::deliberation::LlmBackend;
@@ -1641,5 +1701,58 @@ mod tests {
                 arguments: arguments.into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn test_middlewares_guard_redact_audit() {
+        use crate::middleware::{GuardMiddleware, SensitiveDataRedactMiddleware, TokenAuditMiddleware};
+
+        // 1. Test GuardMiddleware dangerous command blocking
+        let cmd_call = make_call("run_command", r#"{"CommandLine": "rm -rf /"}"#);
+        let llm = Arc::new(QueueLlmBackend::new(vec![
+            Ok(tool_response(cmd_call)),
+            Ok(final_response("done")),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(MockTool));
+        let context = make_context(llm, tools, GuardChain::new()).await
+            .with_middlewares(vec![Arc::new(GuardMiddleware)]);
+        let mut runtime = AgentRuntime::new(context);
+        let mut sink = VecSink::new();
+        let result = runtime.run_turn("test", &mut sink).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("blocked dangerous command"));
+
+        // 2. Test SensitiveDataRedactMiddleware data redaction
+        let sec_call = make_call("mock_tool", r#"{"secret": "my-secret-token"}"#);
+        let llm_sec = Arc::new(QueueLlmBackend::new(vec![
+            Ok(tool_response(sec_call)),
+            Ok(final_response("done api_key=1234567890")),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(MockTool));
+        let context = make_context(llm_sec, tools, GuardChain::new()).await
+            .with_middlewares(vec![Arc::new(SensitiveDataRedactMiddleware::new())]);
+        let mut runtime = AgentRuntime::new(context);
+        let mut sink = VecSink::new();
+        let outcome = runtime.run_turn("test", &mut sink).await.expect("success");
+        if let TurnOutcome::FinalAnswer { content, .. } = outcome {
+            assert!(content.contains("[REDACTED]"));
+            assert!(!content.contains("1234567890"));
+        } else {
+            panic!("Expected FinalAnswer");
+        }
+
+        // 3. Test TokenAuditMiddleware token budget auditing & fuse
+        let llm_audit = Arc::new(QueueLlmBackend::new(vec![
+            Ok(final_response("done")),
+        ]));
+        let context = make_context(llm_audit, ToolRegistry::new(), GuardChain::new()).await
+            .with_middlewares(vec![Arc::new(TokenAuditMiddleware::new(5))]);
+        let mut runtime = AgentRuntime::new(context);
+        let mut sink = VecSink::new();
+        let result = runtime.run_turn("test", &mut sink).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("token limit exceeded"));
     }
 }

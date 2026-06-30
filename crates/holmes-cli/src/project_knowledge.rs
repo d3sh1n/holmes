@@ -1,4 +1,5 @@
 use holmes_core::config::HolmesConfig;
+use holmes_core::types::SessionMode;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,36 @@ These are not optional slash commands. Treat them as part of your default operat
 - Prefer investigation-native behavior over rigid workflows: infer the next best action from the case context.
 - Keep security boundaries explicit. Do not perform actions outside the authorized scope."#;
 
+/// Pentest 模式默认方法论（内化自 skills/pentest-lyan）。
+/// 仅在 SessionMode::Pentest 下注入；其他 mode 不污染上下文。
+/// 完整细节由模型按需 Read skills/pentest-lyan/SKILL.md 与 references/ 获取。
+const PENTEST_METHODOLOGY: &str = r#"[Pentest methodology - default, no /command needed]
+You operate web pentests with the Pentest-Lyan methodology baked in. Do not wait for the user to invoke it.
+
+## 三阶段串行（目标驱动,非步骤）
+1. **Discovery** — 完整阅读所有前端 JS,理解业务逻辑、签名机制、客户端可控参数;全量发现接口、会话池、权限矩阵;为每个 feature 基于 12 维度做威胁建模。读懂代码比测接口重要。
+2. **Attack** — 按 feature 流水线遍历每个功能的 threat_model 逐项验证;深度验证业务影响,参数空间扩展,状态机遍历。
+3. **Audit** — schema 校验、完整性审计、双格式报告(markdown 全面 + docx 交付)。
+
+## 12 维度威胁建模(每个 feature 都过一遍)
+data flow / permission boundary / resource ownership / state change / client-controlled values / concurrency / output display / auth & session / SSRF / injection surface / file ops / business logic
+
+## Banned Patterns(绝不违反)
+- 不得在未验证业务影响前将漏洞标记 confirmed —— 接口返回 200 ≠ 漏洞确认,必须验证数据库层值真的变了、对方数据真的被读到、状态真的被绕过
+- not_vulnerable 记录必须附 unruled_out(还没排除的攻击面)
+- coverage_note 必须回答三问:输入面 / 行为面 / 深度面;禁止"已覆盖""部分覆盖""基本完成"等模糊词
+- 越权测试不得硬编码对象 ID,必须从 victim 的真实数据列表获取
+- 配置类观察(CORS / 安全头 / 版本泄露)不计入 confirmed_vulns,不分配 VULN 编号,归入附录
+- 不跟随到非目标资产(外部域 / CDN 重定向 → 记 blindspots BLOCKED)
+- 不删除真实业务数据或其他用户预存数据
+- 报告中 summary.json 所有 confirmed_vulns 必须从 validation_results 继承,不得编造
+- 不未授权执行高危操作(批量删除 / 支付退款 / 修改权限)
+
+## 反遗漏靠"三问 + 未排除面"
+每个 feature 收口写 coverage_note,从输入面 / 行为面 / 深度面**泛化维度**自问,不点名具体漏洞。
+
+完整方法论与 schema 详见 skills/pentest-lyan/SKILL.md;深入细节按阶段 Read references/{discovery-guide,attack-guide,threat-modeling,validation-guide,cross-role-testing,audit-guide,report-template}.md。"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KnowledgeFile {
     label: String,
@@ -35,12 +66,22 @@ struct SkillSummary {
 ///
 /// This makes project instructions, local rules, and skill indexes part of
 /// Holmes' native perception instead of requiring Watson to manually invoke
-/// them every session.
-pub fn build_system_prompt(base_prompt: &str, config: &HolmesConfig, cwd: &Path) -> String {
+/// them every session. When `mode == SessionMode::Pentest`, the bundled
+/// Pentest-Lyan methodology is also injected as a default operating standard.
+pub fn build_system_prompt(
+    base_prompt: &str,
+    config: &HolmesConfig,
+    cwd: &Path,
+    mode: SessionMode,
+) -> String {
     let mut sections = vec![
         base_prompt.trim().to_string(),
         NATIVE_CAPABILITIES.to_string(),
     ];
+
+    if matches!(mode, SessionMode::Pentest) {
+        sections.push(PENTEST_METHODOLOGY.to_string());
+    }
 
     let knowledge = discover_knowledge_files(cwd);
     if !knowledge.is_empty() {
@@ -315,12 +356,48 @@ mod tests {
     #[test]
     fn build_system_prompt_includes_native_capabilities_without_project_files() {
         let cwd = temp_project_dir();
-        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd);
+        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
 
         assert!(prompt.contains("base"));
         assert!(prompt.contains("Holmes native capabilities - always on"));
         assert!(prompt.contains("Maintain the case state automatically"));
 
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn pentest_mode_injects_pentest_methodology() {
+        let cwd = temp_project_dir();
+        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
+
+        // 三阶段
+        assert!(prompt.contains("Discovery"));
+        assert!(prompt.contains("Attack"));
+        assert!(prompt.contains("Audit"));
+        // 12 维度威胁建模标记
+        assert!(prompt.contains("12 维度威胁建模"));
+        // 关键 banned pattern
+        assert!(prompt.contains("200 ≠ 漏洞确认"));
+        assert!(prompt.contains("unruled_out"));
+        // 完整资料指针
+        assert!(prompt.contains("skills/pentest-lyan/SKILL.md"));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn non_pentest_mode_skips_pentest_methodology() {
+        let cwd = temp_project_dir();
+        for mode in [
+            SessionMode::CodeAudit,
+            SessionMode::Reverse,
+            SessionMode::SecurityResearch,
+            SessionMode::Mixed,
+        ] {
+            let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, mode);
+            assert!(!prompt.contains("Pentest methodology - default"));
+            assert!(!prompt.contains("12 维度威胁建模"));
+        }
         let _ = fs::remove_dir_all(cwd);
     }
 
@@ -346,7 +423,7 @@ description: Build a target map before validation.\n---\n# Recon\n",
         )
         .unwrap();
 
-        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd);
+        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
 
         assert!(prompt.contains("Auto-loaded Holmes knowledge"));
         assert!(prompt.contains("Source: HOLMES.md"));

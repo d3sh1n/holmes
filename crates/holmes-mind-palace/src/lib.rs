@@ -20,7 +20,7 @@ pub struct MindPalace {
 
 impl MindPalace {
     pub fn new(
-        session_db: Arc<holmes_session::db::SessionDB>,
+        session_db: Arc<dyn holmes_session::SessionStore>,
         long_term: Arc<MemoryStore>,
     ) -> Self {
         Self {
@@ -31,7 +31,7 @@ impl MindPalace {
 
     pub async fn from_events(
         session_id: &str,
-        session_db: Arc<holmes_session::db::SessionDB>,
+        session_db: Arc<dyn holmes_session::SessionStore>,
         long_term: Arc<MemoryStore>,
     ) -> Result<Self, String> {
         let mut palace = Self::new(session_db, long_term);

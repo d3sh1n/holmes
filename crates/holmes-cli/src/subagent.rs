@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use holmes_runtime::StreamEvent;
+use holmes_core::session::RuntimeSession;
 use holmes_core::subagent::SubagentRunner;
 use holmes_core::types::{SessionMode, SubAgentResult, SubAgentTask};
-use holmes_core::session::RuntimeSession;
 use holmes_guards::GuardChain;
 use holmes_llm::client::LlmClient;
 use holmes_mind_palace::MindPalace;
@@ -10,7 +9,8 @@ use holmes_runtime::context::{RuntimeContext, RuntimeState};
 use holmes_runtime::deliberation::LlmBackend;
 use holmes_runtime::runtime::AgentRuntime;
 use holmes_runtime::yield_stream::{RuntimeSink, RuntimeYield};
-use holmes_session::{memory_store::MemoryStore, SessionDB};
+use holmes_runtime::StreamEvent;
+use holmes_session::{memory_store::MemoryStore, SessionStore};
 use holmes_tools::registry::ToolRegistry;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use holmes_core::config::Config;
 
 #[derive(Clone)]
 pub struct CliSubagentRunner {
-    pub session_db: Arc<SessionDB>,
+    pub session_db: Arc<dyn SessionStore>,
     pub memory_store: Arc<MemoryStore>,
     pub llm: Arc<LlmClient>,
     pub config: Config,

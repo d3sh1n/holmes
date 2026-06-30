@@ -4,6 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use async_trait::async_trait;
+use crate::store::SessionStore;
 
 use crate::schema;
 use crate::write_contention::WriteContention;
@@ -12,11 +14,12 @@ pub struct SessionDB {
     conn: Arc<Mutex<Connection>>,
     write_contention: WriteContention,
     write_count: Arc<Mutex<u64>>,
+    sessions_dir: std::path::PathBuf,
 }
 
 impl SessionDB {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON;",
         )?;
@@ -44,14 +47,25 @@ impl SessionDB {
             }
         }
 
+        let path_ref = path.as_ref();
+        let sessions_dir = path_ref
+            .parent()
+            .map(|p| p.join("sessions"))
+            .unwrap_or_else(|| std::path::PathBuf::from("sessions"));
+        std::fs::create_dir_all(&sessions_dir).ok();
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             write_contention: WriteContention::new(),
             write_count: Arc::new(Mutex::new(0)),
+            sessions_dir,
         })
     }
+}
 
-    pub async fn create_session(
+#[async_trait]
+impl SessionStore for SessionDB {
+    async fn create_session(
         &self,
         params: CreateSessionParams,
     ) -> Result<Session, SessionError> {
@@ -106,6 +120,9 @@ impl SessionDB {
             }
         }).await?;
 
+        let session_dir = self.sessions_dir.join(&id);
+        std::fs::create_dir_all(session_dir.join("tool-results")).ok();
+
         Ok(Session {
             id,
             title: params.title,
@@ -131,14 +148,31 @@ impl SessionDB {
         })
     }
 
-    pub async fn append_event(&self, session_id: &str, event: &Event) -> Result<u64, SessionError> {
-        let event_type = event_type_str(event);
-        let content_text = event.content_text();
+    async fn append_event(&self, session_id: &str, event: &Event) -> Result<u64, SessionError> {
+        let mut processed_event = event.clone();
+        if let Event::ToolResult { ref mut content, .. } = processed_event {
+            if content.len() > 10000 {
+                let file_uuid = uuid::Uuid::new_v4().to_string();
+                let relative_path = format!("tool-results/call_{}.txt", file_uuid);
+                let full_path = self.sessions_dir.join(session_id).join(&relative_path);
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Err(e) = std::fs::write(&full_path, content.as_bytes()) {
+                    tracing::error!(path = ?full_path, error = ?e, "failed to write bypass file");
+                } else {
+                    *content = format!("__BYPASS_FILE__:file://{}", full_path.to_string_lossy());
+                }
+            }
+        }
+
+        let event_type = event_type_str(&processed_event);
+        let content_text = processed_event.content_text();
         let timestamp = chrono::Utc::now().to_rfc3339();
 
         // Wrap event_data to include content_text for FTS5 by injecting it into
         // the serialized JSON object via serde_json::Value (safe and structured).
-        let mut v: serde_json::Value = serde_json::to_value(event)?;
+        let mut v: serde_json::Value = serde_json::to_value(&processed_event)?;
         if let Some(obj) = v.as_object_mut() {
             obj.insert(
                 "content_text".to_string(),
@@ -147,11 +181,24 @@ impl SessionDB {
         }
         let event_data = serde_json::to_string(&v)?;
 
+        // 双写追加到本地会话目录的 transcript.jsonl
+        let session_dir = self.sessions_dir.join(session_id);
+        std::fs::create_dir_all(&session_dir).ok();
+        let jsonl_path = session_dir.join("transcript.jsonl");
+        let jsonl_line = format!("{}\n", event_data);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)
+        {
+            let _ = std::io::Write::write_all(&mut file, jsonl_line.as_bytes());
+        }
+
         let session_id_owned = session_id.to_string();
         let event_type_owned = event_type.to_string();
         let event_data_owned = event_data;
         let timestamp_owned = timestamp;
-        let event_for_match = event.clone();
+        let event_for_match = processed_event.clone();
 
         let id = self.write_contention.with_retry(|| {
             let session_id = session_id_owned.clone();
@@ -203,61 +250,84 @@ impl SessionDB {
         Ok(id)
     }
 
-    pub async fn get_events(&self, session_id: &str) -> Result<Vec<StoredEvent>, SessionError> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, event_index, turn_index, event_type, event_data, timestamp
-             FROM events WHERE session_id = ?1 ORDER BY event_index",
-        )?;
+    async fn get_events(&self, session_id: &str) -> Result<Vec<StoredEvent>, SessionError> {
+        let mut events = {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, event_index, turn_index, event_type, event_data, timestamp
+                 FROM events WHERE session_id = ?1 ORDER BY event_index",
+            )?;
 
-        let rows = stmt.query_map(params![session_id], |row| {
-            let data: String = row.get(5)?;
-            // event_data has a `content_text` field injected for FTS. Parse as
-            // Value, drop that field, then deserialize the remainder as Event.
-            let event: Event = parse_event_data(&data).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
+            let rows = stmt.query_map(params![session_id], |row| {
+                let id: i64 = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let event_index: i64 = row.get(2)?;
+                let turn_index: Option<i64> = row.get(3)?;
+                let data: String = row.get(5)?;
+                let timestamp_str: String = row.get(6)?;
+                Ok((id, session_id, event_index, turn_index, data, timestamp_str))
             })?;
 
-            let id: i64 = row.get(0)?;
-            let event_index: i64 = row.get(2)?;
-            let turn_index: Option<i64> = row.get(3)?;
-            let timestamp_str: String = row.get(6)?;
+            let mut temp_events = Vec::new();
+            for row in rows {
+                let (id, s_id, event_index, turn_index, data, timestamp_str) = row?;
+                let event: Event = parse_event_data(&data).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
 
-            let timestamp = match chrono::DateTime::parse_from_rfc3339(&timestamp_str) {
-                Ok(d) => d.with_timezone(&chrono::Utc),
-                Err(e) => {
-                    tracing::warn!(
-                        event_id = id,
-                        timestamp = %timestamp_str,
-                        error = %e,
-                        "failed to parse event timestamp; falling back to now()",
-                    );
-                    chrono::Utc::now()
+                let timestamp = match chrono::DateTime::parse_from_rfc3339(&timestamp_str) {
+                    Ok(d) => d.with_timezone(&chrono::Utc),
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = id,
+                            timestamp = %timestamp_str,
+                            error = %e,
+                            "failed to parse event timestamp; falling back to now()",
+                        );
+                        chrono::Utc::now()
+                    }
+                };
+
+                temp_events.push(StoredEvent {
+                    id: id as u64,
+                    session_id: s_id,
+                    event_index: event_index as u64,
+                    turn_index: turn_index.map(|v| v as u64),
+                    timestamp,
+                    event,
+                });
+            }
+            temp_events
+        };
+
+        for stored in &mut events {
+            if let Event::ToolResult { ref mut content, .. } = stored.event {
+                if content.starts_with("__BYPASS_FILE__:file://") {
+                    let file_path_str = &content["__BYPASS_FILE__:file://".len()..];
+                    let file_path = std::path::PathBuf::from(file_path_str);
+                    match tokio::fs::read_to_string(&file_path).await {
+                        Ok(full_content) => {
+                            *content = full_content;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                path = %file_path.display(),
+                                error = %e,
+                                "failed to read bypassed event content file; keeping metadata link"
+                            );
+                        }
+                    }
                 }
-            };
-
-            Ok(StoredEvent {
-                id: id as u64,
-                session_id: row.get(1)?,
-                event_index: event_index as u64,
-                turn_index: turn_index.map(|v| v as u64),
-                timestamp,
-                event,
-            })
-        })?;
-
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(row?);
+            }
         }
         Ok(events)
     }
 
-    pub async fn list_sessions(
+    async fn list_sessions(
         &self,
         filter: &SessionFilter,
     ) -> Result<Vec<SessionSummary>, SessionError> {
@@ -337,7 +407,7 @@ impl SessionDB {
         Ok(sessions)
     }
 
-    pub async fn end_session(&self, id: &str, reason: EndReason) -> Result<(), SessionError> {
+    async fn end_session(&self, id: &str, reason: EndReason) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         let reason_owned = reason;
         self.write_contention
@@ -361,7 +431,7 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn reopen_session(&self, id: &str) -> Result<(), SessionError> {
+    async fn reopen_session(&self, id: &str) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         self.write_contention
             .with_retry(|| {
@@ -379,7 +449,7 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn set_goal_condition(
+    async fn set_goal_condition(
         &self,
         id: &str,
         condition: Option<&str>,
@@ -403,7 +473,7 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn mark_goal_achieved(&self, id: &str) -> Result<(), SessionError> {
+    async fn mark_goal_achieved(&self, id: &str) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         self.write_contention
             .with_retry(|| {
@@ -421,96 +491,97 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn get_session(&self, id: &str) -> Result<Option<Session>, SessionError> {
-        let conn = self.conn.lock().await;
-        let result = conn.query_row(
-            "SELECT id, title, mode, model, model_config, system_prompt, parent_session_id,
-                    fork_point, source, tags, started_at, ended_at, end_reason,
-                    message_count, tool_call_count, subagent_count,
-                    input_tokens, output_tokens, estimated_cost_usd,
-                    goal_condition, goal_achieved
-             FROM sessions WHERE id = ?1",
-            params![id],
-            |row| {
-                let fork_point: Option<i64> = row.get(7)?;
-                let message_count: i64 = row.get(13)?;
-                let tool_call_count: i64 = row.get(14)?;
-                let subagent_count: i64 = row.get(15)?;
-                let input_tokens: i64 = row.get(16)?;
-                let output_tokens: i64 = row.get(17)?;
-                let goal_achieved: i64 = row.get(20)?;
-                Ok(Session {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    mode: str_to_mode(&row.get::<_, String>(2)?),
-                    model: row.get(3)?,
-                    model_config: row
-                        .get::<_, Option<String>>(4)?
-                        .and_then(|v| serde_json::from_str(&v).ok()),
-                    system_prompt: row.get(5)?,
-                    parent_session_id: row.get(6)?,
-                    fork_point: fork_point.map(|v| v as u64),
-                    source: row.get(8)?,
-                    tags: row
-                        .get::<_, String>(9)
-                        .ok()
-                        .and_then(|t| serde_json::from_str(&t).ok())
-                        .unwrap_or_default(),
-                    started_at: parse_datetime(&row.get::<_, String>(10)?),
-                    ended_at: row
-                        .get::<_, Option<String>>(11)?
-                        .map(|s| parse_datetime(&s)),
-                    end_reason: row
-                        .get::<_, Option<String>>(12)?
-                        .and_then(|r| str_to_end_reason(&r)),
-                    message_count: message_count as u64,
-                    tool_call_count: tool_call_count as u64,
-                    subagent_count: subagent_count as u64,
-                    input_tokens: input_tokens as u64,
-                    output_tokens: output_tokens as u64,
-                    estimated_cost_usd: row.get(18)?,
-                    goal_condition: row.get(19)?,
-                    goal_achieved: goal_achieved != 0,
-                })
-            },
-        );
+    async fn get_session(&self, id: &str) -> Result<Option<Session>, SessionError> {
+        let resolved_id = {
+            let conn = self.conn.lock().await;
+            let result = conn.query_row(
+                "SELECT id, title, mode, model, model_config, system_prompt, parent_session_id,
+                        fork_point, source, tags, started_at, ended_at, end_reason,
+                        message_count, tool_call_count, subagent_count,
+                        input_tokens, output_tokens, estimated_cost_usd,
+                        goal_condition, goal_achieved
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                |row| {
+                    let fork_point: Option<i64> = row.get(7)?;
+                    let message_count: i64 = row.get(13)?;
+                    let tool_call_count: i64 = row.get(14)?;
+                    let subagent_count: i64 = row.get(15)?;
+                    let input_tokens: i64 = row.get(16)?;
+                    let output_tokens: i64 = row.get(17)?;
+                    let goal_achieved: i64 = row.get(20)?;
+                    Ok(Session {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        mode: str_to_mode(&row.get::<_, String>(2)?),
+                        model: row.get(3)?,
+                        model_config: row
+                            .get::<_, Option<String>>(4)?
+                            .and_then(|v| serde_json::from_str(&v).ok()),
+                        system_prompt: row.get(5)?,
+                        parent_session_id: row.get(6)?,
+                        fork_point: fork_point.map(|v| v as u64),
+                        source: row.get(8)?,
+                        tags: row
+                            .get::<_, String>(9)
+                            .ok()
+                            .and_then(|t| serde_json::from_str(&t).ok())
+                            .unwrap_or_default(),
+                        started_at: parse_datetime(&row.get::<_, String>(10)?),
+                        ended_at: row
+                            .get::<_, Option<String>>(11)?
+                            .map(|s| parse_datetime(&s)),
+                        end_reason: row
+                            .get::<_, Option<String>>(12)?
+                            .and_then(|r| str_to_end_reason(&r)),
+                        message_count: message_count as u64,
+                        tool_call_count: tool_call_count as u64,
+                        subagent_count: subagent_count as u64,
+                        input_tokens: input_tokens as u64,
+                        output_tokens: output_tokens as u64,
+                        estimated_cost_usd: row.get(18)?,
+                        goal_condition: row.get(19)?,
+                        goal_achieved: goal_achieved != 0,
+                    })
+                },
+            );
 
-        match result {
-            Ok(session) => Ok(Some(session)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // Try prefix match
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM sessions WHERE id LIKE ?1 ORDER BY started_at DESC LIMIT 2",
-                )?;
-                let matches: Vec<String> = stmt
-                    .query_map(params![format!("{}%", id)], |r| r.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+            match result {
+                Ok(session) => return Ok(Some(session)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // Try prefix match
+                    let mut stmt = conn.prepare(
+                        "SELECT id FROM sessions WHERE id LIKE ?1 ORDER BY started_at DESC LIMIT 2",
+                    )?;
+                    let matches: Vec<String> = stmt
+                        .query_map(params![format!("{}%", id)], |r| r.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
 
-                if matches.len() == 1 {
-                    let resolved = matches[0].clone();
-                    drop(stmt);
-                    drop(conn);
-                    Box::pin(self.get_session(&resolved)).await
-                } else {
-                    Ok(None)
+                    if matches.len() == 1 {
+                        matches[0].clone()
+                    } else {
+                        return Ok(None);
+                    }
                 }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => Err(e.into()),
-        }
+        };
+
+        Box::pin(self.get_session(&resolved_id)).await
     }
 
-    pub async fn fork_session(
+    async fn fork_session(
         &self,
         id: &str,
         fork_point: u64,
         new_title: &str,
     ) -> Result<Session, SessionError> {
-        let parent = self
+        let parent: Session = self
             .get_session(id)
             .await?
             .ok_or(SessionError::NotFound(id.to_string()))?;
-        let events = self.get_events(id).await?;
+        let events: Vec<StoredEvent> = self.get_events(id).await?;
         let forked_events: Vec<StoredEvent> = events
             .into_iter()
             .filter(|e| e.event_index <= fork_point)
@@ -651,7 +722,7 @@ impl SessionDB {
         })
     }
 
-    pub async fn update_token_counts(
+    async fn update_token_counts(
         &self,
         id: &str,
         delta: &TokenDelta,
@@ -686,7 +757,7 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn truncate_events_after(
+    async fn truncate_events_after(
         &self,
         session_id: &str,
         event_index: u64,
@@ -776,7 +847,7 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn set_title(&self, id: &str, title: &str) -> Result<(), SessionError> {
+    async fn set_title(&self, id: &str, title: &str) -> Result<(), SessionError> {
         let id_owned = id.to_string();
         let title_owned = title.to_string();
         self.write_contention
@@ -796,7 +867,7 @@ impl SessionDB {
         Ok(())
     }
 
-    pub async fn search_events(
+    async fn search_events(
         &self,
         query: &str,
         top_k: u32,
@@ -810,7 +881,7 @@ impl SessionDB {
                         json_extract(e.event_data, '$.content_text') as content_text,
                         s.title as session_title
                  FROM events e JOIN sessions s ON e.session_id = s.id
-                 WHERE json_extract(e.event_data, '$.content_text') LIKE ?1
+                 WHERE json_extract(e.event_data, '$.content_text') LIKE ?1 AND e.session_id NOT LIKE 'sub-%'
                  ORDER BY e.id DESC LIMIT ?2",
                 format!("%{}%", query),
             )
@@ -821,7 +892,7 @@ impl SessionDB {
                         s.title as session_title
                  FROM events e JOIN events_fts f ON e.id = f.rowid
                  JOIN sessions s ON e.session_id = s.id
-                 WHERE events_fts MATCH ?1
+                 WHERE events_fts MATCH ?1 AND e.session_id NOT LIKE 'sub-%'
                  ORDER BY rank LIMIT ?2",
                 sanitized,
             )
