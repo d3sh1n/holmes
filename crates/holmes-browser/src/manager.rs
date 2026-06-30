@@ -154,6 +154,90 @@ impl BrowserManager {
         Ok(truncate(&text, self.config.content_limit))
     }
 
+    pub async fn click(&self, selector: &str) -> Result<ActionOutcome> {
+        let page = self.ensure_launched().await?;
+        let el = page
+            .find_element(selector)
+            .await
+            .map_err(|_| BrowserError::NotFound(selector.to_string()))?;
+        el.click().await?;
+        Ok(ActionOutcome {
+            summary: format!("clicked {selector}"),
+        })
+    }
+
+    pub async fn fill(&self, selector: &str, value: &str) -> Result<ActionOutcome> {
+        let page = self.ensure_launched().await?;
+        let el = page
+            .find_element(selector)
+            .await
+            .map_err(|_| BrowserError::NotFound(selector.to_string()))?;
+        el.click().await.ok();
+        el.type_str(value).await?;
+        Ok(ActionOutcome {
+            summary: format!("filled {selector}"),
+        })
+    }
+
+    pub async fn get_content(&self, selector: Option<&str>) -> Result<String> {
+        let page = self.ensure_launched().await?;
+        let js = match selector {
+            Some(sel) => {
+                format!("var e=document.querySelector({:?}); e ? e.innerText : ''", sel)
+            }
+            None => "document.body ? document.body.innerText : ''".to_string(),
+        };
+        let text: String = page
+            .evaluate(js.as_str())
+            .await
+            .map(|v| v.into_value::<String>().unwrap_or_default())
+            .map_err(|e| BrowserError::JsError(e.to_string()))?;
+        Ok(truncate(&text, self.config.content_limit))
+    }
+
+    pub async fn execute_js(&self, code: &str) -> Result<serde_json::Value> {
+        let page = self.ensure_launched().await?;
+        page.evaluate(code)
+            .await
+            .map(|v| {
+                v.into_value::<serde_json::Value>().unwrap_or(serde_json::Value::Null)
+            })
+            .map_err(|e| BrowserError::JsError(e.to_string()))
+    }
+
+    pub async fn screenshot(&self, full_page: bool) -> Result<Screenshot> {
+        let page = self.ensure_launched().await?;
+        let dir = self
+            .config
+            .screenshot_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                profile_dir_for(&self.sessions_dir, &self.session_id)
+                    .parent()
+                    .unwrap_or(&self.sessions_dir)
+                    .join("browser-screenshots")
+            });
+        tokio::fs::create_dir_all(&dir).await?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("shot-{stamp}.png"));
+
+        let mut builder = chromiumoxide::page::ScreenshotParams::builder();
+        if full_page {
+            builder = builder.full_page(true);
+        }
+        let bytes = page.screenshot(builder.build()).await?;
+        tokio::fs::write(&path, &bytes).await?;
+        Ok(Screenshot {
+            path,
+            width: 0,
+            height: 0,
+        })
+    }
+
     pub async fn close(&self) {
         let mut state = self.state.lock().await;
         state.page = None;
