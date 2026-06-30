@@ -150,6 +150,52 @@ async fn runs_long_compression_scenario() {
 }
 
 #[tokio::test]
+async fn long_compression_session_replays_with_compaction_summary() {
+    let scenario_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/long-compression.yaml");
+    let scenario = HarnessScenario::from_path(scenario_path).expect("load scenario");
+    let report = HarnessRunner::new()
+        .run(scenario)
+        .await
+        .expect("run scenario");
+
+    assert!(report.success, "{:#?}", report.failed_expectations);
+
+    // Reconstruct StoredEvents from the report and replay the session, exactly
+    // like a production resume would. The compaction must be applied as a
+    // summary marker, not replayed as raw archived history.
+    let stored: Vec<holmes_core::event::StoredEvent> = report
+        .events
+        .iter()
+        .map(|reported| holmes_core::event::StoredEvent {
+            id: reported.id,
+            session_id: reported.session_id.clone(),
+            event_index: reported.event_index,
+            turn_index: reported.turn_index,
+            timestamp: reported.stored_at,
+            event: reported.event.clone(),
+        })
+        .collect();
+
+    let replayed = holmes_session::replay::replay_events(&report.session_id, &stored);
+
+    assert!(
+        !replayed.compactions.is_empty(),
+        "expected at least one compaction marker after replay",
+    );
+    assert!(
+        replayed
+            .session
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .any(|content| content.contains("[Compaction summary]")),
+        "replayed session should contain an injected compaction summary message",
+    );
+}
+
+
+#[tokio::test]
 async fn runs_learning_correction_scenario() {
     let scenario_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/learning-correction.yaml");
