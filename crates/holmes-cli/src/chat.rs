@@ -239,6 +239,7 @@ pub struct ChatContext {
     pub config: Config,
     pub data_dir: PathBuf,
     pub command_registry: CommandRegistry,
+    pub browser: Option<Arc<holmes_browser::BrowserManager>>,
 }
 
 pub(crate) fn save_config(ctx: &ChatContext) -> anyhow::Result<()> {
@@ -1421,6 +1422,8 @@ async fn create_fresh_runtime_session(
     memory_store: Arc<MemoryStore>,
     llm: Arc<LlmClient>,
     config: &HolmesConfig,
+    data_dir: &Path,
+    browser_out: &mut Option<Arc<holmes_browser::BrowserManager>>,
     mode: SessionMode,
     resolved_model: Option<ResolvedModel>,
     system_prompt: String,
@@ -1463,6 +1466,22 @@ async fn create_fresh_runtime_session(
             return Err(error);
         }
     };
+    let browser: Option<Arc<holmes_browser::BrowserManager>> = if config.browser.enabled {
+        let sessions_dir = data_dir.join("sessions");
+        match holmes_browser::BrowserManager::new(
+            &session_id,
+            &sessions_dir,
+            config.browser.clone(),
+        ) {
+            Ok(mgr) => Some(Arc::new(mgr)),
+            Err(e) => {
+                eprintln!("Warning: browser disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let registry = Arc::new(
         build_tool_registry(
             config,
@@ -1470,7 +1489,7 @@ async fn create_fresh_runtime_session(
             Some(memory_store.clone()),
             Some(llm),
             Some(session_id.clone()),
-        None,
+            browser.clone(),
         )
         .await,
     );
@@ -1489,6 +1508,7 @@ async fn create_fresh_runtime_session(
         return Err(error);
     }
     let mind_palace = MindPalace::new(session_db, memory_store);
+    *browser_out = browser.clone();
     Ok((
         session_id.clone(),
         RuntimeSession::new(session_id, mode).with_system_prompt(&system_prompt),
@@ -1537,6 +1557,10 @@ pub(crate) async fn create_chat_context(
     let runtime_guards = GuardChain::from_config(&config.guards);
     let llm = Arc::new(LlmClient::new(&config));
     let startup_model = resolve_attack_model_provider(&config, model);
+
+    // Browser manager (lazy-launches on first action). Only fresh sessions
+    // populate this; resume/continue currently run without a browser.
+    let mut browser: Option<Arc<holmes_browser::BrowserManager>> = None;
 
     // Create RuntimeSession
     let (session_id, runtime_session, mind_palace, registry, is_resume) = if let Some(id) =
@@ -1614,6 +1638,8 @@ pub(crate) async fn create_chat_context(
                     memory_store.clone(),
                     llm.clone(),
                     &config,
+                    &data_dir,
+                    &mut browser,
                     mode.clone(),
                     startup_model.clone(),
                     system_prompt.clone(),
@@ -1627,6 +1653,8 @@ pub(crate) async fn create_chat_context(
             memory_store.clone(),
             llm.clone(),
             &config,
+            &data_dir,
+            &mut browser,
             mode.clone(),
             startup_model.clone(),
             system_prompt.clone(),
@@ -1662,6 +1690,7 @@ pub(crate) async fn create_chat_context(
         config,
         data_dir: data_dir.clone(),
         command_registry: CommandRegistry::default(),
+        browser,
     };
 
     Ok(Some(ChatStartup { ctx, is_resume }))
@@ -1996,11 +2025,14 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                 .await
                 .ok();
             let model = resolve_attack_model_provider(&ctx.config, None);
+            let mut new_browser: Option<Arc<holmes_browser::BrowserManager>> = None;
             match create_fresh_runtime_session(
                 ctx.session_db.clone(),
                 ctx.memory_store.clone(),
                 ctx.llm.clone(),
                 &ctx.config,
+                &ctx.data_dir,
+                &mut new_browser,
                 ctx.runtime_session.mode.clone(),
                 model,
                 ctx.system_prompt.clone(),
@@ -2009,6 +2041,7 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
             {
                 Ok((new_id, rs, mp, registry)) => {
                     println!("Started new session: {}", &new_id[..8.min(new_id.len())]);
+                    ctx.browser = new_browser;
                     return SlashResult::NewSession(rs, mp, new_id, registry);
                 }
                 Err(error) => eprintln!("Error: {}", error),
@@ -2434,6 +2467,26 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                     );
                 }
                 Err(e) => eprintln!("Error: {}", e),
+            }
+            SlashResult::Handled
+        }
+
+        "browser" => {
+            match args.trim() {
+                "close" => {
+                    if let Some(mgr) = ctx.browser.as_ref() {
+                        mgr.close().await;
+                        println!("Browser closed; the next browser action will relaunch it.");
+                    } else {
+                        println!("Browser is not enabled in config.");
+                    }
+                }
+                other => {
+                    println!("Usage: /browser close");
+                    if !other.is_empty() {
+                        println!("Unknown subcommand: {other}");
+                    }
+                }
             }
             SlashResult::Handled
         }

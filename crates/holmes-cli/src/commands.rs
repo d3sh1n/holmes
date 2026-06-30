@@ -150,6 +150,13 @@ impl Default for CommandRegistry {
             args_hint: None,
         });
         registry.register(CommandDef {
+            name: "browser",
+            aliases: &[],
+            description: "管理内置浏览器（如 /browser close 关闭当前浏览器进程）",
+            category: "工具",
+            args_hint: Some("close"),
+        });
+        registry.register(CommandDef {
             name: "retry",
             aliases: &[],
             description: "丢弃上一轮，重新回答",

@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Resolve the per-session browser profile directory.
 ///
@@ -46,7 +46,7 @@ mod tests {
         assert!(!dir.to_string_lossy().contains(".."));
         assert!(dir
             .components()
-            .all(|c| !matches!(c, Component::ParentDir)));
+            .all(|c| !matches!(c, std::path::Component::ParentDir)));
     }
 
     #[test]
