@@ -13,6 +13,7 @@ pub mod perception;
 pub mod permissions;
 pub mod reflection;
 pub mod runtime;
+pub mod summary;
 pub mod yield_stream;
 pub mod middleware;
 

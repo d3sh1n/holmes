@@ -1,7 +1,9 @@
 use async_trait::async_trait;
+use chrono::Utc;
+use holmes_core::event::Event;
 use holmes_core::session::RuntimeSession;
 use holmes_core::subagent::SubagentRunner;
-use holmes_core::types::{SessionMode, SubAgentResult, SubAgentTask};
+use holmes_core::types::{EndReason, SessionMode, SubAgentResult, SubAgentTask};
 use holmes_guards::GuardChain;
 use holmes_llm::client::LlmClient;
 use holmes_mind_palace::MindPalace;
@@ -15,7 +17,18 @@ use holmes_tools::registry::ToolRegistry;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use holmes_core::config::Config;
+use holmes_core::config::{resolve_attack_model_provider, Config};
+
+fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
+    let mut names = registry
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
 
 #[derive(Clone)]
 pub struct CliSubagentRunner {
@@ -47,11 +60,32 @@ impl SubagentRunner for CliSubagentRunner {
 
         let sub_session_id = format!("sub-{}", Uuid::new_v4());
         let mode = SessionMode::default();
-        let session = RuntimeSession::new(sub_session_id.clone(), mode.clone());
+        let system_prompt = format!(
+            "You are Holmes subagent for parent session {}. Context: {}",
+            self.parent_session_id, task.context_summary
+        );
+        let resolved_model = resolve_attack_model_provider(&self.config, None);
+        let model = resolved_model
+            .as_ref()
+            .map(|resolved| resolved.model.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let provider = resolved_model.and_then(|resolved| resolved.provider);
 
-        let mind_palace = MindPalace::new(self.session_db.clone(), self.memory_store.clone());
-        let runtime_guards = GuardChain::from_config(&self.config.guards);
-        let runtime_state = RuntimeState::new(mode);
+        let _sub_session = self
+            .session_db
+            .create_session(holmes_session::db::CreateSessionParams {
+                id: Some(sub_session_id.clone()),
+                title: Some("Subagent".into()),
+                mode: Some(mode.clone()),
+                model: Some(model.clone()),
+                system_prompt: Some(system_prompt.clone()),
+                parent_session_id: Some(self.parent_session_id.clone()),
+                fork_point: None,
+                source: Some("subagent".into()),
+                tags: vec!["subagent".into()],
+            })
+            .await
+            .map_err(|e| e.to_string())?;
 
         let mut registry = ToolRegistry::new();
         holmes_tools::builtin::register_all(
@@ -60,6 +94,58 @@ impl SubagentRunner for CliSubagentRunner {
             Some(Arc::new(self.clone())),
         );
         holmes_tools::mcp::register_mcp_tools(&mut registry, &self.config.mcp.servers).await;
+        let tool_names = active_tool_names(&registry);
+        let now = Utc::now();
+        let startup_events = [
+            Event::SessionCreated {
+                id: sub_session_id.clone(),
+                title: Some("Subagent".into()),
+                mode: mode.clone(),
+                model: Some(model.clone()),
+                system_prompt: Some(system_prompt.clone()),
+                parent_id: Some(self.parent_session_id.clone()),
+                fork_point: None,
+                created_at: now,
+                tags: vec!["subagent".into()],
+            },
+            Event::SessionSystemPromptSet {
+                prompt_hash: holmes_core::stable_prompt_hash(&system_prompt),
+                content: system_prompt.clone(),
+                source: "startup".into(),
+                timestamp: now,
+            },
+            Event::SessionModeSet {
+                mode: mode.clone(),
+                source: Some("startup".into()),
+                timestamp: Some(now),
+            },
+            Event::SessionModelSet {
+                model: model.clone(),
+                provider: provider.clone(),
+                source: "startup".into(),
+                timestamp: now,
+            },
+            Event::ActiveToolsSet {
+                tool_names,
+                source: "startup".into(),
+                timestamp: now,
+            },
+        ];
+        for event in startup_events {
+            if let Err(error) = self.session_db.append_event(&sub_session_id, &event).await {
+                self.session_db
+                    .end_session(&sub_session_id, EndReason::Error)
+                    .await
+                    .ok();
+                return Err(error.to_string());
+            }
+        }
+
+        let session = RuntimeSession::new(sub_session_id.clone(), mode.clone())
+            .with_system_prompt(&system_prompt);
+        let mind_palace = MindPalace::new(self.session_db.clone(), self.memory_store.clone());
+        let runtime_guards = GuardChain::from_config(&self.config.guards);
+        let runtime_state = RuntimeState::new(mode);
 
         let runtime_context = RuntimeContext::new(
             session,

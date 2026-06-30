@@ -24,6 +24,27 @@ pub enum Event {
     },
     SessionModeSet {
         mode: SessionMode,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        timestamp: Option<DateTime<Utc>>,
+    },
+    SessionSystemPromptSet {
+        prompt_hash: String,
+        content: String,
+        source: String,
+        timestamp: DateTime<Utc>,
+    },
+    SessionModelSet {
+        model: String,
+        provider: Option<String>,
+        source: String,
+        timestamp: DateTime<Utc>,
+    },
+    ActiveToolsSet {
+        tool_names: Vec<String>,
+        source: String,
+        timestamp: DateTime<Utc>,
     },
 
     // === Turn Boundaries ===
@@ -285,6 +306,26 @@ pub enum Event {
         summary: String,
         preserved_keys: Vec<String>,
         method: CompressionMethod,
+        #[serde(default)]
+        preserved_head: Option<usize>,
+        #[serde(default)]
+        preserved_tail_tokens: Option<usize>,
+        #[serde(default)]
+        archive_path: Option<String>,
+        #[serde(default)]
+        archived_event_range: Option<(u64, u64)>,
+        #[serde(default)]
+        trigger: Option<CompactionTrigger>,
+        #[serde(default)]
+        timestamp: Option<DateTime<Utc>>,
+    },
+    BranchSummary {
+        from_event_index: u64,
+        to_event_index: u64,
+        summary: String,
+        reason: String,
+        method: SummaryMethod,
+        timestamp: DateTime<Utc>,
     },
 
     // === Skill & Knowledge Injection ===
@@ -480,6 +521,21 @@ pub enum CompressionMethod {
     StaticFallback,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryMethod {
+    Llm,
+    StaticFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectionSource {
@@ -548,6 +604,31 @@ impl Event {
             Event::ToolResult { name, content, .. } => {
                 format!("{} {}", name, content)
             }
+            Event::SessionSystemPromptSet { content, source, .. } => {
+                format!("system_prompt source={} {}", source, content)
+            }
+            Event::SessionModelSet {
+                model,
+                provider,
+                source,
+                ..
+            } => format!(
+                "model source={} provider={} {}",
+                source,
+                provider.as_deref().unwrap_or(""),
+                model
+            ),
+            Event::ActiveToolsSet {
+                tool_names, source, ..
+            } => format!("active_tools source={} {}", source, tool_names.join(" ")),
+            Event::SessionModeSet { mode, source, .. } => match source {
+                Some(source) => format!("session_mode source={} {:?}", source, mode),
+                None => format!("session_mode {:?}", mode),
+            },
+            Event::BranchSummary {
+                summary, reason, ..
+            } => format!("branch_summary reason={} {}", reason, summary),
+            Event::CompressionApplied { summary, .. } => summary.clone(),
             Event::VulnerabilityFound {
                 title, evidence, ..
             } => {
@@ -613,7 +694,10 @@ impl Event {
         match self {
             Event::SessionCreated { .. }
             | Event::SessionEnded { .. }
-            | Event::SessionModeSet { .. } => "session",
+            | Event::SessionModeSet { .. }
+            | Event::SessionSystemPromptSet { .. }
+            | Event::SessionModelSet { .. }
+            | Event::ActiveToolsSet { .. } => "session",
             Event::UserMessage { .. } | Event::TurnComplete { .. } => "turn",
             Event::GoalSet { .. }
             | Event::GoalEvaluated { .. }
@@ -653,7 +737,7 @@ impl Event {
             | Event::ContextSnapshotTaken { .. }
             | Event::ContextSwitched { .. }
             | Event::DashboardUpdated { .. } => "mind_palace",
-            Event::CompressionApplied { .. } => "context",
+            Event::CompressionApplied { .. } | Event::BranchSummary { .. } => "context",
             Event::SkillInjected { .. }
             | Event::KnowledgeInjected { .. }
             | Event::HumanFeedback { .. } => "injection",
@@ -665,6 +749,83 @@ impl Event {
             | Event::SubAgentCompleted { .. }
             | Event::SubAgentProgress { .. } => "subagent",
             Event::ReportGenerated { .. } => "report",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_events_have_text_and_categories() {
+        let now = Utc::now();
+        let events = vec![
+            Event::SessionModeSet {
+                mode: SessionMode::SecurityResearch,
+                source: Some("startup".into()),
+                timestamp: Some(now),
+            },
+            Event::SessionSystemPromptSet {
+                prompt_hash: "hash123".into(),
+                content: "system prompt content".into(),
+                source: "startup".into(),
+                timestamp: now,
+            },
+            Event::SessionModelSet {
+                model: "claude-sonnet-4-6".into(),
+                provider: Some("default".into()),
+                source: "startup".into(),
+                timestamp: now,
+            },
+            Event::ActiveToolsSet {
+                tool_names: vec!["http_request".into(), "report_finding".into()],
+                source: "startup".into(),
+                timestamp: now,
+            },
+            Event::BranchSummary {
+                from_event_index: 1,
+                to_event_index: 4,
+                summary: "branch path found idor evidence".into(),
+                reason: "fork".into(),
+                method: SummaryMethod::StaticFallback,
+                timestamp: now,
+            },
+            Event::CompressionApplied {
+                before_count: 10,
+                after_count: 4,
+                summary: "compacted auth investigation".into(),
+                preserved_keys: vec!["system_prompt".into()],
+                method: CompressionMethod::StaticFallback,
+                preserved_head: Some(2),
+                preserved_tail_tokens: Some(4000),
+                archive_path: Some("sessions/s/compactions/compaction_7.json".into()),
+                archived_event_range: Some((2, 7)),
+                trigger: Some(CompactionTrigger::Manual),
+                timestamp: Some(now),
+            },
+        ];
+
+        assert_eq!(events[0].category(), "session");
+        assert!(
+            events[0].content_text().contains("SecurityResearch")
+                || events[0].content_text().contains("security_research")
+        );
+        assert_eq!(events[1].category(), "session");
+        assert!(events[1].content_text().contains("system prompt content"));
+        assert_eq!(events[2].category(), "session");
+        assert!(events[2].content_text().contains("claude-sonnet-4-6"));
+        assert_eq!(events[3].category(), "session");
+        assert!(events[3].content_text().contains("http_request"));
+        assert_eq!(events[4].category(), "context");
+        assert!(events[4].content_text().contains("idor evidence"));
+        assert_eq!(events[5].category(), "context");
+        assert!(events[5].content_text().contains("auth investigation"));
+
+        for event in events {
+            let encoded = serde_json::to_string(&event).expect("serialize event");
+            let decoded: Event = serde_json::from_str(&encoded).expect("deserialize event");
+            assert_eq!(decoded.category(), event.category());
         }
     }
 }

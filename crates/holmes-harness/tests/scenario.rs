@@ -66,6 +66,64 @@ expectations:
 }
 
 #[tokio::test]
+async fn startup_metadata_is_deterministic() {
+    let scenario: HarnessScenario = serde_yaml::from_str(
+        r#"
+name: Deterministic Name!
+turns:
+  - input: hello
+scripted_responses:
+  - content: '<holmes_decision>{"type":"answer","message":"ok"}</holmes_decision>'
+expectations:
+  final_contains: [ok]
+  max_errors: 0
+"#,
+    )
+    .expect("parse scenario");
+
+    let report = HarnessRunner::new()
+        .run(scenario)
+        .await
+        .expect("run scenario");
+
+    assert!(report.success, "{:#?}", report.failed_expectations);
+    assert_eq!(report.session_id, "harness-deterministic-name");
+
+    let expected_timestamp = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let created = report
+        .events
+        .iter()
+        .find_map(|event| match &event.event {
+            Event::SessionCreated { id, created_at, .. } => Some((id, created_at)),
+            _ => None,
+        })
+        .expect("session_created event");
+    assert_eq!(created.0, "harness-deterministic-name");
+    assert_eq!(*created.1, expected_timestamp);
+
+    let prompt_metadata = report
+        .events
+        .iter()
+        .find_map(|event| match &event.event {
+            Event::SessionSystemPromptSet {
+                prompt_hash,
+                timestamp,
+                ..
+            } => Some((prompt_hash, timestamp)),
+            _ => None,
+        })
+        .expect("session_system_prompt_set event");
+    assert_eq!(
+        prompt_metadata.0,
+        "27f09f96e8ec41f95a274560736cdda417e696ec8651179cb4bc5d2fa7edb79d"
+    );
+    assert_eq!(*prompt_metadata.1, expected_timestamp);
+}
+
+#[tokio::test]
 async fn runs_long_compression_scenario() {
     let scenario_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/long-compression.yaml");
@@ -90,6 +148,52 @@ async fn runs_long_compression_scenario() {
         "{compression_json:#?}"
     );
 }
+
+#[tokio::test]
+async fn long_compression_session_replays_with_compaction_summary() {
+    let scenario_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/long-compression.yaml");
+    let scenario = HarnessScenario::from_path(scenario_path).expect("load scenario");
+    let report = HarnessRunner::new()
+        .run(scenario)
+        .await
+        .expect("run scenario");
+
+    assert!(report.success, "{:#?}", report.failed_expectations);
+
+    // Reconstruct StoredEvents from the report and replay the session, exactly
+    // like a production resume would. The compaction must be applied as a
+    // summary marker, not replayed as raw archived history.
+    let stored: Vec<holmes_core::event::StoredEvent> = report
+        .events
+        .iter()
+        .map(|reported| holmes_core::event::StoredEvent {
+            id: reported.id,
+            session_id: reported.session_id.clone(),
+            event_index: reported.event_index,
+            turn_index: reported.turn_index,
+            timestamp: reported.stored_at,
+            event: reported.event.clone(),
+        })
+        .collect();
+
+    let replayed = holmes_session::replay::replay_events(&report.session_id, &stored);
+
+    assert!(
+        !replayed.compactions.is_empty(),
+        "expected at least one compaction marker after replay",
+    );
+    assert!(
+        replayed
+            .session
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .any(|content| content.contains("[Compaction summary]")),
+        "replayed session should contain an injected compaction summary message",
+    );
+}
+
 
 #[tokio::test]
 async fn runs_learning_correction_scenario() {

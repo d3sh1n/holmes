@@ -14,13 +14,106 @@ use holmes_runtime::{RuntimeSink, RuntimeYield, StreamEvent};
 use holmes_session::{memory_store::MemoryStore, CreateSessionParams, SessionDB, SessionStore};
 use holmes_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::llm::ScriptedLlmBackend;
 use crate::scenario::{
     HarnessEventPayloadExpectation, HarnessExpectations, HarnessScenario, HarnessTool,
 };
 use crate::tool::HarnessMockTool;
+
+fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
+    let mut names = registry
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn deterministic_startup_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .expect("valid deterministic harness timestamp")
+        .with_timezone(&chrono::Utc)
+}
+
+fn deterministic_session_id(scenario: &HarnessScenario) -> String {
+    let sanitized = scenario
+        .name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if sanitized.is_empty() {
+        "harness-scenario".into()
+    } else {
+        format!("harness-{sanitized}")
+    }
+}
+
+async fn append_harness_startup_metadata(
+    session_db: &Arc<dyn SessionStore>,
+    session_id: &str,
+    title: Option<String>,
+    mode: holmes_core::types::SessionMode,
+    model: String,
+    system_prompt: String,
+    tags: Vec<String>,
+    tool_names: Vec<String>,
+    startup_time: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let now = startup_time;
+    let events = [
+        Event::SessionCreated {
+            id: session_id.to_string(),
+            title,
+            mode: mode.clone(),
+            model: Some(model.clone()),
+            system_prompt: Some(system_prompt.clone()),
+            parent_id: None,
+            fork_point: None,
+            created_at: now,
+            tags,
+        },
+        Event::SessionSystemPromptSet {
+            prompt_hash: holmes_core::stable_prompt_hash(&system_prompt),
+            content: system_prompt,
+            source: "harness_startup".into(),
+            timestamp: now,
+        },
+        Event::SessionModeSet {
+            mode,
+            source: Some("harness_startup".into()),
+            timestamp: Some(now),
+        },
+        Event::SessionModelSet {
+            model,
+            provider: None,
+            source: "harness_startup".into(),
+            timestamp: now,
+        },
+        Event::ActiveToolsSet {
+            tool_names,
+            source: "harness_startup".into(),
+            timestamp: now,
+        },
+    ];
+    for event in events {
+        session_db.append_event(session_id, &event).await?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HarnessRunner;
@@ -32,7 +125,8 @@ impl HarnessRunner {
 
     pub async fn run(&self, scenario: HarnessScenario) -> Result<HarnessReport> {
         let session_mode = scenario.mode();
-        let session_id = Uuid::new_v4().to_string();
+        let startup_time = deterministic_startup_time();
+        let session_id = deterministic_session_id(&scenario);
         let session_db: Arc<dyn SessionStore> = Arc::new(SessionDB::open(":memory:").await?);
         let memory_store = Arc::new(MemoryStore::open(":memory:").await?);
         let system_prompt = format!(
@@ -40,19 +134,42 @@ impl HarnessRunner {
             scenario.name
         );
 
+        let model = "scripted".to_string();
+        let title = Some(format!("Harness: {}", scenario.name));
+        let tags = vec!["harness".into()];
         session_db
             .create_session(CreateSessionParams {
                 id: Some(session_id.clone()),
-                title: Some(format!("Harness: {}", scenario.name)),
+                title: title.clone(),
                 mode: Some(session_mode.clone()),
-                model: Some("scripted".into()),
+                model: Some(model.clone()),
                 system_prompt: Some(system_prompt.clone()),
                 parent_session_id: None,
                 fork_point: None,
                 source: Some("harness".into()),
-                tags: vec!["harness".into()],
+                tags: tags.clone(),
             })
             .await?;
+        let tools = Arc::new(build_tool_registry(&scenario)?);
+        if let Err(error) = append_harness_startup_metadata(
+            &session_db,
+            &session_id,
+            title,
+            session_mode.clone(),
+            model,
+            system_prompt.clone(),
+            tags,
+            active_tool_names(&tools),
+            startup_time,
+        )
+        .await
+        {
+            session_db
+                .end_session(&session_id, holmes_core::EndReason::Error)
+                .await
+                .ok();
+            return Err(error);
+        }
 
         let session = RuntimeSession::new(session_id.clone(), session_mode.clone())
             .with_system_prompt(&system_prompt);
@@ -63,7 +180,6 @@ impl HarnessRunner {
                 .into_iter()
                 .map(|response| response.into_llm_response()),
         ));
-        let tools = Arc::new(build_tool_registry(&scenario)?);
         let mind_palace = MindPalace::new(session_db.clone(), memory_store.clone());
         let context = RuntimeContext::new(
             session,

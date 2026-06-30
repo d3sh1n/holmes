@@ -1,7 +1,12 @@
 use async_trait::async_trait;
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::types::*;
-use crate::{CreateSessionParams, SessionError, SearchResult};
+use std::path::PathBuf;
+
+use crate::compaction_archive::CompactionArchive;
+use crate::replay::ReplayedSessionContext;
+use crate::{CreateSessionParams, SearchResult, SessionError};
+
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn create_session(
@@ -19,6 +24,26 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Vec<StoredEvent>, SessionError>;
+
+    /// Rebuild a complete runtime context from the session's event stream.
+    async fn replay_session_context(
+        &self,
+        session_id: &str,
+    ) -> Result<ReplayedSessionContext, SessionError>;
+
+    /// Resolve (creating if needed) the on-disk workspace directory for a session.
+    async fn session_workspace(&self, session_id: &str) -> Result<PathBuf, SessionError>;
+
+    /// Persist a compaction archive and return its absolute path.
+    async fn write_compaction_archive(
+        &self,
+        session_id: &str,
+        compaction_event_index: u64,
+        archive: &CompactionArchive,
+    ) -> Result<String, SessionError>;
+
+    /// Read back a compaction archive from a previously written path.
+    async fn read_compaction_archive(&self, path: &str) -> Result<CompactionArchive, SessionError>;
 
     async fn list_sessions(
         &self,
@@ -63,6 +88,12 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<(), SessionError>;
 
     async fn set_title(&self, id: &str, title: &str) -> Result<(), SessionError>;
+
+    /// Persist the session's active mode (semantic-replay metadata sync).
+    async fn set_mode(&self, id: &str, mode: SessionMode) -> Result<(), SessionError>;
+
+    /// Persist the session's active model (semantic-replay metadata sync).
+    async fn set_model(&self, id: &str, model: &str) -> Result<(), SessionError>;
 
     async fn search_events(
         &self,

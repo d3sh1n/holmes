@@ -42,12 +42,12 @@ impl ReflectionEngine {
     pub fn assess_error(&self, error: &RuntimeError) -> ReflectionOutcome {
         match error.kind {
             RuntimeErrorKind::NeedsUser => ReflectionOutcome::NeedsUser(error.message.clone()),
-            RuntimeErrorKind::Recoverable | RuntimeErrorKind::Fatal => {
-                ReflectionOutcome::RuntimeError {
-                    kind: error.kind.clone(),
-                    message: error.message.clone(),
-                }
-            }
+            RuntimeErrorKind::Recoverable
+            | RuntimeErrorKind::Fatal
+            | RuntimeErrorKind::ContextOverflow => ReflectionOutcome::RuntimeError {
+                kind: error.kind.clone(),
+                message: error.message.clone(),
+            },
         }
     }
 }

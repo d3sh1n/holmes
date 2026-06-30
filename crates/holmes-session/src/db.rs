@@ -1,12 +1,13 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::types::*;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use async_trait::async_trait;
 use crate::store::SessionStore;
 
+use crate::compaction_archive::CompactionArchive;
 use crate::schema;
 use crate::write_contention::WriteContention;
 
@@ -14,7 +15,7 @@ pub struct SessionDB {
     conn: Arc<Mutex<Connection>>,
     write_contention: WriteContention,
     write_count: Arc<Mutex<u64>>,
-    sessions_dir: std::path::PathBuf,
+    sessions_dir: PathBuf,
 }
 
 impl SessionDB {
@@ -122,6 +123,7 @@ impl SessionStore for SessionDB {
 
         let session_dir = self.sessions_dir.join(&id);
         std::fs::create_dir_all(session_dir.join("tool-results")).ok();
+        std::fs::create_dir_all(session_dir.join("compactions")).ok();
 
         Ok(Session {
             id,
@@ -325,6 +327,50 @@ impl SessionStore for SessionDB {
             }
         }
         Ok(events)
+    }
+
+    async fn replay_session_context(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::ReplayedSessionContext, SessionError> {
+        let events = self.get_events(session_id).await?;
+        Ok(crate::replay::replay_events(session_id, &events))
+    }
+
+    async fn session_workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<std::path::PathBuf, SessionError> {
+        validate_session_id_for_path(session_id)?;
+        let path = self.sessions_dir.join(session_id);
+        tokio::fs::create_dir_all(&path).await?;
+        Ok(path)
+    }
+
+    async fn write_compaction_archive(
+        &self,
+        session_id: &str,
+        compaction_event_index: u64,
+        archive: &CompactionArchive,
+    ) -> Result<String, SessionError> {
+        let dir = self
+            .session_workspace(session_id)
+            .await?
+            .join("compactions");
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("compaction_{compaction_event_index}.json"));
+        let content = serde_json::to_string_pretty(archive)?;
+        tokio::fs::write(&path, content).await?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    async fn read_compaction_archive(
+        &self,
+        path: &str,
+    ) -> Result<CompactionArchive, SessionError> {
+        validate_archive_path(&self.sessions_dir, path).await?;
+        let content = tokio::fs::read_to_string(path).await?;
+        Ok(serde_json::from_str(&content)?)
     }
 
     async fn list_sessions(
@@ -581,10 +627,15 @@ impl SessionStore for SessionDB {
             .get_session(id)
             .await?
             .ok_or(SessionError::NotFound(id.to_string()))?;
-        let events: Vec<StoredEvent> = self.get_events(id).await?;
-        let forked_events: Vec<StoredEvent> = events
+        let events = self.get_events(id).await?;
+        let events_at_fork: Vec<StoredEvent> = events
             .into_iter()
             .filter(|e| e.event_index <= fork_point)
+            .collect();
+        let replayed_at_fork = crate::replay::replay_events(id, &events_at_fork);
+        let forked_events: Vec<StoredEvent> = events_at_fork
+            .into_iter()
+            .filter(|e| !is_session_lifecycle_metadata_event(&e.event))
             .collect();
 
         // Pre-compute everything that doesn't need the DB lock so that the
@@ -592,15 +643,28 @@ impl SessionStore for SessionDB {
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let now_str = now.to_rfc3339();
-        let new_mode = parent.mode.clone();
-        let new_model = parent.model.clone();
-        let new_system_prompt = parent.system_prompt.clone();
+        let (new_mode, new_model, new_system_prompt) = if replayed_at_fork.semantic_complete {
+            (
+                replayed_at_fork.session.mode.clone(),
+                replayed_at_fork.model.clone().or(parent.model.clone()),
+                replayed_at_fork
+                    .system_prompt
+                    .clone()
+                    .or(parent.system_prompt.clone()),
+            )
+        } else {
+            (
+                parent.mode.clone(),
+                parent.model.clone(),
+                parent.system_prompt.clone(),
+            )
+        };
         let new_tags = parent.tags.clone();
         let parent_id = id.to_string();
         let title = new_title.to_string();
 
         // Serialize forked events up front so the transaction body is purely DB ops.
-        let prepared_events: Vec<(String, String, String)> = forked_events
+        let prepared_events: Vec<(u64, String, String, String)> = forked_events
             .iter()
             .map(|stored| {
                 let event_type = event_type_str(&stored.event).to_string();
@@ -613,7 +677,12 @@ impl SessionStore for SessionDB {
                     );
                 }
                 let event_data = serde_json::to_string(&v)?;
-                Ok::<_, serde_json::Error>((event_type, event_data, now_str.clone()))
+                Ok::<_, serde_json::Error>((
+                    stored.event_index,
+                    event_type,
+                    event_data,
+                    now_str.clone(),
+                ))
             })
             .collect::<Result<_, _>>()?;
 
@@ -663,11 +732,11 @@ impl SessionStore for SessionDB {
 
                     let mut user_msg_count: i64 = 0;
                     let mut tool_call_count: i64 = 0;
-                    for (idx, (event_type, event_data, ts)) in prepared.iter().enumerate() {
+                    for (event_index, event_type, event_data, ts) in prepared.iter() {
                         tx.execute(
                             "INSERT INTO events (session_id, event_index, event_type, event_data, timestamp)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![new_id, idx as i64, event_type, event_data, ts],
+                            params![new_id, *event_index as i64, event_type, event_data, ts],
                         )?;
                         if event_type == "user_message" {
                             user_msg_count += 1;
@@ -707,11 +776,11 @@ impl SessionStore for SessionDB {
             end_reason: None,
             message_count: prepared_events
                 .iter()
-                .filter(|(t, _, _)| t == "user_message")
+                .filter(|(_, t, _, _)| t == "user_message")
                 .count() as u64,
             tool_call_count: prepared_events
                 .iter()
-                .filter(|(t, _, _)| t == "tool_call")
+                .filter(|(_, t, _, _)| t == "tool_call")
                 .count() as u64,
             subagent_count: 0,
             input_tokens: 0,
@@ -867,6 +936,46 @@ impl SessionStore for SessionDB {
         Ok(())
     }
 
+    async fn set_mode(&self, id: &str, mode: SessionMode) -> Result<(), SessionError> {
+        let id_owned = id.to_string();
+        let mode_owned = mode;
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let mode = mode_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET mode = ?1 WHERE id = ?2",
+                        params![mode_to_str(&mode), id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn set_model(&self, id: &str, model: &str) -> Result<(), SessionError> {
+        let id_owned = id.to_string();
+        let model_owned = model.to_string();
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let model = model_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET model = ?1 WHERE id = ?2",
+                        params![model, id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn search_events(
         &self,
         query: &str,
@@ -951,11 +1060,105 @@ pub enum SessionError {
     Database(#[from] rusqlite::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("session not found: {0}")]
     NotFound(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 // === Helper functions ===
+
+fn validate_session_id_for_path(session_id: &str) -> Result<(), SessionError> {
+    if session_id.is_empty() {
+        return Err(SessionError::Other(
+            "invalid session id: cannot be empty".into(),
+        ));
+    }
+
+    let path = Path::new(session_id);
+    if path.is_absolute() {
+        return Err(SessionError::Other(format!(
+            "invalid session id '{}': absolute paths are not allowed",
+            session_id
+        )));
+    }
+
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == session_id => Ok(()),
+        _ => Err(SessionError::Other(format!(
+            "invalid session id '{}': must be a single path component without separators or '..'",
+            session_id
+        ))),
+    }
+}
+
+async fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, SessionError> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                SessionError::Other(format!(
+                    "path '{}' has no parent directory to canonicalize",
+                    path.display()
+                ))
+            })?;
+            let canonical_parent = tokio::fs::canonicalize(parent).await?;
+            let file_name = path.file_name().ok_or_else(|| {
+                SessionError::Other(format!(
+                    "path '{}' has no final component to canonicalize",
+                    path.display()
+                ))
+            })?;
+            Ok(canonical_parent.join(file_name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Validate that a compaction archive path resolves inside the sessions
+/// directory, guarding against path traversal.
+async fn validate_archive_path(
+    sessions_dir: &Path,
+    path: &str,
+) -> Result<PathBuf, SessionError> {
+    let requested = Path::new(path);
+    let canonical_sessions_dir = canonicalize_existing_or_parent(sessions_dir).await?;
+
+    let canonical_requested = match tokio::fs::canonicalize(requested).await {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = requested.parent().ok_or_else(|| {
+                SessionError::Other(format!(
+                    "compaction archive path '{}' has no parent directory",
+                    path
+                ))
+            })?;
+            let canonical_parent = tokio::fs::canonicalize(parent).await?;
+            if !canonical_parent.starts_with(&canonical_sessions_dir) {
+                return Err(SessionError::Other(format!(
+                    "compaction archive path '{}' is outside sessions directory '{}'",
+                    path,
+                    canonical_sessions_dir.display()
+                )));
+            }
+            return Ok(requested.to_path_buf());
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    if !canonical_requested.starts_with(&canonical_sessions_dir) {
+        return Err(SessionError::Other(format!(
+            "compaction archive path '{}' is outside sessions directory '{}'",
+            path,
+            canonical_sessions_dir.display()
+        )));
+    }
+
+    Ok(canonical_requested)
+}
 
 /// Parse an event_data JSON blob back into an `Event`.
 ///
@@ -970,11 +1173,26 @@ fn parse_event_data(data: &str) -> Result<Event, serde_json::Error> {
     serde_json::from_value(value)
 }
 
+fn is_session_lifecycle_metadata_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::SessionCreated { .. }
+            | Event::SessionEnded { .. }
+            | Event::SessionModeSet { .. }
+            | Event::SessionSystemPromptSet { .. }
+            | Event::SessionModelSet { .. }
+            | Event::ActiveToolsSet { .. }
+    )
+}
+
 fn event_type_str(event: &Event) -> &'static str {
     match event {
         Event::SessionCreated { .. } => "session_created",
         Event::SessionEnded { .. } => "session_ended",
         Event::SessionModeSet { .. } => "session_mode_set",
+        Event::SessionSystemPromptSet { .. } => "session_system_prompt_set",
+        Event::SessionModelSet { .. } => "session_model_set",
+        Event::ActiveToolsSet { .. } => "active_tools_set",
         Event::UserMessage { .. } => "user_message",
         Event::TurnComplete { .. } => "turn_complete",
         Event::GoalSet { .. } => "goal_set",
@@ -1016,6 +1234,7 @@ fn event_type_str(event: &Event) -> &'static str {
         Event::ContextSwitched { .. } => "context_switched",
         Event::DashboardUpdated { .. } => "dashboard_updated",
         Event::CompressionApplied { .. } => "compression_applied",
+        Event::BranchSummary { .. } => "branch_summary",
         Event::SkillInjected { .. } => "skill_injected",
         Event::KnowledgeInjected { .. } => "knowledge_injected",
         Event::HumanFeedback { .. } => "human_feedback",
@@ -1150,6 +1369,142 @@ mod tests {
         }
 
         // Cleanup. Best-effort — ignore errors on shared CI temp dirs.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn fork_session_excludes_parent_lifecycle_metadata() {
+        let path = temp_db_path("fork-lifecycle");
+        let db = SessionDB::open(&path).await.expect("open db");
+
+        let parent = db
+            .create_session(CreateSessionParams {
+                id: Some("parent_session".into()),
+                title: Some("parent".into()),
+                mode: Some(SessionMode::Pentest),
+                model: Some("parent-model".into()),
+                system_prompt: Some("parent prompt".into()),
+                parent_session_id: None,
+                fork_point: None,
+                source: Some("test".into()),
+                tags: vec!["parent-tag".into()],
+            })
+            .await
+            .expect("create parent session");
+        let now = chrono::Utc::now();
+
+        let parent_startup_events = [
+            Event::SessionCreated {
+                id: parent.id.clone(),
+                title: parent.title.clone(),
+                mode: SessionMode::Pentest,
+                model: Some("parent-model".into()),
+                system_prompt: Some("parent prompt".into()),
+                parent_id: None,
+                fork_point: None,
+                created_at: now,
+                tags: vec!["parent-tag".into()],
+            },
+            Event::SessionSystemPromptSet {
+                prompt_hash: "parent-prompt-hash".into(),
+                content: "parent prompt".into(),
+                source: "parent-startup".into(),
+                timestamp: now,
+            },
+            Event::SessionModeSet {
+                mode: SessionMode::SecurityResearch,
+                source: Some("parent-startup".into()),
+                timestamp: Some(now),
+            },
+            Event::SessionModelSet {
+                model: "parent-model".into(),
+                provider: Some("parent-provider".into()),
+                source: "parent-startup".into(),
+                timestamp: now,
+            },
+            Event::ActiveToolsSet {
+                tool_names: vec!["parent_tool".into()],
+                source: "parent-startup".into(),
+                timestamp: now,
+            },
+        ];
+
+        for event in parent_startup_events {
+            db.append_event(&parent.id, &event)
+                .await
+                .expect("append parent startup event");
+        }
+        db.append_event(
+            &parent.id,
+            &Event::UserMessage {
+                content: "first turn".into(),
+                timestamp: now,
+            },
+        )
+        .await
+        .expect("append user event");
+        db.append_event(
+            &parent.id,
+            &Event::Thinking {
+                content: "keep this history".into(),
+                reasoning_type: Some("trace".into()),
+            },
+        )
+        .await
+        .expect("append thinking event");
+        let fork_point = db
+            .append_event(
+                &parent.id,
+                &Event::SessionEnded {
+                    reason: EndReason::UserQuit,
+                    summary: Some("parent ended".into()),
+                },
+            )
+            .await
+            .expect("append lifecycle end event");
+
+        let child = db
+            .fork_session(&parent.id, fork_point, "child")
+            .await
+            .expect("fork session");
+
+        let child_events = db.get_events(&child.id).await.expect("child events");
+        assert!(
+            child_events.iter().any(|stored| matches!(
+                &stored.event,
+                Event::UserMessage { content, .. } if content == "first turn"
+            )),
+            "fork should preserve conversational history"
+        );
+        assert!(
+            child_events.iter().any(|stored| matches!(
+                &stored.event,
+                Event::Thinking { content, .. } if content == "keep this history"
+            )),
+            "fork should preserve meaningful assistant history"
+        );
+        assert!(
+            child_events.iter().all(|stored| !matches!(
+                &stored.event,
+                Event::SessionCreated { .. }
+                    | Event::SessionSystemPromptSet { .. }
+                    | Event::SessionModeSet { .. }
+                    | Event::SessionModelSet { .. }
+                    | Event::ActiveToolsSet { .. }
+                    | Event::SessionEnded { .. }
+            )),
+            "child fork copied parent lifecycle metadata: {child_events:?}"
+        );
+        assert!(
+            child_events.iter().all(|stored| !matches!(
+                &stored.event,
+                Event::SessionCreated { id, .. } if id == &parent.id
+            )),
+            "child must not contain parent SessionCreated payload"
+        );
+        assert_eq!(child.message_count, 1);
+        assert_eq!(child.tool_call_count, 0);
+
         let _ = std::fs::remove_file(&path);
     }
 
