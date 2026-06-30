@@ -606,6 +606,70 @@ fn replay_compaction_summary_replaces_archived_context_range() {
 }
 
 #[test]
+fn replay_injects_compaction_summary_and_marker() {
+    let now = chrono::Utc::now();
+    let replayed = replay_events(
+        "marker_test",
+        &[
+            stored_event(0, session_created_with_prompt("system prompt")),
+            stored_event(
+                1,
+                Event::SessionSystemPromptSet {
+                    prompt_hash: "hash".into(),
+                    content: "system prompt".into(),
+                    source: "test".into(),
+                    timestamp: now,
+                },
+            ),
+            stored_event(
+                2,
+                Event::UserMessage {
+                    content: "old work".into(),
+                    timestamp: now,
+                },
+            ),
+            stored_event(
+                3,
+                Event::CompressionApplied {
+                    before_count: 1,
+                    after_count: 1,
+                    summary: "old work summarized".into(),
+                    preserved_keys: vec!["system_prompt".into()],
+                    method: CompressionMethod::StaticFallback,
+                    preserved_head: Some(1),
+                    preserved_tail_tokens: Some(4000),
+                    // Intentionally a missing/unreadable archive path: replay must
+                    // not block on it and must still record the marker + summary.
+                    archive_path: Some("sessions/marker_test/compactions/missing.json".into()),
+                    archived_event_range: Some((2, 2)),
+                    trigger: Some(CompactionTrigger::Manual),
+                    timestamp: Some(now),
+                },
+            ),
+        ],
+    );
+
+    // The compaction marker is recorded even though the archive file is absent.
+    assert_eq!(replayed.compactions.len(), 1);
+    let marker = &replayed.compactions[0];
+    assert_eq!(marker.event_index, 3);
+    assert_eq!(marker.summary, "old work summarized");
+    assert_eq!(
+        marker.archive_path.as_deref(),
+        Some("sessions/marker_test/compactions/missing.json")
+    );
+    assert!(marker.archived_event_range.is_some());
+
+    // The summary is injected into the replayed context.
+    assert!(replayed
+        .session
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .any(|content| content.contains("old work summarized")));
+}
+
+#[test]
 fn replay_tool_call_followed_by_result_uses_matching_tool_result_id() {
     let replayed = replay_events(
         "replay_test",
