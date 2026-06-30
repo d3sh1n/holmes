@@ -17,7 +17,7 @@ pub enum BrowserError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("cdp error: {0}")]
-    Cdp(String),
+    Cdp(#[from] chromiumoxide::error::CdpError),
     #[error("other: {0}")]
     Other(String),
 }
