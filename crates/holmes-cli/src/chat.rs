@@ -2205,15 +2205,6 @@ mod tests {
             .await
             .unwrap();
 
-        let parent_latest_index = session_db
-            .get_events(&session_id)
-            .await
-            .unwrap()
-            .last()
-            .unwrap()
-            .event_index;
-        assert!(parent_latest_index > runtime_session.message_count() as u64);
-
         let mut ctx = ChatContext {
             session_id: session_id.clone(),
             session_db: session_db.clone(),
@@ -2233,6 +2224,19 @@ mod tests {
             data_dir: PathBuf::from("."),
             command_registry: CommandRegistry::default(),
         };
+
+        let mode_result = handle_slash_command("/mode research", &mut ctx).await;
+        assert!(matches!(mode_result, SlashResult::Handled));
+        assert_eq!(ctx.runtime_session.mode, SessionMode::SecurityResearch);
+
+        let parent_latest_index = session_db
+            .get_events(&session_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .event_index;
+        assert!(parent_latest_index > ctx.runtime_session.message_count() as u64);
 
         let result = handle_slash_command("/branch child", &mut ctx).await;
         assert!(matches!(result, SlashResult::Handled));
@@ -2255,6 +2259,7 @@ mod tests {
             .unwrap()
             .expect("child session record");
         assert_eq!(child.fork_point, Some(parent_latest_index));
+        assert_eq!(child.mode, SessionMode::SecurityResearch);
 
         let replayed = session_db.replay_session_context(&child.id).await.unwrap();
         assert!(replayed.semantic_complete, "{:?}", replayed.warnings);
@@ -2264,6 +2269,7 @@ mod tests {
             Some(session_id.as_str())
         );
         assert_eq!(replayed.session.lineage.fork_point, Some(parent_latest_index));
+        assert_eq!(replayed.session.mode, SessionMode::SecurityResearch);
         assert_eq!(replayed.model.as_deref(), Some("startup-model"));
         assert_eq!(replayed.active_tools, active_tool_names(&ctx.registry));
 
@@ -2312,13 +2318,17 @@ mod tests {
             1,
             "branch should contain exactly one child system prompt metadata event"
         );
+        let child_startup_modes = child_events
+            .iter()
+            .filter_map(|stored| match &stored.event {
+                Event::SessionModeSet { mode, .. } => Some(mode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            child_events
-                .iter()
-                .filter(|stored| matches!(stored.event, Event::SessionModeSet { .. }))
-                .count(),
-            1,
-            "branch should contain exactly one child mode metadata event"
+            child_startup_modes,
+            vec![SessionMode::SecurityResearch],
+            "branch should contain exactly one child mode metadata event with replayed parent mode"
         );
         assert_eq!(
             child_events

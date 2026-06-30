@@ -604,9 +604,13 @@ impl SessionDB {
             .await?
             .ok_or(SessionError::NotFound(id.to_string()))?;
         let events = self.get_events(id).await?;
-        let forked_events: Vec<StoredEvent> = events
+        let events_at_fork: Vec<StoredEvent> = events
             .into_iter()
             .filter(|e| e.event_index <= fork_point)
+            .collect();
+        let replayed_at_fork = crate::replay::replay_events(id, &events_at_fork);
+        let forked_events: Vec<StoredEvent> = events_at_fork
+            .into_iter()
             .filter(|e| !is_session_lifecycle_metadata_event(&e.event))
             .collect();
 
@@ -615,15 +619,28 @@ impl SessionDB {
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let now_str = now.to_rfc3339();
-        let new_mode = parent.mode.clone();
-        let new_model = parent.model.clone();
-        let new_system_prompt = parent.system_prompt.clone();
+        let (new_mode, new_model, new_system_prompt) = if replayed_at_fork.semantic_complete {
+            (
+                replayed_at_fork.session.mode.clone(),
+                replayed_at_fork.model.clone().or(parent.model.clone()),
+                replayed_at_fork
+                    .system_prompt
+                    .clone()
+                    .or(parent.system_prompt.clone()),
+            )
+        } else {
+            (
+                parent.mode.clone(),
+                parent.model.clone(),
+                parent.system_prompt.clone(),
+            )
+        };
         let new_tags = parent.tags.clone();
         let parent_id = id.to_string();
         let title = new_title.to_string();
 
         // Serialize forked events up front so the transaction body is purely DB ops.
-        let prepared_events: Vec<(String, String, String)> = forked_events
+        let prepared_events: Vec<(u64, String, String, String)> = forked_events
             .iter()
             .map(|stored| {
                 let event_type = event_type_str(&stored.event).to_string();
@@ -636,7 +653,12 @@ impl SessionDB {
                     );
                 }
                 let event_data = serde_json::to_string(&v)?;
-                Ok::<_, serde_json::Error>((event_type, event_data, now_str.clone()))
+                Ok::<_, serde_json::Error>((
+                    stored.event_index,
+                    event_type,
+                    event_data,
+                    now_str.clone(),
+                ))
             })
             .collect::<Result<_, _>>()?;
 
@@ -686,11 +708,11 @@ impl SessionDB {
 
                     let mut user_msg_count: i64 = 0;
                     let mut tool_call_count: i64 = 0;
-                    for (idx, (event_type, event_data, ts)) in prepared.iter().enumerate() {
+                    for (event_index, event_type, event_data, ts) in prepared.iter() {
                         tx.execute(
                             "INSERT INTO events (session_id, event_index, event_type, event_data, timestamp)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![new_id, idx as i64, event_type, event_data, ts],
+                            params![new_id, *event_index as i64, event_type, event_data, ts],
                         )?;
                         if event_type == "user_message" {
                             user_msg_count += 1;
@@ -730,11 +752,11 @@ impl SessionDB {
             end_reason: None,
             message_count: prepared_events
                 .iter()
-                .filter(|(t, _, _)| t == "user_message")
+                .filter(|(_, t, _, _)| t == "user_message")
                 .count() as u64,
             tool_call_count: prepared_events
                 .iter()
-                .filter(|(t, _, _)| t == "tool_call")
+                .filter(|(_, t, _, _)| t == "tool_call")
                 .count() as u64,
             subagent_count: 0,
             input_tokens: 0,

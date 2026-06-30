@@ -359,6 +359,178 @@ fn replay_branch_summary_keeps_primary_prompt_as_only_system_message() {
     assert_ne!(branch_summary.role, Role::System);
 }
 
+#[tokio::test]
+async fn fork_session_preserves_event_indices_for_compaction_archived_ranges() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("holmes.db");
+    let db = SessionDB::open(&db_path).await.unwrap();
+
+    let parent = db
+        .create_session(CreateSessionParams {
+            id: Some("parent_compacted".into()),
+            title: Some("parent".into()),
+            mode: Some(SessionMode::Pentest),
+            model: Some("startup-model".into()),
+            system_prompt: Some("startup prompt".into()),
+            parent_session_id: None,
+            fork_point: None,
+            source: Some("test".into()),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+
+    for event in [
+        Event::SessionCreated {
+            id: parent.id.clone(),
+            title: parent.title.clone(),
+            mode: SessionMode::Pentest,
+            model: Some("startup-model".into()),
+            system_prompt: Some("startup prompt".into()),
+            parent_id: None,
+            fork_point: None,
+            created_at: now,
+            tags: vec![],
+        },
+        Event::SessionSystemPromptSet {
+            prompt_hash: "startup-prompt-hash".into(),
+            content: "startup prompt".into(),
+            source: "startup".into(),
+            timestamp: now,
+        },
+        Event::SessionModeSet {
+            mode: SessionMode::Pentest,
+            source: Some("startup".into()),
+            timestamp: Some(now),
+        },
+        Event::SessionModelSet {
+            model: "startup-model".into(),
+            provider: Some("startup-provider".into()),
+            source: "startup".into(),
+            timestamp: now,
+        },
+        Event::ActiveToolsSet {
+            tool_names: vec!["tool_a".into()],
+            source: "startup".into(),
+            timestamp: now,
+        },
+    ] {
+        db.append_event(&parent.id, &event).await.unwrap();
+    }
+
+    let archived_user_index = db
+        .append_event(
+            &parent.id,
+            &Event::UserMessage {
+                content: "archived user text".into(),
+                timestamp: now,
+            },
+        )
+        .await
+        .unwrap();
+    let archived_assistant_index = db
+        .append_event(
+            &parent.id,
+            &Event::Thinking {
+                content: "archived assistant text".into(),
+                reasoning_type: None,
+            },
+        )
+        .await
+        .unwrap();
+    let compaction_index = db
+        .append_event(
+            &parent.id,
+            &Event::CompressionApplied {
+                before_count: 2,
+                after_count: 1,
+                summary: "summary replaces archived pair".into(),
+                preserved_keys: vec![],
+                method: CompressionMethod::StaticFallback,
+                preserved_head: None,
+                preserved_tail_tokens: None,
+                archive_path: Some("sessions/parent_compacted/compactions/compaction.json".into()),
+                archived_event_range: Some((archived_user_index, archived_assistant_index)),
+                trigger: Some(CompactionTrigger::Manual),
+                timestamp: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+    let tail_index = db
+        .append_event(
+            &parent.id,
+            &Event::UserMessage {
+                content: "tail user text".into(),
+                timestamp: now,
+            },
+        )
+        .await
+        .unwrap();
+
+    let child = db
+        .fork_session(&parent.id, tail_index, "child")
+        .await
+        .unwrap();
+
+    let child_events = db.get_events(&child.id).await.unwrap();
+    let child_indices = child_events
+        .iter()
+        .map(|stored| stored.event_index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_indices,
+        vec![
+            archived_user_index,
+            archived_assistant_index,
+            compaction_index,
+            tail_index,
+        ],
+        "forked events must keep parent indices so compaction ranges still resolve"
+    );
+    assert!(child_events.iter().any(|stored| {
+        stored.event_index == archived_user_index
+            && matches!(&stored.event, Event::UserMessage { content, .. } if content == "archived user text")
+    }));
+    assert!(child_events.iter().any(|stored| {
+        stored.event_index == archived_assistant_index
+            && matches!(&stored.event, Event::Thinking { content, .. } if content == "archived assistant text")
+    }));
+    let child_archived_range = child_events
+        .iter()
+        .find_map(|stored| match &stored.event {
+            Event::CompressionApplied {
+                archived_event_range,
+                ..
+            } => *archived_event_range,
+            _ => None,
+        })
+        .expect("child should copy compaction marker");
+    assert_eq!(
+        child_archived_range,
+        (archived_user_index, archived_assistant_index)
+    );
+
+    let replayed = db.replay_session_context(&child.id).await.unwrap();
+    let contents = replayed
+        .session
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>();
+    assert!(contents
+        .iter()
+        .any(|content| content.contains("[Compaction summary]\nsummary replaces archived pair")));
+    assert!(contents.iter().any(|content| *content == "tail user text"));
+    assert!(!contents
+        .iter()
+        .any(|content| *content == "archived user text"));
+    assert!(!contents
+        .iter()
+        .any(|content| *content == "archived assistant text"));
+}
+
 #[test]
 fn replay_compaction_summary_replaces_archived_context_range() {
     let now = chrono::Utc::now();
