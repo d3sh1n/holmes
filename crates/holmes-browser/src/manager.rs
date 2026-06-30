@@ -5,6 +5,7 @@ use chromiumoxide::page::Page;
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 #[derive(Debug)]
@@ -63,6 +64,11 @@ impl BrowserManager {
         self.state.lock().await.browser.is_some()
     }
 
+    /// Per-action timeout derived from `config.timeout` (clamped to >=1s).
+    fn timeout_dur(&self) -> Duration {
+        Duration::from_secs(self.config.timeout.max(1) as u64)
+    }
+
     async fn ensure_launched(&self) -> Result<Arc<Page>> {
         let mut state = self.state.lock().await;
         if let Some(page) = state.page.clone() {
@@ -83,10 +89,15 @@ impl BrowserManager {
         // v1 is always headed: the user must see and interact with the window.
         builder = builder.with_head();
         builder = builder.user_data_dir(profile_dir.clone());
+        builder = builder.launch_timeout(self.timeout_dur());
         builder = builder.arg("no-first-run");
         builder = builder.arg("no-default-browser-check");
         if self.config.ignore_https_errors {
             builder = builder.arg("ignore-certificate-errors");
+        }
+        if let Some(proxy) = &self.config.proxy {
+            // Chrome proxy is a launch flag; chromiumoxide has no builder method for it.
+            builder = builder.arg(format!("proxy-server={}", proxy));
         }
         if let Some(exe) = &self.config.executable_path {
             builder = builder.chrome_executable(exe);
@@ -116,7 +127,12 @@ impl BrowserManager {
             }
         });
 
-        let page = Arc::new(browser.new_page("about:blank").await?);
+        let new_page_fut = browser.new_page("about:blank");
+        let page = Arc::new(
+            tokio::time::timeout(self.timeout_dur(), new_page_fut)
+                .await
+                .map_err(|_| BrowserError::Timeout(self.config.timeout))??,
+        );
 
         state.browser = Some(browser);
         state.page = Some(page.clone());
@@ -125,7 +141,10 @@ impl BrowserManager {
 
     pub async fn navigate(&self, url: &str) -> Result<PageSnapshot> {
         let page = self.ensure_launched().await?;
-        page.goto(url).await?;
+        let dur = self.timeout_dur();
+        tokio::time::timeout(dur, page.goto(url))
+            .await
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))??;
         let title = page
             .evaluate("document.title")
             .await
@@ -156,11 +175,13 @@ impl BrowserManager {
 
     pub async fn click(&self, selector: &str) -> Result<ActionOutcome> {
         let page = self.ensure_launched().await?;
-        let el = page
-            .find_element(selector)
+        let el = tokio::time::timeout(self.timeout_dur(), page.find_element(selector))
             .await
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))?
             .map_err(|_| BrowserError::NotFound(selector.to_string()))?;
-        el.click().await?;
+        tokio::time::timeout(self.timeout_dur(), el.click())
+            .await
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))??;
         Ok(ActionOutcome {
             summary: format!("clicked {selector}"),
         })
@@ -168,12 +189,14 @@ impl BrowserManager {
 
     pub async fn fill(&self, selector: &str, value: &str) -> Result<ActionOutcome> {
         let page = self.ensure_launched().await?;
-        let el = page
-            .find_element(selector)
+        let el = tokio::time::timeout(self.timeout_dur(), page.find_element(selector))
             .await
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))?
             .map_err(|_| BrowserError::NotFound(selector.to_string()))?;
         el.click().await.ok();
-        el.type_str(value).await?;
+        tokio::time::timeout(self.timeout_dur(), el.type_str(value))
+            .await
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))??;
         Ok(ActionOutcome {
             summary: format!("filled {selector}"),
         })
@@ -187,22 +210,23 @@ impl BrowserManager {
             }
             None => "document.body ? document.body.innerText : ''".to_string(),
         };
-        let text: String = page
-            .evaluate(js.as_str())
+        let result = tokio::time::timeout(self.timeout_dur(), page.evaluate(js.as_str()))
             .await
-            .map(|v| v.into_value::<String>().unwrap_or_default())
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))?
             .map_err(|e| BrowserError::JsError(e.to_string()))?;
+        let text: String = result.into_value::<String>().unwrap_or_default();
         Ok(truncate(&text, self.config.content_limit))
     }
 
     pub async fn execute_js(&self, code: &str) -> Result<serde_json::Value> {
         let page = self.ensure_launched().await?;
-        page.evaluate(code)
+        let result = tokio::time::timeout(self.timeout_dur(), page.evaluate(code))
             .await
-            .map(|v| {
-                v.into_value::<serde_json::Value>().unwrap_or(serde_json::Value::Null)
-            })
-            .map_err(|e| BrowserError::JsError(e.to_string()))
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))?
+            .map_err(|e| BrowserError::JsError(e.to_string()))?;
+        Ok(result
+            .into_value::<serde_json::Value>()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     pub async fn screenshot(&self, full_page: bool) -> Result<Screenshot> {
@@ -229,7 +253,9 @@ impl BrowserManager {
         if full_page {
             builder = builder.full_page(true);
         }
-        let bytes = page.screenshot(builder.build()).await?;
+        let bytes = tokio::time::timeout(self.timeout_dur(), page.screenshot(builder.build()))
+            .await
+            .map_err(|_| BrowserError::Timeout(self.config.timeout))??;
         tokio::fs::write(&path, &bytes).await?;
         Ok(Screenshot {
             path,
