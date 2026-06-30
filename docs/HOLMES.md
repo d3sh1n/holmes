@@ -199,7 +199,53 @@ All state changes are immutable `Event` records stored in SQLite. This means:
 - **Auditability**: Every tool call, finding, and decision is traceable
 - **Recovery**: Crash-safe — state is reconstructed from events
 
+### Session Semantic Replay
+
+New sessions are *semantically* replayable, not just message-replayable. At
+session start Holmes appends `SessionCreated`, `SessionSystemPromptSet`,
+`SessionModeSet`, `SessionModelSet`, and `ActiveToolsSet`; `/mode`, `/model`,
+and MCP/tool-visibility changes append further semantic events. Use
+`SessionStore::replay_session_context(session_id)` to rebuild a session — it
+returns a `ReplayedSessionContext` carrying the reconstructed `RuntimeSession`
+plus system prompt, model, active tools, branch summaries, compaction markers,
+and a `semantic_complete` flag.
+
+Old sessions created before this metadata existed are reported as
+`semantic_complete = false`; the CLI falls back to legacy event replay for
+them. New CLI resume/continue/`/resume`/rollback-rebuild paths all reconstruct
+through semantic replay.
+
+Forking is semantic too: `fork_session` excludes the parent's lifecycle
+metadata, materializes the parent's mode/model/system-prompt at the fork point
+(so a fork after `/mode research` keeps the research mode), preserves original
+event indices (so `CompressionApplied.archived_event_range` stays valid), and a
+`BranchSummary` event bridges the abandoned path's context into the child.
+
+### Compaction (event-sourced, archive-backed)
+
+Compaction no longer destructively discards history. Each compaction:
+
+- writes the summarized-away messages and events to an external archive at
+  `sessions/<session-id>/compactions/compaction_<event-index>.json`
+- appends a `CompressionApplied` event recording the summary, `trigger`
+  (`Manual` / `Threshold` / `Overflow`), `archived_event_range`, and the
+  archive pointer
+- is applied during replay by replacing the archived range with the summary
+  message (raw history stays on disk for audit; a missing archive degrades to
+  the event summary with a warning, never a block)
+
+The archive is written **before** the event is appended, so a persisted
+`CompressionApplied` always points at a readable archive.
+
+### Context-overflow self-healing
+
+When the LLM returns a context-overflow error, the runtime classifies it as
+`RuntimeErrorKind::ContextOverflow`, runs one `Overflow`-triggered compaction,
+and retries the same decision exactly once. If the retry still fails it returns
+a clear error (no retry loop).
+
 ---
+
 
 ## 4. CLI Usage
 
