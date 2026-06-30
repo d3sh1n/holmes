@@ -607,6 +607,7 @@ impl SessionDB {
         let forked_events: Vec<StoredEvent> = events
             .into_iter()
             .filter(|e| e.event_index <= fork_point)
+            .filter(|e| !is_session_lifecycle_metadata_event(&e.event))
             .collect();
 
         // Pre-compute everything that doesn't need the DB lock so that the
@@ -1044,6 +1045,18 @@ fn parse_event_data(data: &str) -> Result<Event, serde_json::Error> {
     serde_json::from_value(value)
 }
 
+fn is_session_lifecycle_metadata_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::SessionCreated { .. }
+            | Event::SessionEnded { .. }
+            | Event::SessionModeSet { .. }
+            | Event::SessionSystemPromptSet { .. }
+            | Event::SessionModelSet { .. }
+            | Event::ActiveToolsSet { .. }
+    )
+}
+
 fn event_type_str(event: &Event) -> &'static str {
     match event {
         Event::SessionCreated { .. } => "session_created",
@@ -1228,6 +1241,142 @@ mod tests {
         }
 
         // Cleanup. Best-effort — ignore errors on shared CI temp dirs.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn fork_session_excludes_parent_lifecycle_metadata() {
+        let path = temp_db_path("fork-lifecycle");
+        let db = SessionDB::open(&path).await.expect("open db");
+
+        let parent = db
+            .create_session(CreateSessionParams {
+                id: Some("parent_session".into()),
+                title: Some("parent".into()),
+                mode: Some(SessionMode::Pentest),
+                model: Some("parent-model".into()),
+                system_prompt: Some("parent prompt".into()),
+                parent_session_id: None,
+                fork_point: None,
+                source: Some("test".into()),
+                tags: vec!["parent-tag".into()],
+            })
+            .await
+            .expect("create parent session");
+        let now = chrono::Utc::now();
+
+        let parent_startup_events = [
+            Event::SessionCreated {
+                id: parent.id.clone(),
+                title: parent.title.clone(),
+                mode: SessionMode::Pentest,
+                model: Some("parent-model".into()),
+                system_prompt: Some("parent prompt".into()),
+                parent_id: None,
+                fork_point: None,
+                created_at: now,
+                tags: vec!["parent-tag".into()],
+            },
+            Event::SessionSystemPromptSet {
+                prompt_hash: "parent-prompt-hash".into(),
+                content: "parent prompt".into(),
+                source: "parent-startup".into(),
+                timestamp: now,
+            },
+            Event::SessionModeSet {
+                mode: SessionMode::SecurityResearch,
+                source: Some("parent-startup".into()),
+                timestamp: Some(now),
+            },
+            Event::SessionModelSet {
+                model: "parent-model".into(),
+                provider: Some("parent-provider".into()),
+                source: "parent-startup".into(),
+                timestamp: now,
+            },
+            Event::ActiveToolsSet {
+                tool_names: vec!["parent_tool".into()],
+                source: "parent-startup".into(),
+                timestamp: now,
+            },
+        ];
+
+        for event in parent_startup_events {
+            db.append_event(&parent.id, &event)
+                .await
+                .expect("append parent startup event");
+        }
+        db.append_event(
+            &parent.id,
+            &Event::UserMessage {
+                content: "first turn".into(),
+                timestamp: now,
+            },
+        )
+        .await
+        .expect("append user event");
+        db.append_event(
+            &parent.id,
+            &Event::Thinking {
+                content: "keep this history".into(),
+                reasoning_type: Some("trace".into()),
+            },
+        )
+        .await
+        .expect("append thinking event");
+        let fork_point = db
+            .append_event(
+                &parent.id,
+                &Event::SessionEnded {
+                    reason: EndReason::UserQuit,
+                    summary: Some("parent ended".into()),
+                },
+            )
+            .await
+            .expect("append lifecycle end event");
+
+        let child = db
+            .fork_session(&parent.id, fork_point, "child")
+            .await
+            .expect("fork session");
+
+        let child_events = db.get_events(&child.id).await.expect("child events");
+        assert!(
+            child_events.iter().any(|stored| matches!(
+                &stored.event,
+                Event::UserMessage { content, .. } if content == "first turn"
+            )),
+            "fork should preserve conversational history"
+        );
+        assert!(
+            child_events.iter().any(|stored| matches!(
+                &stored.event,
+                Event::Thinking { content, .. } if content == "keep this history"
+            )),
+            "fork should preserve meaningful assistant history"
+        );
+        assert!(
+            child_events.iter().all(|stored| !matches!(
+                &stored.event,
+                Event::SessionCreated { .. }
+                    | Event::SessionSystemPromptSet { .. }
+                    | Event::SessionModeSet { .. }
+                    | Event::SessionModelSet { .. }
+                    | Event::ActiveToolsSet { .. }
+                    | Event::SessionEnded { .. }
+            )),
+            "child fork copied parent lifecycle metadata: {child_events:?}"
+        );
+        assert!(
+            child_events.iter().all(|stored| !matches!(
+                &stored.event,
+                Event::SessionCreated { id, .. } if id == &parent.id
+            )),
+            "child must not contain parent SessionCreated payload"
+        );
+        assert_eq!(child.message_count, 1);
+        assert_eq!(child.tool_call_count, 0);
+
         let _ = std::fs::remove_file(&path);
     }
 

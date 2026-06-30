@@ -2274,15 +2274,68 @@ mod tests {
                 Event::UserMessage { content, .. } if content == "first turn"
             )
         }));
-        assert!(child_events.iter().any(|stored| {
-            matches!(
+
+        let session_created_events = child_events
+            .iter()
+            .filter_map(|stored| match &stored.event {
+                Event::SessionCreated {
+                    id,
+                    parent_id,
+                    fork_point,
+                    ..
+                } => Some((id, parent_id, fork_point)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            session_created_events.len(),
+            1,
+            "branch should contain exactly one child SessionCreated event: {child_events:?}"
+        );
+        let (created_id, created_parent_id, created_fork_point) = session_created_events[0];
+        assert_eq!(created_id, &child.id);
+        assert_eq!(created_parent_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(*created_fork_point, Some(parent_latest_index));
+        assert!(
+            child_events.iter().all(|stored| !matches!(
                 &stored.event,
-                Event::SessionCreated { id, parent_id, fork_point, .. }
-                    if id == &child.id
-                        && parent_id.as_deref() == Some(session_id.as_str())
-                        && *fork_point == Some(parent_latest_index)
-            )
-        }));
+                Event::SessionCreated { id, .. } if id == &session_id
+            )),
+            "branch must not copy parent SessionCreated into child: {child_events:?}"
+        );
+
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|stored| matches!(stored.event, Event::SessionSystemPromptSet { .. }))
+                .count(),
+            1,
+            "branch should contain exactly one child system prompt metadata event"
+        );
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|stored| matches!(stored.event, Event::SessionModeSet { .. }))
+                .count(),
+            1,
+            "branch should contain exactly one child mode metadata event"
+        );
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|stored| matches!(stored.event, Event::SessionModelSet { .. }))
+                .count(),
+            1,
+            "branch should contain exactly one child model metadata event"
+        );
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|stored| matches!(stored.event, Event::ActiveToolsSet { .. }))
+                .count(),
+            1,
+            "branch should contain exactly one child active-tools metadata event"
+        );
     }
 
     #[tokio::test]
