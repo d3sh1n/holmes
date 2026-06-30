@@ -61,7 +61,9 @@ impl DialogueEngine {
             RuntimeErrorKind::NeedsUser => RuntimeYield::NeedsUserInput {
                 prompt: error.message.clone(),
             },
-            RuntimeErrorKind::Recoverable | RuntimeErrorKind::Fatal => RuntimeYield::Error {
+            RuntimeErrorKind::Recoverable
+            | RuntimeErrorKind::Fatal
+            | RuntimeErrorKind::ContextOverflow => RuntimeYield::Error {
                 message: error.message.clone(),
             },
         }

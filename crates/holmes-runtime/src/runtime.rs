@@ -164,7 +164,7 @@ impl AgentRuntime {
             }
 
             let frame = self.perception.perceive(&self.context);
-            let deliberation = match self.deliberation.decide(&self.context, &frame).await {
+            let deliberation = match self.decide_with_overflow_retry(&frame, sink).await {
                 Ok(deliberation) => deliberation,
                 Err(error) => return self.stop_for_error(error, iterations, sink),
             };
@@ -352,8 +352,42 @@ impl AgentRuntime {
         }
     }
 
-    fn emit_intermediate_content(&self, content: Option<&str>, sink: &mut dyn RuntimeSink) {
-        if let Some(content) = content {
+    async fn decide_with_overflow_retry(
+        &mut self,
+        frame: &crate::perception::PerceptionFrame,
+        sink: &mut dyn RuntimeSink,
+    ) -> Result<crate::deliberation::DeliberationResult, RuntimeError> {
+        match self.deliberation.decide(&self.context, frame).await {
+            Ok(result) => Ok(result),
+            Err(error)
+                if error.kind == crate::deliberation::RuntimeErrorKind::ContextOverflow =>
+            {
+                let original_message = error.message.clone();
+                let compacted = self
+                    .compact_with_trigger(true, holmes_core::CompactionTrigger::Overflow)
+                    .await?;
+                let Some(result) = compacted else {
+                    return Err(RuntimeError::recoverable(format!(
+                        "context overflow and compaction produced no smaller context: {original_message}"
+                    )));
+                };
+                sink.emit_yield(&self.context.session_id, compaction_event(&result));
+                let retry_frame = self.perception.perceive(&self.context);
+                self.deliberation
+                    .decide(&self.context, &retry_frame)
+                    .await
+                    .map_err(|retry_error| {
+                        RuntimeError::recoverable(format!(
+                            "context overflow retry failed after compaction: {}; original overflow: {}",
+                            retry_error.message, original_message
+                        ))
+                    })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn emit_intermediate_content(&self, content: Option<&str>, sink: &mut dyn RuntimeSink) {        if let Some(content) = content {
             if let Some(event) = DialogueEngine::message_to_user(content) {
                 sink.emit_yield(&self.context.session_id, event);
             }
@@ -1618,6 +1652,71 @@ mod tests {
             .filter(|event| matches!(event.event, Event::CompressionApplied { .. }))
             .count();
         assert_eq!(compression_events, 1);
+    }
+
+    #[tokio::test]
+    async fn run_turn_compacts_and_retries_once_on_context_overflow() {
+        let llm = Arc::new(QueueLlmBackend::new(vec![
+            Err("context length exceeded maximum context window".into()),
+            Ok(final_response("recovered")),
+        ]));
+        let mut config = HolmesConfig::default();
+        config.compressor.context_limit = 1;
+        config.compressor.threshold = 1.0;
+        config.compressor.protected_head = 1;
+        config.compressor.protect_last_n = 1;
+        let context =
+            make_context_with_config(llm, ToolRegistry::new(), GuardChain::new(), config).await;
+        let mut runtime = AgentRuntime::new(context);
+        // Seed enough messages so the forced overflow compaction yields a smaller context.
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::system("system prompt"));
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::user("old finding one"));
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::assistant("old reasoning two"));
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::user("latest question"));
+        let mut sink = VecSink::new();
+
+        let outcome = runtime
+            .run_turn("continue", &mut sink)
+            .await
+            .expect("turn outcome");
+
+        assert!(matches!(outcome, TurnOutcome::FinalAnswer { .. }));
+
+        let events = runtime
+            .context()
+            .session_db
+            .get_events(&runtime.context().session_id)
+            .await
+            .expect("stored events");
+        let overflow_compactions = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    Event::CompressionApplied {
+                        trigger: Some(holmes_core::CompactionTrigger::Overflow),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(overflow_compactions, 1);
     }
 
     struct QueueLlmBackend {

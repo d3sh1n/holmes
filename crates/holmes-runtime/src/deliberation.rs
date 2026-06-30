@@ -14,6 +14,7 @@ pub enum RuntimeErrorKind {
     Recoverable,
     NeedsUser,
     Fatal,
+    ContextOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +51,12 @@ impl RuntimeError {
 
     pub fn from_llm_error(error: anyhow::Error, configured_provider_count: usize) -> Self {
         let message = error.to_string();
-        if configured_provider_count == 0 && is_missing_provider_error(&message) {
+        if is_context_overflow_error(&message) {
+            Self {
+                kind: RuntimeErrorKind::ContextOverflow,
+                message,
+            }
+        } else if configured_provider_count == 0 && is_missing_provider_error(&message) {
             Self::missing_provider()
         } else {
             Self::recoverable(message)
@@ -75,6 +81,15 @@ fn is_missing_provider_error(message: &str) -> bool {
     normalized.contains("no healthy llm provider available")
         || normalized.contains("no configured llm provider")
         || normalized.contains("missing llm provider")
+}
+
+fn is_context_overflow_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("context length")
+        || normalized.contains("context window")
+        || normalized.contains("maximum context")
+        || normalized.contains("too many tokens")
+        || normalized.contains("prompt is too long")
 }
 
 #[async_trait]
@@ -195,6 +210,15 @@ mod tests {
 
         assert_eq!(error.kind, RuntimeErrorKind::NeedsUser);
         assert_eq!(error.message, MISSING_PROVIDER_MESSAGE);
+    }
+
+    #[test]
+    fn llm_context_overflow_maps_to_context_overflow_kind() {
+        let error = RuntimeError::from_llm_error(
+            anyhow::anyhow!("context length exceeded maximum context window"),
+            1,
+        );
+        assert_eq!(error.kind, RuntimeErrorKind::ContextOverflow);
     }
 
     #[test]
