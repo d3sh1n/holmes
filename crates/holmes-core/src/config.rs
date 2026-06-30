@@ -348,29 +348,54 @@ pub enum McpTransport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
+    #[serde(default)]
     pub enabled: bool,
-    pub vision: bool,
-    pub content_limit: usize,
-    pub timeout: u32,
+    #[serde(default = "default_headless")]
     pub headless: bool,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default = "default_content_limit")]
+    pub content_limit: usize,
+    #[serde(default = "default_timeout")]
+    pub timeout: u32,
+    #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(default = "default_ignore_https")]
     pub ignore_https_errors: bool,
-    pub mcp_command: String,
-    pub mcp_args: Vec<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
+    #[serde(default)]
+    pub extra_launch_args: Vec<String>,
+    #[serde(default)]
+    pub screenshot_dir: Option<String>,
+}
+
+fn default_headless() -> bool {
+    true
+}
+fn default_content_limit() -> usize {
+    5000
+}
+fn default_timeout() -> u32 {
+    30
+}
+fn default_ignore_https() -> bool {
+    true
 }
 
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            headless: true,
             vision: false,
             content_limit: 5000,
             timeout: 30,
-            headless: true,
             proxy: None,
             ignore_https_errors: true,
-            mcp_command: "node".into(),
-            mcp_args: vec!["browser-mcp/dist/index.js".into()],
+            executable_path: None,
+            extra_launch_args: Vec::new(),
+            screenshot_dir: None,
         }
     }
 }
@@ -449,8 +474,9 @@ impl Default for HolmesConfig {
                 headless: true,
                 proxy: None,
                 ignore_https_errors: true,
-                mcp_command: "node".into(),
-                mcp_args: vec!["browser-mcp/dist/index.js".into()],
+                executable_path: None,
+                extra_launch_args: Vec::new(),
+                screenshot_dir: None,
             },
             output_dir: "output".into(),
         }
@@ -461,6 +487,44 @@ impl Default for HolmesConfig {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn browser_config_serde_round_trip_new_fields() {
+        let cfg = BrowserConfig {
+            enabled: true,
+            headless: false,
+            vision: false,
+            content_limit: 7000,
+            timeout: 45,
+            proxy: Some("http://127.0.0.1:8080".into()),
+            ignore_https_errors: true,
+            executable_path: Some("/usr/bin/chromium".into()),
+            extra_launch_args: vec!["--lang=en".into()],
+            screenshot_dir: None,
+        };
+        let yaml = serde_json::to_string(&cfg).unwrap();
+        let back: BrowserConfig = serde_json::from_str(&yaml).unwrap();
+        assert!(back.enabled);
+        assert_eq!(back.executable_path.as_deref(), Some("/usr/bin/chromium"));
+        assert_eq!(back.extra_launch_args, vec!["--lang=en".to_string()]);
+    }
+
+    #[test]
+    fn browser_config_defaults_include_new_fields() {
+        let cfg = BrowserConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.executable_path.is_none());
+        assert!(cfg.extra_launch_args.is_empty());
+        assert!(cfg.screenshot_dir.is_none());
+    }
+
+    #[test]
+    fn browser_config_legacy_yaml_without_new_fields_loads() {
+        let json = r#"{"enabled":false,"headless":true,"vision":false,"content_limit":5000,"timeout":30,"ignore_https_errors":true}"#;
+        let cfg: BrowserConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.executable_path.is_none());
+        assert!(cfg.extra_launch_args.is_empty());
+    }
 
     #[test]
     fn resolve_attack_model_provider_prefers_override_then_role_provider() {

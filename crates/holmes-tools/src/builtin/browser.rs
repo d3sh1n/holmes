@@ -99,38 +99,12 @@ impl BrowserManager {
         Ok(())
     }
     async fn spawn_process(&mut self) -> Result<()> {
-        info!(cmd = %self.config.mcp_command, "spawning browser MCP server");
-
-        let mut cmd_args = self.config.mcp_args.clone();
-        if !self.config.headless {
-            cmd_args.push("--no-headless".into());
-        }
-        if let Some(ref proxy) = self.config.proxy {
-            cmd_args.push(format!("--proxy={}", proxy));
-        }
-        if !self.config.ignore_https_errors {
-            cmd_args.push("--no-ignore-https-errors".into());
-        }
-
-        let mut child = tokio::process::Command::new(&self.config.mcp_command)
-            .args(&cmd_args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-
-        self.process = Some(child);
-        self.stdin = Some(tokio::io::BufWriter::new(stdin));
-        self.stdout = Some(BufReader::new(stdout));
-        self.request_id = 0;
-
-        let init_resp = self.send_request("initialize", json!({})).await?;
-        debug!(?init_resp, "MCP server initialized");
-
-        Ok(())
+        // The Node/MCP-based browser backend was removed. The whole BrowserManager
+        // is rewritten onto `holmes-browser` (chromiumoxide) in a later task; this
+        // stub keeps the crate compiling in the meantime and intentionally fails.
+        Err(anyhow!(
+            "browser tool backend is being rewritten onto holmes-browser; unavailable until then"
+        ))
     }
     async fn send_request(
         &mut self,
