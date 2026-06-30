@@ -528,6 +528,40 @@ async fn append_active_tools_startup_metadata_event(
     Ok(())
 }
 
+/// Persist a branch summary on a freshly forked child session.
+///
+/// Reads the parent event window `[from_event_index, to_event_index]`, builds a
+/// deterministic static fallback summary, and appends a `BranchSummary` event to
+/// the child so replay surfaces the parent path's context as a non-system message.
+pub(crate) async fn append_branch_summary(
+    ctx: &ChatContext,
+    new_session_id: &str,
+    from_event_index: u64,
+    to_event_index: u64,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let events = ctx.session_db.get_events(&ctx.session_id).await?;
+    let window: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.event_index >= from_event_index && e.event_index <= to_event_index)
+        .collect();
+    let summary = holmes_runtime::summary::static_branch_summary(&window, reason);
+    ctx.session_db
+        .append_event(
+            new_session_id,
+            &Event::BranchSummary {
+                from_event_index,
+                to_event_index,
+                summary,
+                reason: reason.to_string(),
+                method: holmes_core::SummaryMethod::StaticFallback,
+                timestamp: Utc::now(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 async fn append_active_tools_event_for_registry(
     session_db: &SessionDB,
     session_id: &str,
@@ -1641,6 +1675,12 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                         }
                     }
 
+                    if let Err(error) =
+                        append_branch_summary(ctx, &new_session.id, 0, fork_point, "branch").await
+                    {
+                        eprintln!("Warning: failed to record branch summary: {}", error);
+                    }
+
                     println!(
                         "Branched to: {} ({})",
                         &new_session.id[..8.min(new_session.id.len())],
@@ -2639,6 +2679,59 @@ mod tests {
                 .count(),
             1,
             "branch should contain exactly one child active-tools metadata event"
+        );
+
+        // Task 7: branch summary is persisted on the child and surfaces in replay.
+        let branch_summary_events = child_events
+            .iter()
+            .filter_map(|stored| match &stored.event {
+                Event::BranchSummary {
+                    from_event_index,
+                    to_event_index,
+                    summary,
+                    reason,
+                    method,
+                    ..
+                } => Some((from_event_index, to_event_index, summary, reason, method)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            branch_summary_events.len(),
+            1,
+            "branch should append exactly one BranchSummary event: {child_events:?}"
+        );
+        let (from_idx, to_idx, _summary, reason, method) = branch_summary_events[0];
+        assert_eq!(*from_idx, 0);
+        assert_eq!(*to_idx, parent_latest_index);
+        assert_eq!(reason, "branch");
+        assert_eq!(*method, holmes_core::SummaryMethod::StaticFallback);
+
+        assert!(
+            !replayed.branch_summaries.is_empty(),
+            "replay should expose the branch summary"
+        );
+        let branch_message = replayed
+            .session
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("[Branch summary]"))
+            })
+            .expect("branch summary should replay as a context message");
+        assert_ne!(branch_message.role, Role::System);
+        assert_eq!(
+            replayed
+                .session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .count(),
+            1,
+            "branch summary must not introduce extra system messages"
         );
     }
 
