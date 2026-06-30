@@ -204,6 +204,16 @@ On `/mcp reload`, the rebuilt registry receives the same `Arc` from
 
 ## Safety and Permissions
 
+- **Chromium built-in sandbox is always on.** `BrowserManager::ensure_launched`
+  must NOT pass `--no-sandbox`, `--disable-web-security`, or any sandbox-
+  disabling flag. `extra_launch_args` from config is scanned at launch and any
+  of these flags is rejected with a clear error (the user cannot accidentally
+  or intentionally disable the Chromium process sandbox via config). This is
+  the sole sandbox layer in v1 — no network-level filtering and no OS-level
+  jail, by explicit decision (browser scope is governed by `PermissionPolicy`
+  user approval, not a domain allow-list).
+- **Profile isolation** (already specified): per-session `userDataDir`, never
+  the user's real Chrome profile; forks/subagents do not inherit login state.
 - **No domain allow-list** (by explicit decision). Browser scope is governed
   by the existing `PermissionPolicy`:
   - Under `default`/`plan`: the `browser` tool call is subject to the normal
@@ -284,6 +294,8 @@ window). A future headless+vision mode may honor it; v1 ignores it.
 - `profile_dir_for` resolves and is idempotent.
 - `BrowserConfig` serde round-trip with new fields + defaults.
 - Action read/write classification helper used by the middleware.
+- `extra_launch_args` sanitizer rejects `--no-sandbox`,
+  `--disable-web-security`, and equivalent flags; permits benign args.
 
 ### Integration (real Chromium, gated behind a feature / `--ignored`)
 
@@ -336,3 +348,6 @@ window). A future headless+vision mode may honor it; v1 ignores it.
   fork/subagent do not inherit.
 - v1 is headed (`headless=false` at launch regardless of config when the user
   is expected to interact); `vision` and inline image content deferred.
+- **Sandbox**: only the Chromium built-in sandbox, always on; `--no-sandbox`
+  and similar are rejected in `extra_launch_args`. No network-level filtering,
+  no OS-level jail in v1.
