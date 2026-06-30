@@ -1,6 +1,8 @@
 use anyhow::Context;
 use chrono::Utc;
-use holmes_core::config::{resolve_attack_model_provider, ApiFormat, Config, HolmesConfig, ResolvedModel};
+use holmes_core::config::{
+    resolve_attack_model_provider, ApiFormat, Config, HolmesConfig, ResolvedModel,
+};
 use holmes_core::event::{Event, ReportGenerator, ReportType, StoredEvent};
 use holmes_core::session::RuntimeSession;
 use holmes_core::tool_types::{Message, Role};
@@ -139,6 +141,41 @@ fn replay_event_into_runtime(
             session.mode = mode;
         }
         _ => {}
+    }
+}
+
+fn replay_events_into_runtime(
+    session: &mut RuntimeSession,
+    mind_palace: &mut MindPalace,
+    events: &[StoredEvent],
+) {
+    for stored in events {
+        replay_event_into_runtime(session, mind_palace, stored.event.clone());
+    }
+}
+
+async fn load_session_runtime_from_store(
+    session_db: Arc<SessionDB>,
+    memory_store: Arc<MemoryStore>,
+    session_id: &str,
+    fallback_mode: SessionMode,
+    fallback_system_prompt: &str,
+) -> anyhow::Result<(RuntimeSession, MindPalace, bool)> {
+    let replayed = session_db.replay_session_context(session_id).await?;
+    let events = session_db.get_events(session_id).await?;
+
+    if replayed.semantic_complete {
+        let mut mind_palace = MindPalace::new(session_db, memory_store);
+        for stored in &events {
+            mind_palace.ingest(stored.event.clone());
+        }
+        Ok((replayed.session, mind_palace, true))
+    } else {
+        let mut mind_palace = MindPalace::new(session_db, memory_store);
+        let mut legacy = RuntimeSession::new(session_id.to_string(), fallback_mode)
+            .with_system_prompt(fallback_system_prompt);
+        replay_events_into_runtime(&mut legacy, &mut mind_palace, &events);
+        Ok((legacy, mind_palace, false))
     }
 }
 
@@ -423,7 +460,9 @@ async fn append_startup_metadata_events(
                 id: id.to_string(),
                 title,
                 mode: mode.clone(),
-                model: resolved_model.as_ref().map(|resolved| resolved.model.clone()),
+                model: resolved_model
+                    .as_ref()
+                    .map(|resolved| resolved.model.clone()),
                 system_prompt: Some(system_prompt.clone()),
                 parent_id,
                 fork_point,
@@ -503,7 +542,9 @@ async fn create_fresh_runtime_session(
             id: None,
             title: None,
             mode: Some(mode.clone()),
-            model: resolved_model.as_ref().map(|resolved| resolved.model.clone()),
+            model: resolved_model
+                .as_ref()
+                .map(|resolved| resolved.model.clone()),
             system_prompt: Some(system_prompt.clone()),
             parent_session_id: None,
             fork_point: None,
@@ -610,12 +651,19 @@ pub(crate) async fn create_chat_context(
     let (session_id, runtime_session, mind_palace, registry, is_resume) = if let Some(id) =
         resume_id
     {
-        let events = session_db.get_events(&id).await?;
-        let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
-        let mut session =
-            RuntimeSession::new(id.clone(), mode.clone()).with_system_prompt(&system_prompt);
-        for se in &events {
-            replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
+        let (session, mp, semantic_complete) = load_session_runtime_from_store(
+            session_db.clone(),
+            memory_store.clone(),
+            &id,
+            mode.clone(),
+            &system_prompt,
+        )
+        .await?;
+        if !semantic_complete {
+            eprintln!(
+                "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
+                &id[..8.min(id.len())]
+            );
         }
         eprintln!("↻ Resumed session {}", &id[..8.min(id.len())]);
         let registry = Arc::new(
@@ -636,12 +684,19 @@ pub(crate) async fn create_chat_context(
         };
         let sessions = session_db.list_sessions(&filter).await?;
         if let Some(s) = sessions.first() {
-            let events = session_db.get_events(&s.id).await?;
-            let mut mp = MindPalace::new(session_db.clone(), memory_store.clone());
-            let mut session =
-                RuntimeSession::new(s.id.clone(), mode.clone()).with_system_prompt(&system_prompt);
-            for se in &events {
-                replay_event_into_runtime(&mut session, &mut mp, se.event.clone());
+            let (session, mp, semantic_complete) = load_session_runtime_from_store(
+                session_db.clone(),
+                memory_store.clone(),
+                &s.id,
+                mode.clone(),
+                &system_prompt,
+            )
+            .await?;
+            if !semantic_complete {
+                eprintln!(
+                    "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
+                    &s.id[..8.min(s.id.len())]
+                );
             }
             eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
             let registry = Arc::new(
@@ -837,17 +892,23 @@ async fn drain_queued_turns(ctx: &mut ChatContext) {
 
 async fn rebuild_runtime_from_events(ctx: &mut ChatContext) -> anyhow::Result<()> {
     let session_record = ctx.session_db.get_session(&ctx.session_id).await?;
-    let mode = session_record
+    let fallback_mode = session_record
         .as_ref()
         .map(|session| session.mode.clone())
         .unwrap_or_else(|| ctx.runtime_session.mode.clone());
-    let events = ctx.session_db.get_events(&ctx.session_id).await?;
-
-    let mut mind_palace = MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
-    let mut runtime_session =
-        RuntimeSession::new(ctx.session_id.clone(), mode).with_system_prompt(&ctx.system_prompt);
-    for stored in events {
-        replay_event_into_runtime(&mut runtime_session, &mut mind_palace, stored.event);
+    let (runtime_session, mind_palace, semantic_complete) = load_session_runtime_from_store(
+        ctx.session_db.clone(),
+        ctx.memory_store.clone(),
+        &ctx.session_id,
+        fallback_mode,
+        &ctx.system_prompt,
+    )
+    .await?;
+    if !semantic_complete {
+        eprintln!(
+            "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
+            &ctx.session_id[..8.min(ctx.session_id.len())]
+        );
     }
 
     let mut runtime_state = RuntimeState::new(runtime_session.mode.clone());
@@ -1373,18 +1434,26 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                             .end_session(&ctx.session_id, EndReason::UserQuit)
                             .await
                             .ok();
-                        let events = ctx
-                            .session_db
-                            .get_events(&s.id)
-                            .await
-                            .ok()
-                            .unwrap_or_default();
-                        let mut mp =
-                            MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
-                        let mut rs = RuntimeSession::new(s.id.clone(), s.mode.clone())
-                            .with_system_prompt(&ctx.system_prompt);
-                        for se in &events {
-                            replay_event_into_runtime(&mut rs, &mut mp, se.event.clone());
+                        let (rs, mp, semantic_complete) = match load_session_runtime_from_store(
+                            ctx.session_db.clone(),
+                            ctx.memory_store.clone(),
+                            &s.id,
+                            s.mode.clone(),
+                            &ctx.system_prompt,
+                        )
+                        .await
+                        {
+                            Ok(loaded) => loaded,
+                            Err(error) => {
+                                eprintln!("Error: {}", error);
+                                return SlashResult::Handled;
+                            }
+                        };
+                        if !semantic_complete {
+                            eprintln!(
+                                "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
+                                &s.id[..8.min(s.id.len())]
+                            );
                         }
                         println!(
                             "↻ Resumed session {} ({})",
@@ -2128,22 +2197,24 @@ pub async fn list_sessions() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-
     #[test]
     fn configured_model_prefers_override_then_role_provider() {
         let mut config = HolmesConfig::default();
         config.llm.roles.attack_agent = "main".into();
-        config.llm.providers.push(holmes_core::config::ProviderConfig {
-            name: "main".into(),
-            base_url: "http://localhost".into(),
-            api_key: String::new(),
-            api_key_env: None,
-            model: "role-model".into(),
-            api_format: ApiFormat::Anthropic,
-            priority: 0,
-            max_retries: 3,
-            rpm_limit: 60,
-        });
+        config
+            .llm
+            .providers
+            .push(holmes_core::config::ProviderConfig {
+                name: "main".into(),
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                api_key_env: None,
+                model: "role-model".into(),
+                api_format: ApiFormat::Anthropic,
+                priority: 0,
+                max_retries: 3,
+                rpm_limit: 60,
+            });
 
         let override_resolved = resolve_attack_model_provider(&config, Some("override".into()));
         assert_eq!(
@@ -2268,7 +2339,10 @@ mod tests {
             replayed.session.lineage.parent_id.as_deref(),
             Some(session_id.as_str())
         );
-        assert_eq!(replayed.session.lineage.fork_point, Some(parent_latest_index));
+        assert_eq!(
+            replayed.session.lineage.fork_point,
+            Some(parent_latest_index)
+        );
         assert_eq!(replayed.session.mode, SessionMode::SecurityResearch);
         assert_eq!(replayed.model.as_deref(), Some("startup-model"));
         assert_eq!(replayed.active_tools, active_tool_names(&ctx.registry));
@@ -2449,6 +2523,164 @@ mod tests {
         let replayed = session_db.replay_session_context(&new_id).await.unwrap();
         assert!(replayed.semantic_complete, "{:?}", replayed.warnings);
         assert_eq!(replayed.active_tools, actual_tool_names);
+    }
+
+    #[tokio::test]
+    async fn cli_production_rebuild_uses_semantic_replay_for_compaction_and_branch_summary() {
+        let session_db = Arc::new(SessionDB::open(":memory:").await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(":memory:").await.unwrap());
+        let config = HolmesConfig::default();
+        let llm = Arc::new(LlmClient::new(&config));
+        let system_prompt = "semantic startup prompt".to_string();
+        let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
+
+        let (session_id, runtime_session, mind_palace, registry) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            llm.clone(),
+            &config,
+            SessionMode::Pentest,
+            Some(ResolvedModel {
+                model: "startup-model".into(),
+                provider: None,
+            }),
+            system_prompt.clone(),
+        )
+        .await
+        .unwrap();
+
+        let archived_user_index = session_db
+            .append_event(
+                &session_id,
+                &Event::UserMessage {
+                    content: "archived user turn".into(),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let archived_assistant_index = session_db
+            .append_event(
+                &session_id,
+                &Event::Thinking {
+                    content: "archived assistant reasoning".into(),
+                    reasoning_type: Some("thinking".into()),
+                },
+            )
+            .await
+            .unwrap();
+        session_db
+            .append_event(
+                &session_id,
+                &Event::CompressionApplied {
+                    before_count: 2,
+                    after_count: 1,
+                    summary: "semantic compaction kept the investigation state".into(),
+                    preserved_keys: vec![],
+                    method: holmes_core::CompressionMethod::StaticFallback,
+                    preserved_head: None,
+                    preserved_tail_tokens: None,
+                    archive_path: Some("sessions/test/compactions/compaction.json".into()),
+                    archived_event_range: Some((archived_user_index, archived_assistant_index)),
+                    trigger: Some(holmes_core::CompactionTrigger::Manual),
+                    timestamp: Some(Utc::now()),
+                },
+            )
+            .await
+            .unwrap();
+        session_db
+            .append_event(
+                &session_id,
+                &Event::BranchSummary {
+                    from_event_index: archived_user_index,
+                    to_event_index: archived_assistant_index,
+                    summary: "parent branch found credential reuse".into(),
+                    reason: "test fork context".into(),
+                    method: holmes_core::SummaryMethod::StaticFallback,
+                    timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        session_db
+            .append_event(
+                &session_id,
+                &Event::UserMessage {
+                    content: "current user turn".into(),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut ctx = ChatContext {
+            session_id: session_id.clone(),
+            session_db: session_db.clone(),
+            memory_store: memory_store.clone(),
+            llm,
+            registry,
+            guards,
+            runtime_guards: GuardChain::from_config(&config.guards),
+            selector: Selector::new(),
+            runtime_session,
+            mind_palace,
+            runtime_state: RuntimeState::new(SessionMode::Pentest),
+            queued_turns: VecDeque::new(),
+            steering_notes: Vec::new(),
+            system_prompt: system_prompt.clone(),
+            config,
+            data_dir: PathBuf::from("."),
+            command_registry: CommandRegistry::default(),
+        };
+
+        rebuild_runtime_from_events(&mut ctx).await.unwrap();
+
+        let messages = &ctx.runtime_session.messages;
+        assert_eq!(
+            messages.first().map(|message| &message.role),
+            Some(&Role::System)
+        );
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|message| message.content.as_deref()),
+            Some(system_prompt.as_str())
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .count(),
+            1,
+            "semantic branch summaries must not create extra system messages"
+        );
+
+        let contents = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>();
+        assert!(contents.iter().any(|content| {
+            content
+                .contains("[Compaction summary]\nsemantic compaction kept the investigation state")
+        }));
+        let branch_message = messages
+            .iter()
+            .find(|message| {
+                message.content.as_deref().is_some_and(|content| {
+                    content.contains("[Branch summary]\nparent branch found credential reuse")
+                })
+            })
+            .expect("branch summary should be replayed into runtime context");
+        assert_ne!(branch_message.role, Role::System);
+        assert!(contents
+            .iter()
+            .any(|content| *content == "current user turn"));
+        assert!(!contents
+            .iter()
+            .any(|content| *content == "archived user turn"));
+        assert!(!contents
+            .iter()
+            .any(|content| *content == "archived assistant reasoning"));
     }
 
     #[test]
