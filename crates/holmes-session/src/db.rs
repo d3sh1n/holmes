@@ -912,6 +912,46 @@ impl SessionDB {
         Ok(())
     }
 
+    pub async fn set_mode(&self, id: &str, mode: SessionMode) -> Result<(), SessionError> {
+        let id_owned = id.to_string();
+        let mode_owned = mode;
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let mode = mode_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET mode = ?1 WHERE id = ?2",
+                        params![mode_to_str(&mode), id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_model(&self, id: &str, model: &str) -> Result<(), SessionError> {
+        let id_owned = id.to_string();
+        let model_owned = model.to_string();
+        self.write_contention
+            .with_retry(|| {
+                let id = id_owned.clone();
+                let model = model_owned.clone();
+                async move {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE sessions SET model = ?1 WHERE id = ?2",
+                        params![model, id],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn search_events(
         &self,
         query: &str,

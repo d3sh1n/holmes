@@ -528,6 +528,25 @@ async fn append_active_tools_startup_metadata_event(
     Ok(())
 }
 
+async fn append_active_tools_event_for_registry(
+    session_db: &SessionDB,
+    session_id: &str,
+    registry: &ToolRegistry,
+    source: &str,
+) -> anyhow::Result<()> {
+    session_db
+        .append_event(
+            session_id,
+            &Event::ActiveToolsSet {
+                tool_names: active_tool_names(registry),
+                source: source.into(),
+                timestamp: Utc::now(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 async fn create_fresh_runtime_session(
     session_db: Arc<SessionDB>,
     memory_store: Arc<MemoryStore>,
@@ -1938,7 +1957,65 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 }
                 println!("\nUse /model <name> to switch.");
             } else {
-                println!("Model switching requires restart. Use -m <model> when starting holmes.");
+                let selected = ctx
+                    .config
+                    .llm
+                    .providers
+                    .iter()
+                    .find(|provider| provider.name == args || provider.model == args)
+                    .map(|provider| ResolvedModel {
+                        model: provider.model.clone(),
+                        provider: Some(provider.name.clone()),
+                    })
+                    .unwrap_or_else(|| ResolvedModel {
+                        model: args.to_string(),
+                        provider: None,
+                    });
+
+                if let Err(error) = ctx.session_db.set_model(&ctx.session_id, &selected.model).await
+                {
+                    eprintln!("Error: {}", error);
+                    return SlashResult::Handled;
+                }
+                let event = Event::SessionModelSet {
+                    model: selected.model.clone(),
+                    provider: selected.provider.clone(),
+                    source: "slash_command".into(),
+                    timestamp: Utc::now(),
+                };
+                if let Err(error) = ctx.session_db.append_event(&ctx.session_id, &event).await {
+                    eprintln!("Error: {}", error);
+                    return SlashResult::Handled;
+                }
+                ctx.mind_palace.ingest(event);
+
+                if let Some(provider) = selected.provider.clone() {
+                    ctx.config.llm.roles.attack_agent = provider.clone();
+                    println!("Model switched to: {} ({})", selected.model, provider);
+                } else {
+                    let role_provider = ctx.config.llm.roles.attack_agent.clone();
+                    if let Some(provider) = ctx
+                        .config
+                        .llm
+                        .providers
+                        .iter_mut()
+                        .find(|provider| provider.name == role_provider)
+                    {
+                        provider.model = selected.model.clone();
+                    }
+                    println!("Model switched to: {}", selected.model);
+                }
+                ctx.llm = Arc::new(LlmClient::new(&ctx.config));
+
+                let mut selector = Selector::new();
+                for wf in workflows::create_builtin_workflows(
+                    ctx.llm.clone(),
+                    ctx.registry.clone(),
+                    ctx.guards.clone(),
+                ) {
+                    selector.register(wf);
+                }
+                ctx.selector = selector;
             }
             SlashResult::Handled
         }
@@ -1959,6 +2036,13 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                 println!("Available: pentest, audit, reverse, research, mixed");
             } else {
                 let new_mode = parse_mode(args);
+                if let Err(error) = ctx.session_db.set_mode(&ctx.session_id, new_mode.clone()).await
+                {
+                    eprintln!("Error: {}", error);
+                    return SlashResult::Handled;
+                }
+                ctx.runtime_session.mode = new_mode.clone();
+                ctx.runtime_state.session_mode = new_mode.clone();
                 let event = Event::SessionModeSet {
                     mode: new_mode.clone(),
                     source: Some("slash_command".into()),
@@ -1969,8 +2053,6 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                     return SlashResult::Handled;
                 }
                 ctx.mind_palace.ingest(event);
-                ctx.runtime_session.mode = new_mode.clone();
-                ctx.runtime_state.session_mode = new_mode.clone();
                 println!("Mode switched to: {:?}", new_mode);
             }
             SlashResult::Handled
@@ -2032,6 +2114,17 @@ async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> SlashResult
                     )
                     .await,
                 );
+                if let Err(error) = append_active_tools_event_for_registry(
+                    &ctx.session_db,
+                    &ctx.session_id,
+                    &registry,
+                    "mcp_reload",
+                )
+                .await
+                {
+                    eprintln!("Error: {}", error);
+                    return SlashResult::Handled;
+                }
                 let mut selector = Selector::new();
                 for wf in workflows::create_builtin_workflows(
                     ctx.llm.clone(),
@@ -2239,6 +2332,133 @@ mod tests {
             role_resolved.and_then(|resolved| resolved.provider),
             Some("main".into())
         );
+    }
+
+    #[tokio::test]
+    async fn slash_runtime_mutations_persist_mode_model_and_active_tools_for_replay() {
+        let session_db = Arc::new(SessionDB::open(":memory:").await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(":memory:").await.unwrap());
+        let mut config = HolmesConfig::default();
+        config.llm.roles.attack_agent = "main".into();
+        config.llm.providers.push(holmes_core::config::ProviderConfig {
+            name: "main".into(),
+            base_url: "http://localhost".into(),
+            api_key: String::new(),
+            api_key_env: None,
+            model: "startup-model".into(),
+            api_format: ApiFormat::Anthropic,
+            priority: 0,
+            max_retries: 3,
+            rpm_limit: 60,
+        });
+        config.llm.providers.push(holmes_core::config::ProviderConfig {
+            name: "alternate".into(),
+            base_url: "http://localhost".into(),
+            api_key: String::new(),
+            api_key_env: None,
+            model: "alternate-model".into(),
+            api_format: ApiFormat::Anthropic,
+            priority: 1,
+            max_retries: 3,
+            rpm_limit: 60,
+        });
+
+        let llm = Arc::new(LlmClient::new(&config));
+        let system_prompt = "semantic startup prompt".to_string();
+        let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
+        let (session_id, runtime_session, mind_palace, registry) = create_fresh_runtime_session(
+            session_db.clone(),
+            memory_store.clone(),
+            llm.clone(),
+            &config,
+            SessionMode::Pentest,
+            Some(ResolvedModel {
+                model: "startup-model".into(),
+                provider: Some("main".into()),
+            }),
+            system_prompt.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut selector = Selector::new();
+        for wf in workflows::create_builtin_workflows(
+            llm.clone(),
+            registry.clone(),
+            guards.clone(),
+        ) {
+            selector.register(wf);
+        }
+
+        let mut ctx = ChatContext {
+            session_id: session_id.clone(),
+            session_db: session_db.clone(),
+            memory_store: memory_store.clone(),
+            llm,
+            registry,
+            guards,
+            runtime_guards: GuardChain::from_config(&config.guards),
+            selector,
+            runtime_session,
+            mind_palace,
+            runtime_state: RuntimeState::new(SessionMode::Pentest),
+            queued_turns: VecDeque::new(),
+            steering_notes: Vec::new(),
+            system_prompt,
+            config,
+            data_dir: PathBuf::from("."),
+            command_registry: CommandRegistry::default(),
+        };
+
+        assert!(matches!(
+            handle_slash_command("/mode reverse", &mut ctx).await,
+            SlashResult::Handled
+        ));
+        assert_eq!(ctx.runtime_session.mode, SessionMode::Reverse);
+
+        let workflow_names_before_model_switch = ctx.selector.workflow_names().into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert!(!workflow_names_before_model_switch.is_empty());
+
+        assert!(matches!(
+            handle_slash_command("/model alternate", &mut ctx).await,
+            SlashResult::Handled
+        ));
+        assert_eq!(ctx.config.llm.roles.attack_agent, "alternate");
+        assert_eq!(
+            ctx.selector
+                .workflow_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            workflow_names_before_model_switch
+        );
+
+        assert!(matches!(
+            handle_slash_command("/mcp reload", &mut ctx).await,
+            SlashResult::Handled
+        ));
+        let actual_tool_names = active_tool_names(&ctx.registry);
+        let replayed = session_db.replay_session_context(&session_id).await.unwrap();
+        assert_eq!(replayed.session.mode, SessionMode::Reverse);
+        assert_eq!(replayed.model.as_deref(), Some("alternate-model"));
+        assert_eq!(replayed.active_tools, actual_tool_names);
+
+        let events = session_db.get_events(&session_id).await.unwrap();
+        assert!(events.iter().any(|stored| matches!(
+            &stored.event,
+            Event::SessionModelSet {
+                model,
+                provider,
+                source,
+                timestamp: _,
+            } if model == "alternate-model"
+                && provider.as_deref() == Some("alternate")
+                && source == "slash_command"
+        )));
+        assert!(events.iter().any(|stored| matches!(
+            &stored.event,
+            Event::ActiveToolsSet { source, .. } if source == "mcp_reload"
+        )));
     }
 
     #[tokio::test]
