@@ -107,7 +107,8 @@ impl AgentRuntime {
     }
 
     pub async fn compact_now(&mut self) -> Result<Option<CompressionResult>, RuntimeError> {
-        self.compact_with_force(true).await
+        self.compact_with_trigger(true, holmes_core::CompactionTrigger::Manual)
+            .await
     }
 
     pub async fn run_turn(
@@ -383,12 +384,14 @@ impl AgentRuntime {
     }
 
     async fn maybe_compact(&mut self) -> Result<Option<CompressionResult>, RuntimeError> {
-        self.compact_with_force(false).await
+        self.compact_with_trigger(false, holmes_core::CompactionTrigger::Threshold)
+            .await
     }
 
-    async fn compact_with_force(
+    async fn compact_with_trigger(
         &mut self,
         force: bool,
+        trigger: holmes_core::CompactionTrigger,
     ) -> Result<Option<CompressionResult>, RuntimeError> {
         let current_msg_count = self.context.session.messages.len();
         for hook in &self.action.hooks {
@@ -400,13 +403,81 @@ impl AgentRuntime {
         let plan = self
             .compactor
             .plan(&self.context.session, &self.context.config, force);
-        let Some(result) = self
+        let plan_protected_head = plan.protected_head;
+        let protected_tail_tokens =
+            self.context.config.compressor.protected_tail_tokens as usize;
+
+        // Snapshot the pre-compaction state so we can archive the messages and
+        // events that are about to be summarized away.
+        let events_before = self
+            .context
+            .session_db
+            .get_events(&self.context.session_id)
+            .await
+            .map_err(|error| {
+                RuntimeError::recoverable(format!(
+                    "failed to snapshot events before compaction in session {}: {}",
+                    self.context.session_id, error
+                ))
+            })?;
+        let messages_before = self.context.session.messages.clone();
+
+        let Some(mut result) = self
             .compactor
-            .compress_session(&mut self.context.session, &self.context.config, plan)
+            .compress_session(
+                &mut self.context.session,
+                &self.context.config,
+                plan,
+                trigger.clone(),
+            )
             .map_err(|error| RuntimeError::recoverable(error.to_string()))?
         else {
             return Ok(None);
         };
+
+        if let Some((start, end)) = result.archived_message_range {
+            let archived_messages = messages_before
+                .get(start..end)
+                .map(|slice| slice.to_vec())
+                .unwrap_or_default();
+            let archived_event_range = events_before
+                .first()
+                .zip(events_before.last())
+                .map(|(first, last)| (first.event_index, last.event_index));
+            let next_index = self.next_event_index().await?;
+
+            let archive = holmes_session::CompactionArchive {
+                schema_version: holmes_session::COMPACTION_ARCHIVE_SCHEMA_VERSION,
+                session_id: self.context.session_id.clone(),
+                compaction_event_index: next_index,
+                trigger: trigger.clone(),
+                archived_event_range: archived_event_range
+                    .map(|(s, e)| holmes_session::ArchivedEventRange { start: s, end: e }),
+                messages: archived_messages,
+                events: events_before
+                    .iter()
+                    .map(holmes_session::ArchivedEvent::from_stored)
+                    .collect(),
+                created_at: Utc::now(),
+            };
+
+            // Write the archive before appending the CompressionApplied event so
+            // the persisted event always points at a readable archive (atomic).
+            let archive_path = self
+                .context
+                .session_db
+                .write_compaction_archive(&self.context.session_id, next_index, &archive)
+                .await
+                .map_err(|error| {
+                    RuntimeError::recoverable(format!(
+                        "failed to write compaction archive for session {}: {}",
+                        self.context.session_id, error
+                    ))
+                })?;
+
+            result.archive_path = Some(archive_path);
+            result.archived_event_range = archived_event_range;
+        }
 
         append_and_ingest(
             &mut self.context,
@@ -416,11 +487,11 @@ impl AgentRuntime {
                 summary: result.summary.clone(),
                 preserved_keys: result.preserved_keys.clone(),
                 method: result.method.clone(),
-                preserved_head: None,
-                preserved_tail_tokens: None,
-                archive_path: None,
-                archived_event_range: None,
-                trigger: None,
+                preserved_head: Some(plan_protected_head),
+                preserved_tail_tokens: Some(protected_tail_tokens),
+                archive_path: result.archive_path.clone(),
+                archived_event_range: result.archived_event_range,
+                trigger: Some(result.trigger.clone()),
                 timestamp: Some(Utc::now()),
             },
         )
@@ -1354,6 +1425,84 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event.event, Event::CompressionApplied { .. })));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_persists_archive_backed_event() {
+        let llm = Arc::new(QueueLlmBackend::new(Vec::new()));
+        let mut config = HolmesConfig::default();
+        config.compressor.context_limit = 1;
+        config.compressor.threshold = 1.0;
+        config.compressor.protected_head = 1;
+        config.compressor.protect_last_n = 1;
+        let context =
+            make_context_with_config(llm, ToolRegistry::new(), GuardChain::new(), config).await;
+        let mut runtime = AgentRuntime::new(context);
+
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::system("system prompt"));
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::user("old finding one"));
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::assistant("old reasoning two"));
+        runtime
+            .context_mut()
+            .session
+            .messages
+            .push(Message::user("latest question"));
+
+        let result = runtime
+            .compact_now()
+            .await
+            .expect("compact runtime")
+            .expect("compressed");
+        assert_eq!(result.trigger, holmes_core::CompactionTrigger::Manual);
+        let archive_path = result.archive_path.clone().expect("archive path");
+
+        let events = runtime
+            .context()
+            .session_db
+            .get_events(&runtime.context().session_id)
+            .await
+            .expect("stored events");
+        let compression = events
+            .iter()
+            .find_map(|event| match &event.event {
+                Event::CompressionApplied {
+                    trigger,
+                    archive_path,
+                    ..
+                } => Some((trigger.clone(), archive_path.clone())),
+                _ => None,
+            })
+            .expect("compression event");
+        assert_eq!(
+            compression.0,
+            Some(holmes_core::CompactionTrigger::Manual)
+        );
+        assert_eq!(compression.1, Some(archive_path.clone()));
+
+        let archive = runtime
+            .context()
+            .session_db
+            .read_compaction_archive(&archive_path)
+            .await
+            .expect("readable archive");
+        assert_eq!(archive.trigger, holmes_core::CompactionTrigger::Manual);
+        assert_eq!(
+            archive.schema_version,
+            holmes_session::COMPACTION_ARCHIVE_SCHEMA_VERSION
+        );
+        assert!(!archive.messages.is_empty());
     }
 
     #[tokio::test]

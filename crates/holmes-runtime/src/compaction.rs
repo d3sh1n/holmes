@@ -44,6 +44,7 @@ impl CaseCompactor {
             threshold_tokens,
             protected_head,
             protected_tail_start,
+            archived_message_range: has_middle.then_some((protected_head, protected_tail_start)),
         }
     }
 
@@ -52,6 +53,7 @@ impl CaseCompactor {
         session: &mut RuntimeSession,
         config: &HolmesConfig,
         plan: CompressionPlan,
+        trigger: holmes_core::CompactionTrigger,
     ) -> Result<Option<CompressionResult>> {
         if !plan.should_compress {
             return Ok(None);
@@ -87,6 +89,10 @@ impl CaseCompactor {
                 "protected_tail".into(),
             ],
             method: CompressionMethod::StaticFallback,
+            archived_message_range: plan.archived_message_range,
+            trigger,
+            archive_path: None,
+            archived_event_range: None,
         }))
     }
 }
@@ -230,6 +236,7 @@ pub struct CompressionPlan {
     pub threshold_tokens: u64,
     pub protected_head: usize,
     pub protected_tail_start: usize,
+    pub archived_message_range: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +246,10 @@ pub struct CompressionResult {
     pub summary: String,
     pub preserved_keys: Vec<String>,
     pub method: CompressionMethod,
+    pub archived_message_range: Option<(usize, usize)>,
+    pub trigger: holmes_core::CompactionTrigger,
+    pub archive_path: Option<String>,
+    pub archived_event_range: Option<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -344,10 +355,18 @@ mod tests {
 
         let mut compactor = CaseCompactor::default();
         let plan = compactor.plan(&session, &config, true);
+        assert_eq!(plan.archived_message_range, Some((plan.protected_head, plan.protected_tail_start)));
         let result = compactor
-            .compress_session(&mut session, &config, plan)
+            .compress_session(
+                &mut session,
+                &config,
+                plan,
+                holmes_core::CompactionTrigger::Manual,
+            )
             .expect("compression result")
             .expect("compressed");
+        assert_eq!(result.trigger, holmes_core::CompactionTrigger::Manual);
+        assert!(result.archived_message_range.is_some());
 
         assert_eq!(result.before_count, 5);
         assert!(result.after_count < result.before_count);
@@ -460,10 +479,18 @@ mod tests {
 
         let mut compactor = CaseCompactor::default();
         let plan = compactor.plan(&session, &config, true);
+        assert_eq!(plan.archived_message_range, Some((plan.protected_head, plan.protected_tail_start)));
         let result = compactor
-            .compress_session(&mut session, &config, plan)
+            .compress_session(
+                &mut session,
+                &config,
+                plan,
+                holmes_core::CompactionTrigger::Manual,
+            )
             .expect("compression result")
             .expect("compressed");
+        assert_eq!(result.trigger, holmes_core::CompactionTrigger::Manual);
+        assert!(result.archived_message_range.is_some());
 
         assert_eq!(session.messages.len(), 4);
         assert_eq!(session.messages[0].role, Role::System);
