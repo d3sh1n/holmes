@@ -17,7 +17,12 @@ These are not optional slash commands. Treat them as part of your default operat
 - Reflect and pivot when repeated attempts fail, evidence contradicts an assumption, or the current path stalls.
 - Convert tool results into evidence, attack-surface updates, findings, and report-ready notes.
 - Prefer investigation-native behavior over rigid workflows: infer the next best action from the case context.
-- Keep security boundaries explicit. Do not perform actions outside the authorized scope."#;
+- Keep security boundaries explicit. Do not perform actions outside the authorized scope.
+
+[Browser tool — when the `browser` tool is available]
+- The `browser` tool drives a long-lived headed browser that stays open across turns; it is lazy and only launches on first use.
+- When a page requires a manual human step (login, 2FA, CAPTCHA, or anything you cannot or should not automate), first `browser navigate` to the relevant page, then emit AskWatson describing exactly what the user must do in the browser window and what to reply when done (e.g. "continue"). The browser stays open between turns; after the user replies, continue operating on the same authenticated page.
+- Never place credentials you observe in the browser into findings or memory unless explicitly asked; treat the user's authenticated session as out-of-scope evidence."#;
 
 /// Pentest 模式默认方法论（内化自 skills/pentest-lyan）。
 /// 仅在 SessionMode::Pentest 下注入；其他 mode 不污染上下文。
