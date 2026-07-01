@@ -182,3 +182,36 @@ async fn attach_to_real_chrome_navigates() {
     // The fact that we got here without panicking + the browser is still up
     // (next test run can re-attach) is the contract.
 }
+
+#[tokio::test]
+#[ignore = "real network; launch with system Chrome binary to bypass anti-bot"]
+async fn xiaohongshu_with_system_chrome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = enabled_config();
+    cfg.timeout = 60;
+    cfg.executable_path =
+        Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
+    let mgr = BrowserManager::new("xhs-chrome", tmp.path(), cfg).unwrap();
+
+    // First, diagnose the UA the launched browser reports.
+    let snap = mgr.navigate("data:text/html,<body>x</body>").await.unwrap();
+    let ua = mgr
+        .execute_js("navigator.userAgent")
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    println!("UA reported: {}", ua);
+    println!("title: {}", snap.title);
+
+    // Now hit the real anti-bot target.
+    let snap = match mgr.navigate("https://www.xiaohongshu.com").await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("xiaohongshu navigate error: {e}");
+            panic!("still blocked: {e}");
+        }
+    };
+    println!("XHS url: {} | title: {}", snap.url, snap.title);
+    let head: String = snap.text_excerpt.chars().take(300).collect();
+    println!("XHS body excerpt: {head}");
+    mgr.close().await;
+}
