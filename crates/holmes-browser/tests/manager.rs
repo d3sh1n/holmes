@@ -215,3 +215,18 @@ async fn xiaohongshu_with_system_chrome() {
     println!("XHS body excerpt: {head}");
     mgr.close().await;
 }
+
+#[tokio::test]
+#[ignore = "real network; verifies auto-detected system Chrome bypasses xiaohongshu anti-bot without explicit executable_path"]
+async fn xiaohongshu_auto_detected_chrome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = enabled_config();
+    cfg.timeout = 60;
+    // intentionally no executable_path — should auto-detect system Chrome
+    let mgr = BrowserManager::new("xhs-auto", tmp.path(), cfg).unwrap();
+    let snap = mgr.navigate("https://www.xiaohongshu.com").await.expect("navigate");
+    println!("XHS auto url: {} | title: {}", snap.url, snap.title);
+    assert!(!snap.title.is_empty());
+    assert!(!snap.text_excerpt.is_empty());
+    mgr.close().await;
+}

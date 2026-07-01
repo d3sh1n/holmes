@@ -123,6 +123,11 @@ impl BrowserManager {
             }
             if let Some(exe) = &self.config.executable_path {
                 builder = builder.chrome_executable(exe);
+            } else if let Some(system_chrome) = detect_system_chrome() {
+                // Prefer the user's real Chrome/Edge over the (often older,
+                // more fingerprintable) Chromium chromiumoxide would otherwise
+                // download. Real binaries defeat strong anti-bot fingerprinting.
+                builder = builder.chrome_executable(system_chrome);
             }
             for a in normalized {
                 builder = builder.arg(a);
@@ -331,6 +336,40 @@ const STEALTH_JS: &str = r#"
   try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
 })();
 "#;
+
+/// Probe common install locations for a real Chrome/Edge/Chromium binary.
+/// Returns the first existing path. Used so that, by default, we launch the
+/// user's real browser (real fingerprint) rather than the Chromium
+/// chromiumoxide would download — the latter is easily fingerprinted by strong
+/// anti-bot systems (e.g. Akamai Bot Manager on sites like xiaohongshu.com).
+pub fn detect_system_chrome() -> Option<std::path::PathBuf> {
+    let candidates: &[&str] = &[
+        // macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        // Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/brave-browser",
+        "/snap/bin/chromium",
+        // Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(std::path::PathBuf::from(c));
+        }
+    }
+    None
+}
 
 const READ_ONLY_ACTIONS: &[&str] = &["navigate", "screenshot", "get_content"];
 
