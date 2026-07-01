@@ -237,3 +237,101 @@ impl RuntimeMiddleware for TokenAuditMiddleware {
         Ok(())
     }
 }
+
+/// Block mutating `browser` actions (`click`, `fill`, `execute_js`) while the
+/// session is running under `read_only` permission mode. Read-only actions
+/// (`navigate`, `screenshot`, `get_content`) pass through.
+pub struct BrowserReadOnlyMiddleware;
+
+/// Pure decision: returns `Some(reason)` if the call must be blocked.
+pub fn browser_write_blocked_under_readonly(
+    mode: &holmes_core::config::PermissionMode,
+    tool_name: &str,
+    action: &str,
+) -> Option<String> {
+    if tool_name != "browser" {
+        return None;
+    }
+    if !matches!(mode, holmes_core::config::PermissionMode::ReadOnly) {
+        return None;
+    }
+    if matches!(action, "click" | "fill" | "execute_js") {
+        return Some(format!(
+            "browser action '{action}' is a write and is blocked under read_only permission mode"
+        ));
+    }
+    None
+}
+
+#[async_trait]
+impl RuntimeMiddleware for BrowserReadOnlyMiddleware {
+    async fn before_tool_call(
+        &self,
+        ctx: &mut RuntimeContext,
+        tool_name: &mut String,
+        args: &mut serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let action = args
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        if let Some(reason) = browser_write_blocked_under_readonly(
+            &ctx.config.permissions.mode,
+            tool_name,
+            action,
+        ) {
+            return Err(RuntimeError::recoverable(reason));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod browser_middleware_tests {
+    use super::*;
+    use holmes_core::config::PermissionMode;
+
+    #[test]
+    fn read_only_blocks_write_actions() {
+        for action in ["click", "fill", "execute_js"] {
+            assert!(browser_write_blocked_under_readonly(
+                &PermissionMode::ReadOnly,
+                "browser",
+                action
+            )
+            .is_some(),);
+        }
+    }
+
+    #[test]
+    fn read_only_permits_read_actions() {
+        for action in ["navigate", "screenshot", "get_content"] {
+            assert!(browser_write_blocked_under_readonly(
+                &PermissionMode::ReadOnly,
+                "browser",
+                action
+            )
+            .is_none(),);
+        }
+    }
+
+    #[test]
+    fn non_read_only_mode_allows_writes() {
+        assert!(browser_write_blocked_under_readonly(
+            &PermissionMode::Default,
+            "browser",
+            "click"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn non_browser_tool_passes_through() {
+        assert!(browser_write_blocked_under_readonly(
+            &PermissionMode::ReadOnly,
+            "http_request",
+            "click"
+        )
+        .is_none());
+    }
+}

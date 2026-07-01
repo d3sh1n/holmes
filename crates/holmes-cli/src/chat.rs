@@ -953,6 +953,12 @@ pub(crate) async fn run_runtime_input_with_sink<S: RuntimeSink>(
         ctx.config.clone(),
     );
     let mut runtime = AgentRuntime::new(runtime_context);
+    if ctx.browser.is_some() {
+        runtime
+            .context_mut()
+            .middlewares
+            .push(Arc::new(holmes_runtime::middleware::BrowserReadOnlyMiddleware));
+    }
     let result = if oneshot {
         runtime.run_oneshot(input, sink).await
     } else {
