@@ -1,92 +1,132 @@
-# Holmes - AI Security Research Agent
+# Holmes — AI Security Research Agent
 
-Holmes is an advanced, autonomous AI security research agent built in Rust. It utilizes LLMs to act as a deeply integrated virtual security researcher, fully capable of delegating tasks to its recursive subagents, auditing and interacting with target systems, and organizing findings within its "Mind Palace."
+Holmes is an autonomous, Rust-native AI agent for security research, penetration testing, code auditing, and reverse engineering. It runs a single cognitive loop — perception → deliberation → action — backed by an event-sourced session store, a Mind Palace memory layer, and native browser automation with human-in-the-loop handoff.
 
 ## 🚀 Key Features
 
-*   **Unified Agent Runtime**: Interactive chat, one-shot queries, tool execution, permissions, guard checks, event writes, and runtime yields flow through `holmes-runtime::AgentRuntime`.
-*   **First-Class Recursive Subagents**: Holmes can spawn, isolate, and delegate work to subagents. Subagents run asynchronously with their own runtime context.
-*   **Modern TUI & REPL**: A Pi-style full-screen TUI is the default interactive surface, with Reedline still available as a legacy line REPL. Features include command palettes, keyboard navigation, session tree inspection, event timelines, and fork-from-event workflows.
-*   **Mind Palace Architecture**: A structured memory and knowledge management layer that organizes findings, tasks, and context into logical domains.
-*   **User-Configurable Safety Layer**: `PermissionPolicy` and `GuardChain` are exposed through readable TUI commands, so users can inspect modes, allow/deny tools, and toggle guard behavior without hand-editing YAML.
-*   **Persistent SQLite DB**: Complete event tracing, memory retrieval (using Full-Text Search), and dialogue saving locally so that sessions can be resumed or analyzed.
-*   **Modular LLM Core**: Extensible tool registry and model backend abstraction (currently tailored for Claude/Anthropic APIs).
+- **Unified Agent Runtime** — every turn flows through one engine (`AgentRuntime::run_turn`) that orchestrates ~10 engines per iteration: reflection budget → compaction → perception → LLM deliberation → permission/guard/middleware → tool batch → evidence projection → deduction review → memory.
+- **Seven-Way Decision Model** — `HolmesDecision` goes beyond "answer / use-tools": `Answer`, `Finish`, `AskWatson` (human handoff), `UseTools`, `SetGoal`, `Reflect`, `Deduce` are all first-class loop outcomes.
+- **Three Independent Safety Layers** — `PermissionPolicy` (user authorization, 6 modes), `GuardChain` (system-level pre/post tool hooks; `SkepticGate` is the sole writer to the validated state zone), and `RuntimeMiddleware` (cross-cutting command blocklist, sensitive-data redaction, token budget).
+- **Event-Sourced Sessions + Semantic Kernel** — every state change is an immutable `Event` in SQLite (FTS5 + WAL). Sessions replay from events; the Semantic Kernel persists prompt/model/mode/tools metadata so a session resumes with full context. Forking is a transactional event copy; compaction is archived and replayable.
+- **Mind Palace** — three layers in one type: raw event memory + long-term FTS memory, typed working context (attack surface, findings, pitfalls, …), and a mode-aware dashboard (Pentest / SecurityResearch / CodeAudit / Reverse / Mixed).
+- **Native Browser Automation** *(new)* — a headed Chromium the agent launches and keeps open across turns via native CDP (`chromiumoxide`). When a page needs a human (login / 2FA / CAPTCHA), the agent hands off with `AskWatson`, you act in the browser window, reply `continue`, and the agent continues on the same authenticated page. Auto-detects your real Chrome to bypass anti-bot fingerprinting; per-session profile + userDataDir; Chromium sandbox always on.
+- **Recursive Subagents** — spawn / isolate / delegate to subagents that share the parent's store and LLM but run their own runtime.
+- **Modern TUI + Legacy REPL** — full-screen TUI (default) with mouse-wheel scrollback, command palette, session tree, event timeline, fork-from-event; Reedline REPL still available for one-shot and scripted use.
+- **Bundled Pentest Methodology** — [Pentest-Lyan](https://github.com/HeaSec/Pentest-Lyan) (v2.3, MIT) is internalized as the default operating standard in Pentest mode (three phases, 12-dimension threat model, 9 Banned Patterns).
+- **Multi-Provider LLM** — any Anthropic-Messages-compatible gateway (Anthropic, GLM/Zhipu, …) with failover, rate limiting, and role-based routing over a single wire format.
+- **Deterministic Harness** — scripted-LLM scenario tests in YAML drive a real `AgentRuntime` with an in-memory store for regression coverage.
 
 ## 🛠️ System Architecture
 
-The project is structured into multiple decoupled crates to ensure maximum flexibility and reliability:
+The workspace is split into focused crates. `holmes-core` is the base (everything depends on it); `holmes-cli` and `holmes-harness` sit at the top.
 
-*   **`holmes-cli`**: The primary entrypoint. Handles the full-screen TUI, legacy Reedline REPL, session loading, config reading, and slash commands.
-*   **`holmes-core`**: Defines the shared types, structs, and traits (e.g., configurations, event protocols).
-*   **`holmes-runtime`**: The heart of the agent. Manages the perception-deliberation-action cycle, tool execution, permissions, guards, runtime yields, and event persistence.
-*   **`holmes-mind-palace`**: Context and memory layer logic.
-*   **`holmes-session`**: Handles local SQLite persistence, FTS searches, and data concurrency control.
-*   **`holmes-guards`**: Contains Pre- and Post-tool hooks designed to prevent infinite loops, restrict dangerous commands, or seed read states safely.
-*   **`holmes-llm`**: Manages backend API integrations and prompt streaming.
-*   **`holmes-tools`**: The extensible tool registry exposing command execution, Python, HTTP, reporting, hypothesis, optional subagent, and MCP-backed tools to the LLM.
+| Crate | Role |
+|---|---|
+| `holmes-core` | Base layer: types, `Event`, `Config`, `RuntimeSession`, `AgentHook` / `SubagentRunner` traits, four-zone `AttackState`. |
+| `holmes-session` | SQLite + FTS5 + WAL event store; `SessionStore` trait; semantic replay, fork, compaction archive. |
+| `holmes-llm` | Multi-provider client over the Anthropic Messages wire format; failover, rate limit, role routing, error classification. |
+| `holmes-tools` | Extensible tool registry: command exec, Python, HTTP, file ops, reporting, hypothesis, optional subagent + MCP, browser. |
+| `holmes-guards` | Pre/Post-tool guard chain: `immutable_field`, `dangerous_command`, `repetition`, `attack_surface`, `evidence_extractor`, `skeptic_gate`, `failure_tracker`, `soft404`. |
+| `holmes-mind-palace` | Three-layer memory / context / dashboard. |
+| `holmes-runtime` | The single agent loop + reflection / deliberation / compaction / middleware / permissions. |
+| `holmes-browser` | Native CDP browser automation (`chromiumoxide`): lazy launch, per-session profile, read-only gating, stealth, sandbox-safe. |
+| `holmes-harness` | Deterministic scenario runner for regression tests. |
+| `holmes-cli` | Entrypoint: TUI, legacy REPL, one-shot, session/config plumbing, slash commands. |
 
 ## 📦 Getting Started
 
 ### Prerequisites
-*   Rust toolchain (cargo)
-*   A valid Anthropic/Claude API Key (or supported backend key).
+- Rust toolchain (cargo, stable)
+- An API key for an Anthropic-Messages-compatible provider (Anthropic Claude, GLM/Zhipu, …). `ANTHROPIC_API_KEY` and `HOLMES_API_KEY` are auto-detected by `setup`.
 
-### Building from Source
+### Build
 
-Clone the repository and build the workspace in release mode:
 ```bash
 git clone git@github.com:d3sh1n/holmes.git
 cd holmes
-cargo build --release
+cargo build --release          # produces ./target/release/holmes
 ```
 
-### Running Holmes
+### Configure
 
-Run the compiled binary. You will enter the full-screen TUI:
-```bash
-./target/release/holmes
-```
-
-Holmes starts a fresh session by default. Continue the most recent session only when you ask for it:
+Run the interactive wizard (writes `config.yaml` under your data dir):
 
 ```bash
-./target/release/holmes -c
-./target/release/holmes --resume <session-id>
+./target/release/holmes setup
 ```
 
-For the legacy Reedline REPL, use:
+- Config location: `dirs::data_dir()/holmes/config.yaml` — e.g. `~/Library/Application Support/holmes/config.yaml` on macOS, `~/.local/share/holmes/config.yaml` on Linux.
+- `config.default.yaml` at the repo root is the reference template with every option documented.
+- To use an Anthropic-compatible gateway (e.g. GLM), add it as another entry under `llm.providers` with `api_format: anthropic`.
+
+### Run
 
 ```bash
-./target/release/holmes repl
-# or
-./target/release/holmes --repl
+./target/release/holmes                       # full-screen TUI (default)
+./target/release/holmes repl                  # legacy Reedline REPL
+./target/release/holmes -q "your question"    # one-shot, non-interactive
+./target/release/holmes -c                    # continue most recent session
+./target/release/holmes -r <session-id>       # resume a specific session
+./target/release/holmes --mode pentest        # pentest | security-research | code-audit | reverse | mixed
 ```
 
-Type `/` in the TUI command editor or `Ctrl+L` for the command palette. In the legacy REPL, type `/` and press `Tab` to see available commands.
-
-Useful TUI commands:
-
-```text
-/tree                         # Show the session tree
-/tree events [limit]          # Inspect the current session event timeline
-/tree fork <event_index>      # Fork from a specific event and switch to it
-/permissions                  # Explain the current permission policy
-/permissions mode read-only   # Switch policy mode
-/permissions allow http_*     # Add allow/deny patterns
-/guards                       # Explain active GuardChain checks
-/guards disable repetition    # Toggle an individual guard
-```
-
-Full-screen TUI shortcuts:
+### TUI Shortcuts
 
 ```text
 F1 help        F2 session tree     F3 event timeline
 F4 permissions F5 GuardChain       F6 recent sessions
-Ctrl+L commands  Ctrl+N new  Ctrl+B fork  Ctrl+O tool output
+Ctrl+L command palette   Ctrl+N new   Ctrl+B fork   Ctrl+O fold/expand tool output
+Mouse wheel / PgUp / PgDn   scroll chat history
 ```
 
-## 🤝 Contributing
-Contributions, bug reports, and feature requests are always welcome! Feel free to open an issue or submit a pull request.
+Useful slash commands:
 
-## 📝 License
-This project is licensed under the MIT License.
+```text
+/tree                         # session tree
+/tree events [limit]          # event timeline
+/tree fork <event_index>      # fork from an event
+/permissions                  # show current permission policy
+/permissions mode read-only   # switch mode
+/guards                       # show active guards
+/browser close                # close the long-lived browser (if open)
+```
+
+## 🌐 Browser Automation
+
+Enable in `config.yaml`:
+
+```yaml
+browser:
+  enabled: true
+  timeout: 45                 # per-action seconds
+  # executable_path: null     # auto-detects your real Chrome/Edge (recommended; bypasses anti-bot)
+  # cdp_endpoint: "http://127.0.0.1:9222"   # attach to your running Chrome instead of launching
+```
+
+Then ask the agent to drive it:
+
+```
+用 browser 打开 https://example.com 并告诉我页面标题
+```
+
+**Login handoff** — when a page needs a human step, the agent navigates there, emits `AskWatson` describing what to do, and pauses. You act in the browser window, then reply `continue`; the agent continues on the same authenticated page. The browser stays open across turns and is closed only on `/browser close`, `/quit`, or session end.
+
+**Security** — browser actions go through `PermissionPolicy` + `GuardChain`. The Chromium built-in sandbox is always on; `--no-sandbox` / `--disable-web-security` and similar flags in `extra_launch_args` are rejected. In `read_only` mode, write actions (`click` / `fill` / `execute_js`) are blocked by `BrowserReadOnlyMiddleware`.
+
+## 🧪 Testing
+
+```bash
+cargo test --workspace                        # full suite
+cargo test -p holmes-runtime                  # one crate
+cargo test -p holmes-harness                  # deterministic scenario tests (scenarios/*.yaml)
+```
+
+Add a YAML to `scenarios/` with scripted LLM responses + mocked tools + expectations, and the harness exercises it through a real `AgentRuntime`.
+
+## 🤝 Contributing
+
+Contributions, bug reports, and feature requests are welcome — open an issue or a pull request.
+
+## 📝 License & Credits
+
+MIT License. Bundled methodology: [Pentest-Lyan](https://github.com/HeaSec/Pentest-Lyan) (v2.3, MIT, by HeaSec).

@@ -1,3 +1,14 @@
 /target
 .worktrees/
 crates/*/sessions/
+
+# Local Claude Code state
+.claude/
+
+# Local runtime artifacts (configs may carry keys; keep DBs/output local)
+config.yaml
+config.local.yaml
+*.db
+*.db-*
+/output/
+/data/
