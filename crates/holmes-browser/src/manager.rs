@@ -37,6 +37,10 @@ pub struct BrowserManager {
 struct ManagerState {
     browser: Option<Browser>,
     page: Option<Arc<Page>>,
+    /// `true` when we launched the browser (we own its lifecycle and may kill
+    /// it on `close`). `false` when we attached to an external Chrome via CDP
+    /// — closing then only drops our handle, never the user's browser.
+    owned: bool,
 }
 
 impl BrowserManager {
@@ -52,6 +56,7 @@ impl BrowserManager {
             state: Arc::new(Mutex::new(ManagerState {
                 browser: None,
                 page: None,
+                owned: true,
             })),
         })
     }
@@ -74,50 +79,69 @@ impl BrowserManager {
         if let Some(page) = state.page.clone() {
             return Ok(page);
         }
-        let profile_dir = profile_dir_for(&self.sessions_dir, &self.session_id);
-        tokio::fs::create_dir_all(&profile_dir).await?;
 
-        let safe_extra = sanitize_launch_args(&self.config.extra_launch_args)?;
-        // chromiumoxide's `arg(...)` renders as `--<arg>`, so strip any leading
-        // `--` the user supplied to avoid `----name`.
-        let normalized: Vec<String> = safe_extra
-            .into_iter()
-            .map(|a| a.trim_start_matches('-').to_string())
-            .collect();
+        // Decide attach-vs-launch. Attaching reuses the user's real Chrome
+        // (profile, login, fingerprint) and defeats strong anti-bot systems
+        // that would block an automation-launched browser.
+        let (browser, mut handler, owned) = if let Some(endpoint) =
+            self.config.cdp_endpoint.as_ref()
+        {
+            let (b, h) = tokio::time::timeout(self.timeout_dur(), Browser::connect(endpoint.clone()))
+                .await
+                .map_err(|_| BrowserError::Timeout(self.config.timeout))?
+                .map_err(|e| BrowserError::LaunchFailed(format!("cdp connect {endpoint}: {e}")))?;
+            (b, h, false)
+        } else {
+            let profile_dir = profile_dir_for(&self.sessions_dir, &self.session_id);
+            tokio::fs::create_dir_all(&profile_dir).await?;
 
-        let mut builder = BrowserConfig::builder();
-        // v1 is always headed: the user must see and interact with the window.
-        builder = builder.with_head();
-        builder = builder.user_data_dir(profile_dir.clone());
-        builder = builder.launch_timeout(self.timeout_dur());
-        builder = builder.arg("no-first-run");
-        builder = builder.arg("no-default-browser-check");
-        if self.config.ignore_https_errors {
-            builder = builder.arg("ignore-certificate-errors");
-        }
-        if let Some(proxy) = &self.config.proxy {
-            // Chrome proxy is a launch flag; chromiumoxide has no builder method for it.
-            builder = builder.arg(format!("proxy-server={}", proxy));
-        }
-        if let Some(exe) = &self.config.executable_path {
-            builder = builder.chrome_executable(exe);
-        }
-        for a in normalized {
-            builder = builder.arg(a);
-        }
-        // The built-in Chromium sandbox stays on: we intentionally do NOT call
-        // `no_sandbox()`. `sanitize_launch_args` already rejected user-supplied
-        // sandbox-disabling flags.
+            let safe_extra = sanitize_launch_args(&self.config.extra_launch_args)?;
+            // chromiumoxide's `arg(...)` renders as `--<arg>`, so strip any leading
+            // `--` the user supplied to avoid `----name`.
+            let normalized: Vec<String> = safe_extra
+                .into_iter()
+                .map(|a| a.trim_start_matches('-').to_string())
+                .collect();
 
-        let cfg = builder
-            .build()
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-        let (browser, mut handler) = Browser::launch(cfg)
-            .await
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+            let mut builder = BrowserConfig::builder();
+            // v1 is always headed: the user must see and interact with the window.
+            builder = builder.with_head();
+            builder = builder.user_data_dir(profile_dir.clone());
+            builder = builder.launch_timeout(self.timeout_dur());
+            builder = builder.arg("no-first-run");
+            builder = builder.arg("no-default-browser-check");
+            // Baseline anti-fingerprint hardening for launched mode. This is a
+            // best-effort nudge for light anti-bot targets; strong bot managers
+            // still require attach mode (real browser fingerprint).
+            builder = builder.arg("disable-blink-features=AutomationControlled");
+            if self.config.ignore_https_errors {
+                builder = builder.arg("ignore-certificate-errors");
+            }
+            if let Some(proxy) = &self.config.proxy {
+                // Chrome proxy is a launch flag; chromiumoxide has no builder method for it.
+                builder = builder.arg(format!("proxy-server={}", proxy));
+            }
+            if let Some(exe) = &self.config.executable_path {
+                builder = builder.chrome_executable(exe);
+            }
+            for a in normalized {
+                builder = builder.arg(a);
+            }
+            // The built-in Chromium sandbox stays on: we intentionally do NOT call
+            // `no_sandbox()`. `sanitize_launch_args` already rejected user-supplied
+            // sandbox-disabling flags.
+
+            let cfg = builder
+                .build()
+                .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+            let (b, h) = Browser::launch(cfg)
+                .await
+                .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+            (b, h, true)
+        };
 
         // Drive the CDP event loop on a background task. This must live for the
-        // lifetime of the browser.
+        // lifetime of the browser handle.
         tokio::spawn(async move {
             loop {
                 match handler.next().await {
@@ -134,8 +158,13 @@ impl BrowserManager {
                 .map_err(|_| BrowserError::Timeout(self.config.timeout))??,
         );
 
+        // Stealth init script: hide the webdriver flag and fake common tells.
+        // Harmless on an attached real Chrome; useful for launched mode.
+        let _ = page.evaluate_on_new_document(STEALTH_JS).await;
+
         state.browser = Some(browser);
         state.page = Some(page.clone());
+        state.owned = owned;
         Ok(page)
     }
 
@@ -267,9 +296,17 @@ impl BrowserManager {
     pub async fn close(&self) {
         let mut state = self.state.lock().await;
         state.page = None;
-        if let Some(mut browser) = state.browser.take() {
-            let _ = browser.close().await;
-            let _ = browser.wait().await;
+        let owned = state.owned;
+        if let Some(browser) = state.browser.take() {
+            if owned {
+                // We launched it: shut the whole browser down.
+                let mut b = browser;
+                let _ = b.close().await;
+                let _ = b.wait().await;
+            }
+            // Attach mode: just drop the handle (disconnects the WebSocket).
+            // We must NOT call `Browser::close` — that sends `Browser.close`
+            // over CDP and would kill the user's real Chrome (every tab).
         }
     }
 }
@@ -282,6 +319,18 @@ fn truncate(s: &str, limit: usize) -> String {
     out.push_str("…[truncated]");
     out
 }
+
+/// Init script injected before each document load to hide automation tells.
+/// Best-effort baseline for launched mode; attach mode needs it less since the
+/// browser fingerprint is already real.
+const STEALTH_JS: &str = r#"
+(() => {
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] }); } catch (e) {}
+  try { Object.defineProperty(navigator, 'plugins', { get: () => [{}, {}, {}, {}, {}] }); } catch (e) {}
+  try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
+})();
+"#;
 
 const READ_ONLY_ACTIONS: &[&str] = &["navigate", "screenshot", "get_content"];
 

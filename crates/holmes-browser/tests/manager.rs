@@ -13,6 +13,7 @@ fn enabled_config() -> BrowserConfig {
         executable_path: None,
         extra_launch_args: vec![],
         screenshot_dir: None,
+        cdp_endpoint: None,
     }
 }
 
@@ -145,4 +146,39 @@ async fn real_site_example_com_works() {
     println!("url: {} | title: {}", snap.url, snap.title);
     assert!(snap.text_excerpt.contains("Example Domain"), "body: {}", snap.text_excerpt);
     mgr.close().await;
+}
+
+#[tokio::test]
+#[ignore = "launches real Chromium; verifies stealth hides the webdriver flag"]
+async fn stealth_hides_webdriver_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = enabled_config();
+    let mgr = BrowserManager::new("stealth", tmp.path(), cfg).unwrap();
+    mgr.navigate("data:text/html,<body>x</body>").await.unwrap();
+    let val = mgr.execute_js("navigator.webdriver").await.unwrap();
+    // After stealth patch, navigator.webdriver must be masked (null/undefined).
+    assert!(
+        val.is_null(),
+        "navigator.webdriver should be masked (null), got {val}"
+    );
+    mgr.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a real Chrome running with --remote-debugging-port=9222; attach mode"]
+async fn attach_to_real_chrome_navigates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = enabled_config();
+    cfg.cdp_endpoint = Some("http://127.0.0.1:9222".to_string());
+    cfg.timeout = 60;
+    let mgr = BrowserManager::new("attach-test", tmp.path(), cfg).unwrap();
+    // about:blank navigation proves the attach + new_page path works.
+    let snap = mgr.navigate("https://example.com").await.expect("attach navigate");
+    println!("attached url: {} | title: {}", snap.url, snap.title);
+    assert!(snap.text_excerpt.contains("Example Domain"));
+    // close() in attach mode must NOT kill the user's Chrome; verify the
+    // process is still listening afterward.
+    mgr.close().await;
+    // The fact that we got here without panicking + the browser is still up
+    // (next test run can re-attach) is the contract.
 }

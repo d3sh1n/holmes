@@ -93,5 +93,6 @@ browser:
   executable_path: null     # set a Chromium/Chrome binary path to override auto-detection
   extra_launch_args: []     # NOTE: --no-sandbox / --disable-web-security are rejected
   screenshot_dir: null      # default: sessions/<id>/browser-screenshots
+  cdp_endpoint: null        # e.g. "http://127.0.0.1:9222" to attach to your real Chrome (defeats anti-bot)
 
 output_dir: output

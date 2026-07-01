@@ -368,6 +368,12 @@ pub struct BrowserConfig {
     pub extra_launch_args: Vec<String>,
     #[serde(default)]
     pub screenshot_dir: Option<String>,
+    /// If set, attach to an already-running Chrome at this CDP endpoint
+    /// (e.g. "http://127.0.0.1:9222") instead of launching a new browser.
+    /// Attach reuses the user's real profile/login state and defeats strong
+    /// anti-bot fingerprinting that would block a launched automation browser.
+    #[serde(default)]
+    pub cdp_endpoint: Option<String>,
 }
 
 fn default_headless() -> bool {
@@ -395,7 +401,7 @@ impl Default for BrowserConfig {
             ignore_https_errors: true,
             executable_path: None,
             extra_launch_args: Vec::new(),
-            screenshot_dir: None,
+            screenshot_dir: None, cdp_endpoint: None,
         }
     }
 }
@@ -476,7 +482,7 @@ impl Default for HolmesConfig {
                 ignore_https_errors: true,
                 executable_path: None,
                 extra_launch_args: Vec::new(),
-                screenshot_dir: None,
+                screenshot_dir: None, cdp_endpoint: None,
             },
             output_dir: "output".into(),
         }
@@ -500,7 +506,7 @@ mod tests {
             ignore_https_errors: true,
             executable_path: Some("/usr/bin/chromium".into()),
             extra_launch_args: vec!["--lang=en".into()],
-            screenshot_dir: None,
+            screenshot_dir: None, cdp_endpoint: None,
         };
         let yaml = serde_json::to_string(&cfg).unwrap();
         let back: BrowserConfig = serde_json::from_str(&yaml).unwrap();
