@@ -4,7 +4,10 @@ use crate::chat::{
     run_runtime_input_with_sink, save_config, truncate_chars, ChatContext, ChatStartup,
 };
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
@@ -49,7 +52,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter(stdout: &mut Stdout) -> anyhow::Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen, Hide)?;
+        execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -58,7 +61,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();
-        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
     }
 }
 
@@ -193,9 +196,16 @@ impl TuiApp {
         self.render(stdout)?;
         while !self.exit_requested {
             if event::poll(Duration::from_millis(120))? {
-                if let TerminalEvent::Key(key) = event::read()? {
-                    self.handle_key(key, stdout).await?;
-                    self.render(stdout)?;
+                match event::read()? {
+                    TerminalEvent::Key(key) => {
+                        self.handle_key(key, stdout).await?;
+                        self.render(stdout)?;
+                    }
+                    TerminalEvent::Mouse(ev) => {
+                        self.handle_mouse(ev);
+                        self.render(stdout)?;
+                    }
+                    _ => {}
                 }
             } else if self.busy {
                 self.render(stdout)?;
@@ -203,6 +213,17 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    /// Mouse wheel → scroll the chat viewport. Wheel up looks at older history
+    /// (increase the offset from the bottom); wheel down returns toward the
+    /// newest. Same direction as PgUp/PgDn, finer step.
+    fn handle_mouse(&mut self, ev: MouseEvent) {
+        match ev.kind {
+            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
+            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
+            _ => {}
+        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent, stdout: &mut Stdout) -> anyhow::Result<()> {

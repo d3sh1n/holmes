@@ -74,7 +74,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                // Default `warn`, but silence chromiumoxide's noisy CDP stream:
+                // Chrome 149 emits event variants the chromiumoxide 0.9 schema
+                // can't deserialize, so it logs a WARN per ignored message and
+                // floods the TUI on heavy SPA pages. Drop that crate to ERROR.
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("warn,chromiumoxide=error")
+                }),
         )
         .init();
 
