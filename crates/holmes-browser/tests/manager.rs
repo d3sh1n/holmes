@@ -100,3 +100,49 @@ async fn screenshot_writes_png_file() {
     assert!(shot.path.extension().and_then(|e| e.to_str()) == Some("png"));
     mgr.close().await;
 }
+
+#[tokio::test]
+#[ignore = "real network + Chromium; run with: cargo test -p holmes-browser xiaohongshu -- --ignored"]
+async fn xiaohongshu_smoke() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = enabled_config();
+    cfg.timeout = 60; // real site may be slow (redirects, JS)
+    cfg.screenshot_dir = Some(tmp.path().join("shots").to_string_lossy().to_string());
+    let mgr = BrowserManager::new("xhs-smoke", tmp.path(), cfg).unwrap();
+
+    let snap = mgr
+        .navigate("https://www.xiaohongshu.com")
+        .await
+        .expect("navigate should not time out / error");
+    println!("XHS url after navigate: {}", snap.url);
+    println!("XHS title: {}", snap.title);
+    println!("XHS body excerpt (first 400 chars):");
+    let head: String = snap.text_excerpt.chars().take(400).collect();
+    println!("{head}");
+
+    let shot = mgr.screenshot(true).await.expect("screenshot");
+    println!("XHS screenshot saved: {}", shot.path.display());
+    assert!(shot.path.exists(), "screenshot file missing");
+
+    let body = mgr.get_content(None).await.expect("get_content");
+    println!("XHS get_content length: {}", body.len());
+
+    assert!(mgr.is_launched().await);
+    assert!(
+        !body.trim().is_empty(),
+        "page body should not be empty after navigate"
+    );
+    mgr.close().await;
+}
+
+#[tokio::test]
+#[ignore = "real network; confirms browser works against a normal HTTPS site"]
+async fn real_site_example_com_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = enabled_config();
+    let mgr = BrowserManager::new("example-com", tmp.path(), cfg).unwrap();
+    let snap = mgr.navigate("https://example.com").await.expect("navigate");
+    println!("url: {} | title: {}", snap.url, snap.title);
+    assert!(snap.text_excerpt.contains("Example Domain"), "body: {}", snap.text_excerpt);
+    mgr.close().await;
+}
