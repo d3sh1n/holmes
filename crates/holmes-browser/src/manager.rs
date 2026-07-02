@@ -43,6 +43,13 @@ struct ManagerState {
     owned: bool,
 }
 
+/// Max wait for a cached-page liveness probe before treating the CDP
+/// connection as dead and relaunching. The background handler task can die
+/// (browser crash, socket drop, anti-bot kill) and leave a stale page handle;
+/// this probe lets us detect that and recover instead of failing forever with
+/// "receiver gone".
+const LIVENESS_PROBE: Duration = Duration::from_millis(1000);
+
 impl BrowserManager {
     pub fn new(
         session_id: &str,
@@ -75,10 +82,26 @@ impl BrowserManager {
     }
 
     async fn ensure_launched(&self) -> Result<Arc<Page>> {
-        let mut state = self.state.lock().await;
-        if let Some(page) = state.page.clone() {
-            return Ok(page);
+        // Fast path: a cached page is only usable if its CDP handler is still
+        // alive. If the background handler task died, every action would fail
+        // with "receiver gone" and the agent's retries could never recover.
+        // Probe the cached page cheaply; on failure discard the stale handle
+        // and fall through to a fresh launch (same per-session profile, so any
+        // manual login survives the relaunch).
+        if let Some(page) = self.state.lock().await.page.clone() {
+            let alive = tokio::time::timeout(LIVENESS_PROBE, page.evaluate("1"))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            if alive {
+                return Ok(page);
+            }
+            let mut state = self.state.lock().await;
+            state.page = None;
+            state.browser = None;
         }
+
+        let mut state = self.state.lock().await;
 
         // Decide attach-vs-launch. Attaching reuses the user's real Chrome
         // (profile, login, fingerprint) and defeats strong anti-bot systems
