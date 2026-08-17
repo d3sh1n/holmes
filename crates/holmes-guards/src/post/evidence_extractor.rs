@@ -10,6 +10,12 @@ pub struct EvidenceExtractor {
     object_id_re: Regex,
 }
 
+impl Default for EvidenceExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EvidenceExtractor {
     pub fn new() -> Self {
         Self {
@@ -53,7 +59,7 @@ impl PostGuard for EvidenceExtractor {
         for cap in self.object_id_re.captures_iter(content) {
             let id_value = cap[1].to_string();
             let path = cap[0]
-                .split(|c: char| c == ':' || c == '=')
+                .split([':', '='])
                 .next()
                 .unwrap_or("id")
                 .trim()
@@ -113,7 +119,7 @@ mod tests {
         let mut state = make_state();
         let result = ToolResult::success("1", "http_request", "user_id: 42\norder_id: 100");
         guard.process(&make_call(), &result, &mut state).await;
-        assert!(state.evidence_bundle().object_refs.len() >= 1);
+        assert!(!state.evidence_bundle().object_refs.is_empty());
     }
 
     #[tokio::test]

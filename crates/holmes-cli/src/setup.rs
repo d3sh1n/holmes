@@ -111,7 +111,6 @@ pub fn run_setup(data_dir: &PathBuf) -> anyhow::Result<()> {
                 model,
                 api_format: provider.api_format.clone(),
                 priority: 0,
-                max_retries: 3,
                 rpm_limit: 50,
             }],
             roles: holmes_core::config::RoleConfig {
@@ -121,6 +120,9 @@ pub fn run_setup(data_dir: &PathBuf) -> anyhow::Result<()> {
                 skill_evolver: provider.name.to_string(),
                 goal_evaluator: provider.name.to_string(),
             },
+            stream: false,
+            thinking_budget: 0,
+            ..HolmesConfig::default().llm
         },
         ..HolmesConfig::default()
     };
@@ -448,14 +450,7 @@ fn sort_models(models: Vec<String>, default_model: &str) -> Vec<String> {
 }
 
 fn truncate_for_setup(content: &str, max_bytes: usize) -> &str {
-    if content.len() <= max_bytes {
-        return content;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    &content[..end]
+    holmes_core::truncate_str(content, max_bytes)
 }
 
 /// Filter to likely chat-capable models (filter out embedding, tts, dall-e, etc.)

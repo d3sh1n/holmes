@@ -44,7 +44,8 @@ impl ReflectionEngine {
             RuntimeErrorKind::NeedsUser => ReflectionOutcome::NeedsUser(error.message.clone()),
             RuntimeErrorKind::Recoverable
             | RuntimeErrorKind::Fatal
-            | RuntimeErrorKind::ContextOverflow => ReflectionOutcome::RuntimeError {
+            | RuntimeErrorKind::ContextOverflow
+            | RuntimeErrorKind::Cancelled => ReflectionOutcome::RuntimeError {
                 kind: error.kind.clone(),
                 message: error.message.clone(),
             },

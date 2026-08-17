@@ -1,12 +1,15 @@
 pub mod protocol;
 pub mod transport;
 
-use anyhow::{Context, Result};
-use holmes_core::config::McpServerConfig;
-use holmes_core::{FunctionDefinition, ToolDefinition};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use holmes_core::config::McpServerConfig;
+use holmes_core::execution_context::ExecutionContext;
+use holmes_core::{FunctionDefinition, ToolDefinition};
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -21,17 +24,22 @@ pub struct McpToolProvider {
 }
 
 struct McpServer {
+    /// Kept so a terminated stdio transport can be restarted (P1-01): after a
+    /// cancelled/timed-out call kills the server, the next call respawns it and
+    /// redoes the handshake instead of reusing a broken pipe.
+    cfg: McpServerConfig,
+    request_timeout: Duration,
     transport: McpTransport,
     tools: Vec<ToolDefinition>,
 }
 
 impl McpToolProvider {
-    pub async fn from_config(configs: &[McpServerConfig]) -> Self {
+    pub async fn from_config(configs: &[McpServerConfig], request_timeout: Duration) -> Self {
         let mut servers = Vec::new();
         let mut tool_to_server = HashMap::new();
 
         for cfg in configs {
-            match Self::connect_server(cfg).await {
+            match Self::connect_server(cfg, request_timeout).await {
                 Ok(server) => {
                     let server_idx = servers.len();
                     for tool in &server.tools {
@@ -52,7 +60,7 @@ impl McpToolProvider {
         }
     }
 
-    async fn connect_server(cfg: &McpServerConfig) -> Result<McpServer> {
+    async fn connect_server(cfg: &McpServerConfig, request_timeout: Duration) -> Result<McpServer> {
         use holmes_core::config::McpTransport as CfgTransport;
         let mut transport = match cfg.transport {
             CfgTransport::Stdio => {
@@ -65,19 +73,32 @@ impl McpToolProvider {
             }
             CfgTransport::Http => {
                 let url = cfg.url.as_deref().context("http transport requires url")?;
-                McpTransport::Http(HttpTransport::new(url.to_string()))
+                McpTransport::Http(HttpTransport::new(
+                    url.to_string(),
+                    // connect / read / total — explicit per AGT-002.
+                    request_timeout.min(Duration::from_secs(10)),
+                    request_timeout,
+                    request_timeout,
+                ))
             }
         };
 
+        // The handshake is bounded by the same request timeout: a server that accepts
+        // the connection but never answers initialize must not hang startup.
         let init_req = JsonRpcRequest::initialize(1);
-        let _init_resp = transport.send(&init_req).await?;
+        let _init_resp = transport.send(&init_req, request_timeout).await?;
 
         let list_req = JsonRpcRequest::tools_list(2);
-        let list_resp = transport.send(&list_req).await?;
+        let list_resp = transport.send(&list_req, request_timeout).await?;
 
         let tools = Self::parse_tools_list(list_resp.result)?;
 
-        Ok(McpServer { transport, tools })
+        Ok(McpServer {
+            cfg: cfg.clone(),
+            request_timeout,
+            transport,
+            tools,
+        })
     }
 
     fn parse_tools_list(result: Option<Value>) -> Result<Vec<ToolDefinition>> {
@@ -123,15 +144,34 @@ impl McpToolProvider {
         self.tool_to_server.contains_key(name)
     }
 
-    pub async fn execute(&mut self, tool_name: &str, arguments: Value) -> Result<String> {
+    pub async fn execute(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Result<String> {
         let idx = *self
             .tool_to_server
             .get(tool_name)
             .context(format!("MCP tool not found: {tool_name}"))?;
         let server = &mut self.servers[idx];
 
+        // P1-01: a stdio transport killed after a cancelled/timed-out call is never
+        // reused — restart the server and redo the handshake so the next call gets a
+        // fresh, in-sync pipe instead of a stale-response read.
+        if matches!(&server.transport, McpTransport::Stdio(t) if !t.is_alive()) {
+            info!(
+                server = %server.cfg.name,
+                "MCP stdio transport was terminated; restarting before the next call"
+            );
+            let fresh = Self::connect_server(&server.cfg, server.request_timeout)
+                .await
+                .context("restarting terminated MCP server")?;
+            server.transport = fresh.transport;
+        }
+
         let req = JsonRpcRequest::tools_call(3, tool_name, arguments);
-        let resp = server.transport.send(&req).await?;
+        let resp = server.transport.send(&req, timeout).await?;
 
         if let Some(err) = resp.error {
             anyhow::bail!("MCP error {}: {}", err.code, err.message);
@@ -144,12 +184,16 @@ impl McpToolProvider {
     }
 }
 
-pub async fn register_mcp_tools(registry: &mut ToolRegistry, configs: &[McpServerConfig]) -> usize {
+pub async fn register_mcp_tools(
+    registry: &mut ToolRegistry,
+    configs: &[McpServerConfig],
+    request_timeout: Duration,
+) -> usize {
     if configs.is_empty() {
         return 0;
     }
 
-    let provider = McpToolProvider::from_config(configs).await;
+    let provider = McpToolProvider::from_config(configs, request_timeout).await;
     let definitions = provider.definitions();
     let provider = Arc::new(Mutex::new(provider));
     let count = definitions.len();
@@ -159,6 +203,7 @@ pub async fn register_mcp_tools(registry: &mut ToolRegistry, configs: &[McpServe
             name: definition.function.name.clone(),
             definition,
             provider: provider.clone(),
+            request_timeout,
         }));
     }
 
@@ -169,6 +214,7 @@ struct McpTool {
     name: String,
     definition: ToolDefinition,
     provider: Arc<Mutex<McpToolProvider>>,
+    request_timeout: Duration,
 }
 
 #[async_trait::async_trait]
@@ -186,12 +232,90 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, args: &str) -> Result<String> {
+        self.execute_with_context(args, &ExecutionContext::default())
+            .await
+    }
+
+    async fn execute_with_context(&self, args: &str, ctx: &ExecutionContext) -> Result<String> {
         let arguments =
             serde_json::from_str::<Value>(args).unwrap_or_else(|_| Value::String(args.into()));
+        // The configured per-request timeout, further capped by the turn boundary.
+        let timeout = ctx.effective_deadline(Some(self.request_timeout));
         self.provider
             .lock()
             .await
-            .execute(&self.name, arguments)
+            .execute(&self.name, arguments, timeout)
             .await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Canned JSON-RPC response carrying a one-tool `tools/list` result; used for
+    /// initialize/tools-list/tools-call alike (the provider only parses the list).
+    /// `%ID%` is replaced with the request's own id — responses must echo the
+    /// request id or the transport refuses them (P1-14).
+    const RESP: &str = r#"{"jsonrpc":"2.0","id":%ID%,"result":{"tools":[{"name":"t","description":"d","inputSchema":{}}]}}"#;
+
+    fn stdio_config(script: String) -> McpServerConfig {
+        McpServerConfig {
+            name: "stub".into(),
+            transport: holmes_core::config::McpTransport::Stdio,
+            command: Some("sh".into()),
+            args: Some(vec!["-c".into(), script]),
+            url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminated_stdio_transport_is_restarted_on_next_call() {
+        // P1-01 acceptance: after a cancelled/timed-out call kills the stdio server,
+        // the next call respawns it (fresh handshake) instead of reading a stale
+        // response off the broken pipe. The stub answers every line EXCEPT the first
+        // process's third line (the first tools/call), which hangs until killed.
+        let dir = tempfile::tempdir().unwrap();
+        let flag = dir.path().join("hung-once");
+        let script = format!(
+            r#"flag="{flag}"
+n=0
+while IFS= read -r line; do
+  n=$((n+1))
+  if [ ! -f "$flag" ] && [ "$n" -eq 3 ]; then
+    touch "$flag"
+    sleep 300
+  fi
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  echo '{RESP}' | sed "s/%ID%/${{id:-1}}/"
+done
+"#,
+            flag = flag.display(),
+            RESP = RESP
+        );
+        let configs = vec![stdio_config(script)];
+        let mut provider = McpToolProvider::from_config(&configs, Duration::from_millis(300)).await;
+        assert!(provider.has_tool("t"), "handshake listed the stub tool");
+
+        // First call hits the wedged third line: the deadline kills the transport.
+        let start = std::time::Instant::now();
+        let err = provider
+            .execute("t", serde_json::json!({}), Duration::from_millis(300))
+            .await
+            .expect_err("wedged first call must time out");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "bounded by deadline, took {:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("terminated"), "got: {err}");
+
+        // The next call restarts the transport: fresh process, fresh handshake,
+        // and this server answers the call.
+        let out = provider
+            .execute("t", serde_json::json!({}), Duration::from_secs(5))
+            .await
+            .expect("dead transport restarted on next call");
+        assert!(out.contains("tools"), "fresh response, got: {out}");
     }
 }

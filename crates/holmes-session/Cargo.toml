@@ -2,6 +2,9 @@
 name = "holmes-session"
 version = "0.1.0"
 edition = "2021"
+# Internal workspace crate: never published to a registry (cargo-deny treats
+# publish = false crates as private and skips their license check).
+publish = false
 
 [dependencies]
 holmes-core = { path = "../holmes-core" }
@@ -15,6 +18,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
 rand = "0.8"
 
 [dev-dependencies]

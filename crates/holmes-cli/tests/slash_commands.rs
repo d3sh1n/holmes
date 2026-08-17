@@ -15,6 +15,7 @@ fn test_all_commands_registered() {
     assert_eq!(registry.resolve("reset"), Some("new"));
     assert_eq!(registry.resolve("resume"), Some("resume"));
     assert_eq!(registry.resolve("sessions"), Some("sessions"));
+    assert_eq!(registry.resolve("ledger"), Some("ledger"));
     assert_eq!(registry.resolve("history"), Some("sessions"));
     assert_eq!(registry.resolve("branch"), Some("branch"));
     assert_eq!(registry.resolve("fork"), Some("branch"));
@@ -26,7 +27,6 @@ fn test_all_commands_registered() {
     assert_eq!(registry.resolve("config"), Some("config"));
     assert_eq!(registry.resolve("tools"), Some("tools"));
     assert_eq!(registry.resolve("workflows"), Some("workflows"));
-    assert_eq!(registry.resolve("dashboard"), Some("dashboard"));
     assert_eq!(registry.resolve("usage"), Some("usage"));
     assert_eq!(registry.resolve("save"), Some("save"));
     assert_eq!(registry.resolve("export"), Some("save"));

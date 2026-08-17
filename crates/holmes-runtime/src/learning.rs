@@ -1,10 +1,11 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::truncate_str;
-use holmes_core::types::MemoryCategory;
-use holmes_session::memory_store::MemoryEntry;
+use holmes_core::types::{MemoryCategory, MemorySource, MemoryStatus};
+use holmes_session::memory_store::{MemoryEntry, StoreError};
 
 use crate::context::RuntimeContext;
 use crate::deliberation::RuntimeError;
+use crate::memory::store_transition_error;
 
 const MAX_CANDIDATE_CONTENT_BYTES: usize = 800;
 
@@ -29,6 +30,9 @@ pub struct MemoryCandidate {
     pub content: String,
     pub tags: Vec<String>,
     pub relevance_score: f64,
+    /// Provenance. Agent-inferred candidates may only enter long-term memory
+    /// as staged; user/tool-originated candidates may activate directly.
+    pub source: MemorySource,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,27 +59,52 @@ impl LearningEngine {
         let mut candidates = Vec::new();
         let max_candidates = context.config.learning.max_candidates_per_turn;
         for event in turn_events {
-            let Event::UserMessage { content, .. } = &event.event else {
-                continue;
-            };
-            if !looks_like_watson_correction(content) {
-                continue;
-            }
+            match &event.event {
+                Event::UserMessage { content, .. } => {
+                    if !looks_like_watson_correction(content) {
+                        continue;
+                    }
 
-            let content = format!(
-                "Watson preference or correction: {}",
-                truncate_str(content.trim(), MAX_CANDIDATE_CONTENT_BYTES)
-            );
-            candidates.push(LearningCandidate::Memory(MemoryCandidate {
-                category: MemoryCategory::TargetKnowledge,
-                content,
-                tags: vec![
-                    "learning".into(),
-                    "watson_correction".into(),
-                    "preference".into(),
-                ],
-                relevance_score: 0.86,
-            }));
+                    let content = format!(
+                        "Watson preference or correction: {}",
+                        truncate_str(content.trim(), MAX_CANDIDATE_CONTENT_BYTES)
+                    );
+                    // User-originated: may activate directly (subject to the
+                    // optional write-approval config).
+                    candidates.push(LearningCandidate::Memory(MemoryCandidate {
+                        category: MemoryCategory::TargetKnowledge,
+                        content,
+                        tags: vec![
+                            "learning".into(),
+                            "watson_correction".into(),
+                            "preference".into(),
+                        ],
+                        relevance_score: 0.86,
+                        source: MemorySource::User,
+                    }));
+                }
+                // A verified-satisfied goal yields a skill candidate
+                // (AGT-012). Skill candidates are agent inferences and always
+                // stay staged until validated and approved.
+                Event::GoalEvaluated {
+                    satisfied: true,
+                    reason,
+                    ..
+                } if context.config.learning.skill_extraction && reason.contains("[verified") => {
+                    let content = format!(
+                        "Skill candidate from verified goal completion: {}",
+                        truncate_str(reason.trim(), MAX_CANDIDATE_CONTENT_BYTES)
+                    );
+                    candidates.push(LearningCandidate::Memory(MemoryCandidate {
+                        category: MemoryCategory::Skill,
+                        content,
+                        tags: vec!["learning".into(), "skill".into(), "verified_goal".into()],
+                        relevance_score: 0.8,
+                        source: MemorySource::AgentInferred,
+                    }));
+                }
+                _ => continue,
+            }
 
             if candidates.len() >= max_candidates {
                 break;
@@ -84,6 +113,16 @@ impl LearningEngine {
 
         let trigger = if candidates.is_empty() {
             String::new()
+        } else if candidates.iter().any(|candidate| {
+            matches!(
+                candidate,
+                LearningCandidate::Memory(MemoryCandidate {
+                    category: MemoryCategory::Skill,
+                    ..
+                })
+            )
+        }) {
+            "verified_goal".into()
         } else {
             "watson_correction".into()
         };
@@ -91,7 +130,7 @@ impl LearningEngine {
             String::new()
         } else {
             format!(
-                "Detected {} learnable Watson correction/preference signal(s).",
+                "Detected {} learnable signal(s) (Watson corrections and/or verified goals).",
                 candidates.len()
             )
         };
@@ -143,44 +182,85 @@ impl LearningEngine {
                         continue;
                     }
 
-                    if context.config.learning.memory_write_approval {
-                        record_learning_event(
-                            context,
-                            Event::MemoryWriteStaged {
-                                content: candidate.content,
-                                reason: review.rationale.clone(),
-                            },
-                        )
-                        .await?;
-                        application.staged += 1;
+                    // Agent inferences and skills may only ever be staged
+                    // (AGT-012); user/tool-originated candidates activate
+                    // directly unless write approval is configured.
+                    let must_stage = matches!(candidate.category, MemoryCategory::Skill)
+                        || matches!(candidate.source, MemorySource::AgentInferred)
+                        || context.config.learning.memory_write_approval;
+                    let is_user_correction = matches!(candidate.source, MemorySource::User);
+
+                    let status = if must_stage {
+                        MemoryStatus::Staged
                     } else {
-                        let entry = MemoryEntry {
-                            category: candidate.category.clone(),
-                            content: candidate.content.clone(),
-                            tags: candidate.tags.clone(),
-                            attack_type: None,
-                            tech_stack: Vec::new(),
-                            success: true,
-                            relevance_score: candidate.relevance_score,
-                            source_session_id: Some(context.session_id.clone()),
-                        };
-                        context.memory_store.store(entry).await.map_err(|error| {
-                            RuntimeError::recoverable(format!(
+                        MemoryStatus::Active
+                    };
+                    let entry = MemoryEntry {
+                        category: candidate.category.clone(),
+                        content: candidate.content.clone(),
+                        tags: candidate.tags.clone(),
+                        success: true,
+                        relevance_score: candidate.relevance_score,
+                        source_session_id: Some(context.session_id.clone()),
+                        source: candidate.source,
+                        status: Some(status),
+                        ..Default::default()
+                    };
+                    let stored = context.memory_store.store(entry).await;
+                    match stored {
+                        Ok(_outcome) if must_stage => {
+                            let metrics = holmes_core::metrics::metrics();
+                            metrics.count("memory.learning.staged");
+                            if is_user_correction {
+                                metrics.count("memory.learning.user_correction");
+                            }
+                            record_learning_event(
+                                context,
+                                Event::MemoryWriteStaged {
+                                    content: candidate.content,
+                                    reason: review.rationale.clone(),
+                                },
+                            )
+                            .await?;
+                            application.staged += 1;
+                        }
+                        Ok(_outcome) => {
+                            let metrics = holmes_core::metrics::metrics();
+                            metrics.count("memory.learning.applied");
+                            if is_user_correction {
+                                metrics.count("memory.learning.user_correction");
+                            }
+                            record_learning_event(
+                                context,
+                                Event::MemoryStored {
+                                    category: candidate.category,
+                                    content: candidate.content,
+                                    tags: candidate.tags,
+                                    relevance_score: candidate.relevance_score,
+                                    source_session_id: Some(context.session_id.clone()),
+                                },
+                            )
+                            .await?;
+                            application.applied += 1;
+                        }
+                        Err(StoreError::Rejected(reason)) => {
+                            // Store-level screening caught what the candidate
+                            // filter missed; audited as a rejection.
+                            record_learning_event(
+                                context,
+                                Event::LearningCandidateRejected {
+                                    kind: "memory".into(),
+                                    reason,
+                                },
+                            )
+                            .await?;
+                            application.rejected += 1;
+                        }
+                        Err(error) => {
+                            return Err(RuntimeError::recoverable(format!(
                                 "failed to store learned memory: {error}"
-                            ))
-                        })?;
-                        record_learning_event(
-                            context,
-                            Event::MemoryStored {
-                                category: candidate.category,
-                                content: candidate.content,
-                                tags: candidate.tags,
-                                relevance_score: candidate.relevance_score,
-                                source_session_id: Some(context.session_id.clone()),
-                            },
-                        )
-                        .await?;
-                        application.applied += 1;
+                            )));
+                        }
                     }
                 }
             }
@@ -195,6 +275,41 @@ impl LearningEngine {
             },
         )
         .await?;
+
+        // `learning.skill_write_approval = false` automates the approval half of
+        // the AGT-012 gate: staged skills that already carry a recorded passed
+        // validation promote without waiting for a manual approver. The
+        // validation requirement itself is not configurable.
+        if !context.config.learning.skill_write_approval {
+            let promotable = context
+                .memory_store
+                .staged_validated_skills()
+                .await
+                .map_err(|error| {
+                    RuntimeError::recoverable(format!(
+                        "failed to list staged validated skills: {error}"
+                    ))
+                })?;
+            for skill in promotable {
+                context
+                    .memory_store
+                    .promote(&skill.id, "auto:learning.skill_write_approval=false")
+                    .await
+                    .map_err(store_transition_error)?;
+                record_learning_event(
+                    context,
+                    Event::MemoryStatusChanged {
+                        memory_id: skill.id.clone(),
+                        from_status: "staged".into(),
+                        to_status: "active".into(),
+                        reason:
+                            "auto-approved (learning.skill_write_approval=false); validation passed"
+                                .into(),
+                    },
+                )
+                .await?;
+            }
+        }
 
         Ok(application)
     }
@@ -337,39 +452,10 @@ fn looks_like_turn_scoped_instruction(normalized: &str) -> bool {
 }
 
 fn reject_memory_candidate(candidate: &MemoryCandidate) -> Option<String> {
-    if looks_like_secret(&candidate.content) {
-        return Some("candidate appears to contain a secret or credential".into());
-    }
-
-    if looks_like_prompt_injection(&candidate.content) {
-        return Some("candidate appears to contain prompt-injection instructions".into());
-    }
-
-    None
-}
-
-fn looks_like_secret(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    lower.contains("-----begin ")
-        || lower.contains("password=")
-        || lower.contains("password:")
-        || lower.contains("api_key=")
-        || lower.contains("apikey=")
-        || lower.contains("access_token=")
-        || lower.contains("secret_key=")
-        || lower.contains("bearer ")
-        || content.contains("sk-")
-        || content.contains("ghp_")
-}
-
-fn looks_like_prompt_injection(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    lower.contains("ignore previous instructions")
-        || lower.contains("ignore all previous instructions")
-        || lower.contains("disregard previous instructions")
-        || lower.contains("reveal your system prompt")
-        || lower.contains("treat this as system")
-        || lower.contains("developer message")
+    // Shared screening (holmes-core): secrets, credentials and prompt
+    // injection never reach long-term memory. The store re-screens at the
+    // write boundary as defense in depth.
+    holmes_core::screen_sensitive(&candidate.content)
 }
 
 fn normalize_text(content: &str) -> String {
@@ -416,9 +502,9 @@ mod tests {
 
         assert_eq!(review.candidates.len(), 1);
         assert_eq!(review.trigger, "watson_correction");
-        let LearningCandidate::Memory(candidate) = &review.candidates[0] else {
-            panic!("memory candidate expected");
-        };
+        // LearningCandidate currently has a single variant, so this binding is
+        // irrefutable; reintroduce a check when more variants are added.
+        let LearningCandidate::Memory(candidate) = &review.candidates[0];
         assert!(candidate.content.contains("HEAD before GET"));
     }
 
@@ -468,6 +554,7 @@ mod tests {
                 content: "Watson preference or correction: Remember to prefer safe probes.".into(),
                 tags: vec!["learning".into()],
                 relevance_score: 0.86,
+                source: MemorySource::User,
             })],
             rationale: "test".into(),
             trigger: "watson_correction".into(),
@@ -486,12 +573,21 @@ mod tests {
                 rejected: 0,
             }
         );
+        // The staged candidate is persisted (so it can later be validated and
+        // promoted) but is invisible to turn-time recall.
         let memories = context
             .memory_store
             .search("safe probes", 3)
             .await
             .expect("search");
-        assert!(memories.is_empty());
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].status, MemoryStatus::Staged);
+        let recalled = context
+            .memory_store
+            .recall("safe probes", 3, true, None)
+            .await
+            .expect("recall");
+        assert!(recalled.hits.is_empty());
 
         let events = context
             .session_db
@@ -506,6 +602,212 @@ mod tests {
             .any(|event| matches!(event.event, Event::LearningReviewCompleted { .. })));
     }
 
+    #[test]
+    fn verified_goal_creates_staged_skill_candidate() {
+        let context = make_context_sync(HolmesConfig::default());
+        let events = vec![StoredEvent {
+            id: 1,
+            session_id: "session-1".into(),
+            event_index: 0,
+            turn_index: None,
+            timestamp: chrono::Utc::now(),
+            event: Event::GoalEvaluated {
+                satisfied: true,
+                reason: "Goal achieved. [verified; evidence: login-bypass]".into(),
+                turn_count: 3,
+                tokens_spent: 1200,
+            },
+        }];
+
+        let review = LearningEngine::new().review_turn(&context, &events);
+
+        assert_eq!(review.candidates.len(), 1);
+        assert_eq!(review.trigger, "verified_goal");
+        let LearningCandidate::Memory(candidate) = &review.candidates[0];
+        assert_eq!(candidate.category, MemoryCategory::Skill);
+        assert_eq!(candidate.source, MemorySource::AgentInferred);
+    }
+
+    #[test]
+    fn unverified_goal_creates_no_skill_candidate() {
+        let context = make_context_sync(HolmesConfig::default());
+        let events = vec![StoredEvent {
+            id: 1,
+            session_id: "session-1".into(),
+            event_index: 0,
+            turn_index: None,
+            timestamp: chrono::Utc::now(),
+            event: Event::GoalEvaluated {
+                satisfied: true,
+                reason: "The model claims the goal is done.".into(),
+                turn_count: 3,
+                tokens_spent: 1200,
+            },
+        }];
+
+        let review = LearningEngine::new().review_turn(&context, &events);
+        assert!(review.candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_inferred_candidate_is_staged_even_without_approval_config() {
+        let mut context = make_context(HolmesConfig::default()).await;
+        let review = LearningReview {
+            candidates: vec![LearningCandidate::Memory(MemoryCandidate {
+                category: MemoryCategory::Skill,
+                content: "Skill candidate from verified goal completion: enumerate then fuzz."
+                    .into(),
+                tags: vec!["learning".into(), "skill".into()],
+                relevance_score: 0.8,
+                source: MemorySource::AgentInferred,
+            })],
+            rationale: "test".into(),
+            trigger: "verified_goal".into(),
+        };
+
+        let application = LearningEngine::new()
+            .apply_review(&mut context, review)
+            .await
+            .expect("apply review");
+
+        assert_eq!(application.staged, 1);
+        assert_eq!(application.applied, 0);
+        let memories = context
+            .memory_store
+            .search("enumerate then fuzz", 3)
+            .await
+            .expect("search");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].status, MemoryStatus::Staged);
+        assert_eq!(memories[0].category, MemoryCategory::Skill);
+        // Unvalidated skill cannot be promoted — the production-skill gate.
+        assert!(context
+            .memory_store
+            .promote(&memories[0].id, "watson")
+            .await
+            .is_err());
+    }
+
+    /// Seed a staged skill with a recorded passed validation and return its id.
+    async fn seed_validated_staged_skill(context: &RuntimeContext, content: &str) -> String {
+        let outcome = context
+            .memory_store
+            .store(MemoryEntry {
+                category: MemoryCategory::Skill,
+                content: content.into(),
+                tags: vec!["learning".into(), "skill".into()],
+                success: true,
+                relevance_score: 0.8,
+                source_session_id: Some(context.session_id.clone()),
+                source: MemorySource::AgentInferred,
+                status: Some(MemoryStatus::Staged),
+                ..Default::default()
+            })
+            .await
+            .expect("seed skill");
+        context
+            .memory_store
+            .record_validation(&outcome.id, true)
+            .await
+            .expect("record validation");
+        outcome.id
+    }
+
+    fn empty_review() -> LearningReview {
+        LearningReview {
+            candidates: Vec::new(),
+            rationale: "interval review".into(),
+            trigger: "verified_goal".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_write_approval_off_auto_promotes_validated_skill() {
+        let mut config = HolmesConfig::default();
+        config.learning.skill_write_approval = false;
+        let mut context = make_context(config).await;
+        let skill_id = seed_validated_staged_skill(&context, "enumerate then fuzz").await;
+
+        LearningEngine::new()
+            .apply_review(&mut context, empty_review())
+            .await
+            .expect("apply review");
+
+        let memory = context
+            .memory_store
+            .get(&skill_id)
+            .await
+            .expect("get")
+            .expect("skill exists");
+        assert_eq!(memory.status, MemoryStatus::Active);
+        let events = context
+            .session_db
+            .get_events(&context.session_id)
+            .await
+            .expect("events");
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::MemoryStatusChanged { memory_id, to_status, .. }
+                if memory_id == &skill_id && to_status == "active"
+        )));
+    }
+
+    #[tokio::test]
+    async fn skill_write_approval_on_keeps_validated_skill_staged() {
+        // Default: approval is manual — validation alone never activates a skill.
+        let mut context = make_context(HolmesConfig::default()).await;
+        let skill_id = seed_validated_staged_skill(&context, "enumerate then fuzz").await;
+
+        LearningEngine::new()
+            .apply_review(&mut context, empty_review())
+            .await
+            .expect("apply review");
+
+        let memory = context
+            .memory_store
+            .get(&skill_id)
+            .await
+            .expect("get")
+            .expect("skill exists");
+        assert_eq!(memory.status, MemoryStatus::Staged);
+    }
+
+    #[tokio::test]
+    async fn skill_write_approval_off_never_promotes_unvalidated_skill() {
+        // The validation half of the AGT-012 gate is not configurable.
+        let mut config = HolmesConfig::default();
+        config.learning.skill_write_approval = false;
+        let mut context = make_context(config).await;
+        let outcome = context
+            .memory_store
+            .store(MemoryEntry {
+                category: MemoryCategory::Skill,
+                content: "unvalidated skill".into(),
+                tags: vec!["learning".into(), "skill".into()],
+                success: true,
+                relevance_score: 0.8,
+                source_session_id: Some(context.session_id.clone()),
+                source: MemorySource::AgentInferred,
+                status: Some(MemoryStatus::Staged),
+                ..Default::default()
+            })
+            .await
+            .expect("seed skill");
+
+        LearningEngine::new()
+            .apply_review(&mut context, empty_review())
+            .await
+            .expect("apply review");
+
+        let memory = context
+            .memory_store
+            .get(&outcome.id)
+            .await
+            .expect("get")
+            .expect("skill exists");
+        assert_eq!(memory.status, MemoryStatus::Staged);
+    }
+
     #[tokio::test]
     async fn secret_like_memory_candidate_is_rejected() {
         let mut context = make_context(HolmesConfig::default()).await;
@@ -515,6 +817,7 @@ mod tests {
                 content: "Watson preference or correction: remember password=hunter2".into(),
                 tags: vec!["learning".into()],
                 relevance_score: 0.86,
+                source: MemorySource::User,
             })],
             rationale: "test".into(),
             trigger: "watson_correction".into(),
@@ -557,11 +860,10 @@ mod tests {
                 category: MemoryCategory::TargetKnowledge,
                 content: content.into(),
                 tags: vec!["learning".into()],
-                attack_type: None,
-                tech_stack: Vec::new(),
                 success: true,
                 relevance_score: 0.86,
                 source_session_id: Some(context.session_id.clone()),
+                ..Default::default()
             })
             .await
             .expect("seed memory");
@@ -571,6 +873,7 @@ mod tests {
                 content: content.into(),
                 tags: vec!["learning".into()],
                 relevance_score: 0.86,
+                source: MemorySource::User,
             })],
             rationale: "test".into(),
             trigger: "watson_correction".into(),
@@ -633,6 +936,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: None,
                 usage: None,
+                ..Default::default()
             })),
             Arc::new(ToolRegistry::new()),
             GuardChain::new(),

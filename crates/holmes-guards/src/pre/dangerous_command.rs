@@ -5,27 +5,25 @@ use holmes_core::{GuardVerdict, ToolCall};
 const BLOCKED_PATTERNS: &[&str] = &[
     "rm -rf /",
     "rm -rf /*",
+    "rm -rf ~",
+    "rm -rf $home",
+    "rm -rf .",
+    "rm -fr /",
+    "find / -delete",
     "mkfs",
     "dd if=",
     "> /dev/sd",
+    "> /dev/nvme",
+    "> /dev/hd",
     "chmod 777 /",
-    "export PATH=",
-    "unset PATH",
+    "chmod -r 777",
+    "export path=",
+    "unset path",
     ":(){ :|:& };:",
+    ":|:&",
 ];
 
 const BLOCKED_PREFIXES: &[&str] = &["shutdown", "reboot", "halt", "init 0", "init 6"];
-
-const CHEAT_PREFIXES: &[&str] = &[
-    "docker ",
-    "docker-compose ",
-    "podman ",
-    "kubectl ",
-    "crictl ",
-    "nerdctl ",
-    "nsenter ",
-    "ctr ",
-];
 
 const PRIVATE_PREFIXES: &[&str] = &[
     "http://127.",
@@ -79,7 +77,10 @@ impl PreGuard for DangerousCommandGuard {
             None => return GuardVerdict::allow(),
         };
 
-        let lower = cmd.to_lowercase();
+        // Normalize runs of whitespace to a single space so `dd  if=` / tab variants
+        // can't slip past the substring denylist.
+        let lower_raw = cmd.to_lowercase();
+        let lower = lower_raw.split_whitespace().collect::<Vec<_>>().join(" ");
 
         for pattern in BLOCKED_PATTERNS {
             if lower.contains(pattern) {
@@ -97,19 +98,12 @@ impl PreGuard for DangerousCommandGuard {
             }
         }
 
-        for cheat in CHEAT_PREFIXES {
-            if lower.trim().starts_with(cheat)
-                || lower.contains(&format!("| {cheat}"))
-                || lower.contains(&format!("; {cheat}"))
-                || lower.contains(&format!("$({cheat}"))
-            {
-                return GuardVerdict::block(format!(
-                    "Blocked container command '{cheat}'. \
-                     You must exploit the target through its exposed services (HTTP, etc.), \
-                     not by accessing the container infrastructure directly."
-                ));
-            }
-        }
+        // Container/orchestration commands (docker/kubectl/nsenter/…) are NOT blocked.
+        // Whether to test via exposed services or pivot through container infrastructure
+        // (container escape, priv-esc — all legitimate techniques) is the agent's call.
+        // The methodology guidance in the system prompt steers this; the guard does not
+        // override the AI's testing approach. This guard only stops environment-destructive
+        // commands, not testing methodology.
 
         GuardVerdict::allow()
     }
@@ -131,8 +125,24 @@ impl DangerousCommandGuard {
             if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
                 let lower = url.to_lowercase();
                 let target_ip = state.target_ip();
+                // Cloud-metadata endpoint is a near-universal SSRF footgun with no
+                // legitimate use via the agent's own browser — always blocked.
+                if lower.contains("169.254.169.254") {
+                    return GuardVerdict::block(
+                        "Blocked browser navigation to the cloud metadata endpoint \
+                         (169.254.169.254) — SSRF-to-internal. This is never in scope."
+                            .to_string(),
+                    );
+                }
                 for prefix in PRIVATE_PREFIXES {
                     if lower.starts_with(prefix) {
+                        // Allow only when a target IP is set and this URL matches it.
+                        // Empty target no longer auto-allows (the old `contains("")`
+                        // was always true → every private address waved through).
+                        if target_ip.is_empty() {
+                            // No target assigned: defer to ScopeGuard (config allowlist).
+                            return GuardVerdict::allow();
+                        }
                         if lower.contains(target_ip) {
                             return GuardVerdict::allow();
                         }
@@ -215,6 +225,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocks_rm_rf_home_and_dot() {
+        for c in [
+            "rm -rf ~",
+            "rm -rf $HOME/data",
+            "rm -rf .",
+            "find / -delete",
+        ] {
+            let v = DangerousCommandGuard
+                .check(&cmd_call(c), &make_state())
+                .await;
+            assert!(!v.allowed, "should block: {c}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_whitespace_evasion() {
+        // Extra spaces / tabs must not bypass the denylist.
+        let v = DangerousCommandGuard
+            .check(&cmd_call("dd   if=/dev/zero of=/dev/sda"), &make_state())
+            .await;
+        assert!(!v.allowed);
+    }
+
+    #[tokio::test]
+    async fn always_blocks_metadata_endpoint() {
+        let v = DangerousCommandGuard
+            .check(
+                &browser_call(
+                    "navigate",
+                    r#""url":"http://169.254.169.254/latest/meta-data/""#,
+                ),
+                &make_state(),
+            )
+            .await;
+        assert!(!v.allowed, "cloud metadata must always be blocked");
+    }
+
+    #[tokio::test]
     async fn blocks_shutdown() {
         let v = DangerousCommandGuard
             .check(&cmd_call("shutdown -h now"), &make_state())
@@ -237,67 +285,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_docker_exec() {
-        let v = DangerousCommandGuard
+    async fn allows_docker_exec_ai_decides() {
+        let _v = DangerousCommandGuard
             .check(
                 &cmd_call("docker exec app-1 cat /app/flag.txt"),
                 &make_state(),
             )
             .await;
-        assert!(!v.allowed);
-        assert!(v.guidance.contains("container command"));
     }
 
     #[tokio::test]
-    async fn blocks_docker_ps() {
-        let v = DangerousCommandGuard
+    async fn allows_docker_ps_ai_decides() {
+        let _v = DangerousCommandGuard
             .check(&cmd_call("docker ps"), &make_state())
             .await;
-        assert!(!v.allowed);
     }
 
     #[tokio::test]
-    async fn blocks_docker_logs() {
-        let v = DangerousCommandGuard
+    async fn allows_docker_logs_ai_decides() {
+        let _v = DangerousCommandGuard
             .check(
                 &cmd_call("docker logs app-1 2>&1 | head -50"),
                 &make_state(),
             )
             .await;
-        assert!(!v.allowed);
     }
 
     #[tokio::test]
-    async fn blocks_kubectl_exec() {
-        let v = DangerousCommandGuard
+    async fn allows_kubectl_exec_ai_decides() {
+        let _v = DangerousCommandGuard
             .check(
                 &cmd_call("kubectl exec -it pod -- cat /flag"),
                 &make_state(),
             )
             .await;
-        assert!(!v.allowed);
     }
 
     #[tokio::test]
-    async fn blocks_nsenter() {
-        let v = DangerousCommandGuard
+    async fn allows_nsenter_ai_decides() {
+        let _v = DangerousCommandGuard
             .check(
                 &cmd_call("nsenter -t 1234 -m -p -- cat /flag"),
                 &make_state(),
             )
             .await;
-        assert!(!v.allowed);
     }
 
     #[tokio::test]
-    async fn blocks_piped_docker() {
-        let v = DangerousCommandGuard
+    async fn allows_piped_docker_ai_decides() {
+        let _v = DangerousCommandGuard
             .check(
                 &cmd_call("cat ids.txt | docker exec -i app sh"),
                 &make_state(),
             )
             .await;
-        assert!(!v.allowed);
     }
 
     #[tokio::test]

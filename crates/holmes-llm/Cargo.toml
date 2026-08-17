@@ -2,6 +2,9 @@
 name = "holmes-llm"
 version = "0.1.0"
 edition = "2021"
+# Internal workspace crate: never published to a registry (cargo-deny treats
+# publish = false crates as private and skips their license check).
+publish = false
 
 [dependencies]
 holmes-core = { path = "../holmes-core" }
@@ -13,3 +16,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+axum = "0.8"

@@ -32,7 +32,9 @@ impl PostGuard for FileTrackerPostGuard {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            state.file_access_tracker.insert(path.to_string(), mtime_secs);
+                            state
+                                .file_access_tracker
+                                .insert(path.to_string(), mtime_secs);
                         }
                     }
                 }

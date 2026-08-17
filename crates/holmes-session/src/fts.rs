@@ -1,29 +1,19 @@
 /// Sanitize a query string for FTS5.
 /// FTS5 has special characters that need quoting: hyphens, dots, etc.
 pub fn sanitize_fts5_query(query: &str) -> String {
-    let mut result = String::new();
-    let needs_quoting = |c: char| {
-        matches!(
-            c,
-            '-' | '.'
-                | ','
-                | ';'
-                | '@'
-                | '/'
-                | '\\'
-                | ':'
-                | '|'
-                | '^'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-        )
-    };
+    // Any character that is not alphanumeric or `_` is an FTS5 metacharacter or
+    // operator (`?`, `*`, `"`, `(`, `:`, `-`, `'`, `^`, `+`, `~`, …) and must be
+    // wrapped in a double-quoted string literal, or FTS5 raises a syntax error on
+    // arbitrary user input.
+    let needs_quoting = |c: char| !c.is_alphanumeric() && c != '_';
 
+    let mut result = String::new();
     for word in query.split_whitespace() {
+        // Pure-punctuation tokens carry no searchable content and, quoted, would form
+        // an empty FTS5 phrase — drop them.
+        if !word.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
         if !result.is_empty() {
             result.push(' ');
         }
@@ -65,6 +55,20 @@ mod tests {
             sanitize_fts5_query("Yes, authorized"),
             "\"Yes,\" authorized"
         );
+    }
+
+    #[test]
+    fn sanitize_quotes_fts5_metacharacters_that_crashed_recall() {
+        // Regression: a `?` (and `*`, `'`, `:`) used to reach MATCH unquoted → syntax error.
+        assert_eq!(
+            sanitize_fts5_query("what is http_request?"),
+            "what is \"http_request?\""
+        );
+        assert_eq!(sanitize_fts5_query("wildcard* term"), "\"wildcard*\" term");
+        assert_eq!(sanitize_fts5_query("it's fine"), "\"it's\" fine");
+        // Pure-punctuation tokens are dropped (would form an empty FTS5 phrase).
+        assert_eq!(sanitize_fts5_query("hello ??? world"), "hello world");
+        assert_eq!(sanitize_fts5_query("?!*"), "");
     }
 
     #[test]

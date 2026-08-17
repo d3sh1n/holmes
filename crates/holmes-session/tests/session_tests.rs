@@ -85,9 +85,7 @@ async fn compaction_archive_round_trips_through_session_store() {
         .write_compaction_archive(&session.id, 7, &archive)
         .await
         .unwrap();
-    let expected_path = temp_dir
-        .path()
-        .join("sessions")
+    let expected_path = sessions_dir_for(&db_path)
         .join("archive_session")
         .join("compactions")
         .join("compaction_7.json");
@@ -523,13 +521,9 @@ async fn fork_session_preserves_event_indices_for_compaction_archived_ranges() {
     assert!(contents
         .iter()
         .any(|content| content.contains("[Compaction summary]\nsummary replaces archived pair")));
-    assert!(contents.iter().any(|content| *content == "tail user text"));
-    assert!(!contents
-        .iter()
-        .any(|content| *content == "archived user text"));
-    assert!(!contents
-        .iter()
-        .any(|content| *content == "archived assistant text"));
+    assert!(contents.contains(&"tail user text"));
+    assert!(!contents.contains(&"archived user text"));
+    assert!(!contents.contains(&"archived assistant text"));
 }
 
 #[test]
@@ -601,9 +595,9 @@ fn replay_compaction_summary_replaces_archived_context_range() {
     assert!(contents
         .iter()
         .any(|content| content.contains("[Compaction summary]\ncompacted A and B")));
-    assert!(contents.iter().any(|content| *content == "C"));
-    assert!(!contents.iter().any(|content| *content == "A"));
-    assert!(!contents.iter().any(|content| *content == "B"));
+    assert!(contents.contains(&"C"));
+    assert!(!contents.contains(&"A"));
+    assert!(!contents.contains(&"B"));
 }
 
 #[test]
@@ -681,6 +675,7 @@ fn replay_tool_call_followed_by_result_uses_matching_tool_result_id() {
                     name: "http_request".into(),
                     arguments: serde_json::json!({"url": "https://example.com"}),
                     purpose: Some("fetch".into()),
+                    call_id: None,
                 },
             ),
             stored_event(
@@ -688,9 +683,11 @@ fn replay_tool_call_followed_by_result_uses_matching_tool_result_id() {
                 Event::ToolResult {
                     name: "http_request".into(),
                     success: true,
+                    outcome: Some(holmes_core::ToolOutcomeStatus::Succeeded),
                     content: "ok".into(),
                     error: None,
                     artifacts: vec![],
+                    call_id: None,
                 },
             ),
         ],
@@ -726,9 +723,11 @@ fn replay_orphan_tool_result_becomes_non_tool_historical_context() {
             Event::ToolResult {
                 name: "http_request".into(),
                 success: false,
+                outcome: Some(holmes_core::ToolOutcomeStatus::Failed),
                 content: "orphan output".into(),
                 error: Some("failed".into()),
                 artifacts: vec![],
+                call_id: None,
             },
         )],
     );
@@ -752,9 +751,317 @@ fn replay_orphan_tool_result_becomes_non_tool_historical_context() {
     assert_ne!(context.role, Role::System);
 }
 
-// Merged from main (HEAD): verifies large ToolResult offload to disk + transparent restore.
+/// P1-03 legality invariant: every assistant tool_use in the replayed history is
+/// answered by exactly one tool_result message carrying the same call id.
+fn assert_tool_history_is_legal(messages: &[holmes_core::Message]) {
+    let answered: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    for message in messages {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        for call in message.tool_calls.as_deref().unwrap_or(&[]) {
+            assert!(
+                answered.contains(call.id.as_str()),
+                "tool_use '{}' ({}) has no matching tool_result",
+                call.function.name,
+                call.id
+            );
+        }
+    }
+}
+
+#[test]
+fn replay_blocked_tool_synthesizes_failure_tool_result() {
+    // Legacy events (no call_id): a blocked call must still yield a tool_result
+    // so the replayed history stays legal (P1-03).
+    let replayed = replay_events(
+        "replay_test",
+        &[
+            stored_event(
+                0,
+                Event::ToolCall {
+                    name: "http_request".into(),
+                    arguments: serde_json::json!({"url": "https://example.com"}),
+                    purpose: None,
+                    call_id: None,
+                },
+            ),
+            stored_event(
+                1,
+                Event::ToolBlocked {
+                    tool_name: "http_request".into(),
+                    guard_name: "scope".into(),
+                    reason: "target outside authorized scope".into(),
+                    call_id: None,
+                },
+            ),
+        ],
+    );
+
+    assert_tool_history_is_legal(&replayed.session.messages);
+    assert_eq!(replayed.session.messages.len(), 2);
+    let assistant = &replayed.session.messages[0];
+    let call_id = assistant.tool_calls.as_ref().expect("tool calls")[0]
+        .id
+        .clone();
+    let result = &replayed.session.messages[1];
+    assert_eq!(result.role, Role::Tool);
+    assert_eq!(result.tool_call_id.as_deref(), Some(call_id.as_str()));
+    let content = result.content.as_deref().expect("blocked content");
+    assert!(content.contains("scope"), "got: {content}");
+    assert!(
+        content.contains("target outside authorized scope"),
+        "got: {content}"
+    );
+}
+
+#[test]
+fn replay_parallel_same_name_calls_bind_results_by_call_id() {
+    // Two parallel calls to the same tool, results persisted out of order: each
+    // result must bind to its own call id (and therefore its own arguments).
+    let replayed = replay_events(
+        "replay_test",
+        &[
+            stored_event(
+                0,
+                Event::ToolCall {
+                    name: "http_request".into(),
+                    arguments: serde_json::json!({"url": "https://a.example"}),
+                    purpose: None,
+                    call_id: Some("call-a".into()),
+                },
+            ),
+            stored_event(
+                1,
+                Event::ToolCall {
+                    name: "http_request".into(),
+                    arguments: serde_json::json!({"url": "https://b.example"}),
+                    purpose: None,
+                    call_id: Some("call-b".into()),
+                },
+            ),
+            stored_event(
+                2,
+                Event::ToolResult {
+                    name: "http_request".into(),
+                    success: true,
+                    outcome: Some(holmes_core::ToolOutcomeStatus::Succeeded),
+                    content: "response-for-b".into(),
+                    error: None,
+                    artifacts: vec![],
+                    call_id: Some("call-b".into()),
+                },
+            ),
+            stored_event(
+                3,
+                Event::ToolResult {
+                    name: "http_request".into(),
+                    success: true,
+                    outcome: Some(holmes_core::ToolOutcomeStatus::Succeeded),
+                    content: "response-for-a".into(),
+                    error: None,
+                    artifacts: vec![],
+                    call_id: Some("call-a".into()),
+                },
+            ),
+        ],
+    );
+
+    assert_tool_history_is_legal(&replayed.session.messages);
+    // One merged assistant message (the run is one model response's tool batch),
+    // followed by one result per call.
+    let assistant = &replayed.session.messages[0];
+    assert_eq!(assistant.role, Role::Assistant);
+    let calls = assistant.tool_calls.as_ref().expect("tool calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0].function.arguments,
+        r#"{"url":"https://a.example"}"#
+    );
+    assert_eq!(
+        calls[1].function.arguments,
+        r#"{"url":"https://b.example"}"#
+    );
+
+    let result_for = |id: &str| {
+        replayed
+            .session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(id))
+            .and_then(|message| message.content.as_deref())
+            .expect("result content")
+    };
+    assert_eq!(result_for("call-a"), "response-for-a");
+    assert_eq!(result_for("call-b"), "response-for-b");
+}
+
+#[test]
+fn replay_interrupted_tool_call_gets_synthesized_result() {
+    // Crash between ToolCall and its outcome event: replay closes the dangling
+    // tool_use with a synthesized failure result instead of leaving illegal
+    // history (P1-03).
+    let replayed = replay_events(
+        "replay_test",
+        &[stored_event(
+            0,
+            Event::ToolCall {
+                name: "execute_command".into(),
+                arguments: serde_json::json!({"command": "nmap -sV target"}),
+                purpose: None,
+                call_id: Some("call-crash".into()),
+            },
+        )],
+    );
+
+    assert_tool_history_is_legal(&replayed.session.messages);
+    let result = replayed
+        .session
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-crash"))
+        .expect("synthesized result");
+    assert!(
+        result
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("interrupted"),
+        "got: {:?}",
+        result.content
+    );
+    assert!(replayed
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("no result or blocked event")));
+}
+
 #[tokio::test]
-async fn test_automatic_archiving_and_bypass() {
+async fn pre_call_id_database_migrates_and_legacy_events_read() {
+    // P1-03: a database written before call-id persistence (schema v4, event
+    // payloads without `call_id`) must still open — the v5 migration applies —
+    // and its legacy events must read and replay as a legal history.
+    let temp_dir = std::env::temp_dir().join(format!("holmes_legacy_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("legacy.db");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(holmes_session::schema::schema_version_table())
+            .unwrap();
+        for (index, migration) in holmes_session::schema::MIGRATIONS
+            .iter()
+            .take(4)
+            .enumerate()
+        {
+            conn.execute_batch(migration).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                rusqlite::params![(index + 1) as u32],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, started_at) VALUES ('legacy-session', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (session_id, event_index, event_type, event_data, timestamp)
+             VALUES ('legacy-session', 0, 'tool_call',
+                     '{\"type\":\"tool_call\",\"name\":\"nmap\",\"arguments\":{\"target\":\"10.0.0.9\"},\"purpose\":null}',
+                     datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (session_id, event_index, event_type, event_data, timestamp)
+             VALUES ('legacy-session', 1, 'tool_blocked',
+                     '{\"type\":\"tool_blocked\",\"tool_name\":\"nmap\",\"guard_name\":\"scope\",\"reason\":\"target outside authorized scope\"}',
+                     datetime('now'))",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = SessionDB::open(&db_path).await.unwrap();
+    // The v5 migration must have been applied on open.
+    let version: u32 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, holmes_session::schema::SCHEMA_VERSION);
+
+    let events = db.get_events("legacy-session").await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[0].event,
+        Event::ToolCall { name, call_id: None, .. } if name == "nmap"
+    ));
+    assert!(matches!(
+        &events[1].event,
+        Event::ToolBlocked { tool_name, guard_name, call_id: None, .. }
+            if tool_name == "nmap" && guard_name == "scope"
+    ));
+
+    // The legacy blocked call replays as a legal tool history (P1-03 fix item 4).
+    let replayed = replay_events("legacy-session", &events);
+    assert_tool_history_is_legal(&replayed.session.messages);
+    let blocked_result = replayed
+        .session
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("synthesized blocked result");
+    assert!(blocked_result
+        .content
+        .as_deref()
+        .unwrap_or_default()
+        .contains("target outside authorized scope"));
+}
+
+#[test]
+fn legacy_tool_events_without_call_id_still_deserialize() {
+    // Pre-P1-03 event payloads carry no call_id; they must stay readable.
+    let call: Event = serde_json::from_str(
+        r#"{"type":"tool_call","name":"nmap","arguments":{"target":"t"},"purpose":null}"#,
+    )
+    .expect("legacy tool_call");
+    assert!(matches!(call, Event::ToolCall { call_id: None, .. }));
+
+    let result: Event = serde_json::from_str(
+        r#"{"type":"tool_result","name":"nmap","success":true,"content":"ok","error":null,"artifacts":[]}"#,
+    )
+    .expect("legacy tool_result");
+    assert!(matches!(
+        result,
+        Event::ToolResult {
+            call_id: None,
+            outcome: None,
+            ..
+        }
+    ));
+
+    let blocked: Event = serde_json::from_str(
+        r#"{"type":"tool_blocked","tool_name":"nmap","guard_name":"scope","reason":"out of scope"}"#,
+    )
+    .expect("legacy tool_blocked");
+    assert!(matches!(blocked, Event::ToolBlocked { call_id: None, .. }));
+}
+
+// P1-08: a large ToolResult is stored in the SQLite blob tables (same
+// transaction as the event), NOT in a disk sidecar — the database alone
+// restores the full payload.
+#[tokio::test]
+async fn test_large_tool_result_stored_in_sqlite_blobs() {
     let temp_dir = std::env::temp_dir().join(format!("holmes_test_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
     let db_path = temp_dir.join("holmes_test.db");
@@ -763,7 +1070,7 @@ async fn test_automatic_archiving_and_bypass() {
     let session = db
         .create_session(CreateSessionParams {
             id: Some("test_session_123".into()),
-            title: Some("bypass test".into()),
+            title: Some("blob offload test".into()),
             mode: Some(SessionMode::Pentest),
             model: None,
             system_prompt: None,
@@ -775,35 +1082,45 @@ async fn test_automatic_archiving_and_bypass() {
         .await
         .unwrap();
 
-    let sessions_dir = db_path.parent().unwrap().join("sessions");
-    let session_workspace = sessions_dir.join("test_session_123");
-    let tool_results_dir = session_workspace.join("tool-results");
-    assert!(session_workspace.exists());
-    assert!(tool_results_dir.exists());
-
     let large_content = "A".repeat(15000);
     let event = Event::ToolResult {
         name: "test_tool".into(),
         success: true,
+        outcome: Some(holmes_core::ToolOutcomeStatus::Succeeded),
         content: large_content.clone(),
         error: None,
         artifacts: vec![],
+        call_id: None,
     };
     db.append_event(&session.id, &event).await.unwrap();
 
-    let mut files = std::fs::read_dir(&tool_results_dir).unwrap();
-    let entry = files.next().unwrap().unwrap();
-    let txt_path = entry.path();
-    assert!(txt_path.is_file());
-    assert_eq!(txt_path.extension().unwrap(), "txt");
-    let file_content = std::fs::read_to_string(&txt_path).unwrap();
-    assert_eq!(file_content, large_content);
+    // No sidecar file is written anymore.
+    let sessions_dir = sessions_dir_for(&db_path);
+    let session_workspace = sessions_dir.join("test_session_123");
+    assert!(
+        !session_workspace.join("tool-results").exists(),
+        "blob offload must not create disk sidecars"
+    );
 
-    let jsonl_path = session_workspace.join("transcript.jsonl");
-    assert!(jsonl_path.exists());
-    let jsonl_content = std::fs::read_to_string(&jsonl_path).unwrap();
-    assert!(jsonl_content.contains("__BYPASS_FILE__:file://"));
+    // The stored event row carries only the content-addressed marker.
+    let stored_data: String = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT event_data FROM events WHERE session_id = 'test_session_123'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(stored_data.contains(holmes_session::blob_store::BLOB_REF_PREFIX));
+    assert!(!stored_data.contains(&large_content));
 
+    // The transcript projection carries the marker, not the payload.
+    db.projector().flush().await;
+    let jsonl_content =
+        std::fs::read_to_string(session_workspace.join("transcript.jsonl")).unwrap();
+    assert!(jsonl_content.contains(holmes_session::blob_store::BLOB_REF_PREFIX));
+
+    // The read path restores the full payload from SQLite alone.
     let events = db.get_events(&session.id).await.unwrap();
     assert_eq!(events.len(), 1);
     if let Event::ToolResult { content, .. } = &events[0].event {
@@ -813,4 +1130,242 @@ async fn test_automatic_archiving_and_bypass() {
     }
 
     std::fs::remove_dir_all(temp_dir).ok();
+}
+
+// P1-08 acceptance: with every file under the sessions directory deleted,
+// the SQLite database alone still restores a large tool result in full.
+#[tokio::test]
+async fn large_tool_result_survives_total_sidecar_loss() {
+    let temp_dir = std::env::temp_dir().join(format!("holmes_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("holmes_test.db");
+
+    let large_content = "needle-payload-".repeat(2000); // 30 000 chars
+    {
+        let db = SessionDB::open(&db_path).await.unwrap();
+        db.create_session(CreateSessionParams {
+            id: Some("sidecar-loss".into()),
+            title: None,
+            mode: Some(SessionMode::Pentest),
+            model: None,
+            system_prompt: None,
+            parent_session_id: None,
+            fork_point: None,
+            source: Some("test".into()),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+        db.append_event(
+            "sidecar-loss",
+            &Event::ToolResult {
+                name: "nmap".into(),
+                success: true,
+                outcome: Some(holmes_core::ToolOutcomeStatus::Succeeded),
+                content: large_content.clone(),
+                error: None,
+                artifacts: vec![],
+                call_id: Some("call-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+        db.projector().flush().await;
+    }
+
+    // Total sidecar loss: every derived file is gone; only holmes.db remains.
+    std::fs::remove_dir_all(sessions_dir_for(&db_path)).unwrap();
+
+    let db = SessionDB::open(&db_path).await.unwrap();
+    let events = db.get_events("sidecar-loss").await.unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0].event {
+        Event::ToolResult {
+            content, call_id, ..
+        } => {
+            assert_eq!(content.as_str(), large_content.as_str());
+            assert_eq!(call_id.as_deref(), Some("call-1"));
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+// P1-08 read-path compatibility: pre-v6 events whose content is a
+// `__BYPASS_FILE__:file://` sidecar pointer still read — from the file when it
+// exists, degraded to the pointer (never an error, never a panic) when lost.
+#[tokio::test]
+async fn legacy_bypass_file_pointer_reads_degrade_gracefully() {
+    let temp_dir = std::env::temp_dir().join(format!("holmes_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("holmes_test.db");
+
+    let sessions_dir = db_path.parent().unwrap().join("sessions");
+    let sidecar = sessions_dir.join("legacy-session/tool-results/call_legacy.txt");
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    std::fs::write(&sidecar, "legacy payload from disk").unwrap();
+
+    let db = SessionDB::open(&db_path).await.unwrap();
+    db.create_session(CreateSessionParams {
+        id: Some("legacy-session".into()),
+        title: None,
+        mode: Some(SessionMode::Pentest),
+        model: None,
+        system_prompt: None,
+        parent_session_id: None,
+        fork_point: None,
+        source: Some("test".into()),
+        tags: vec![],
+    })
+    .await
+    .unwrap();
+
+    // Insert a legacy pointer row directly (append_event never writes these).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO events (session_id, event_index, event_type, event_data, timestamp)
+             VALUES ('legacy-session', 0, 'tool_result', ?1, datetime('now'))",
+            rusqlite::params![format!(
+                "{{\"type\":\"tool_result\",\"name\":\"nmap\",\"success\":true,\"content\":\"__BYPASS_FILE__:file://{}\",\"error\":null,\"artifacts\":[]}}",
+                sidecar.to_string_lossy()
+            )],
+        )
+        .unwrap();
+    }
+
+    // Sidecar present: content is restored from the file.
+    let events = db.get_events("legacy-session").await.unwrap();
+    match &events[0].event {
+        Event::ToolResult { content, .. } => {
+            assert_eq!(content, "legacy payload from disk")
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+
+    // Sidecar lost: read degrades to the pointer instead of failing.
+    std::fs::remove_file(&sidecar).unwrap();
+    let events = db.get_events("legacy-session").await.unwrap();
+    match &events[0].event {
+        Event::ToolResult { content, .. } => {
+            assert!(content.starts_with("__BYPASS_FILE__:file://"))
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+// P1-04: a fork with startup semantics commits copied events, the startup
+// batch and the branch summary in ONE transaction — the child replays as
+// semantically complete, and a conflicting fork leaves nothing behind.
+#[tokio::test]
+async fn fork_session_with_events_commits_startup_semantics_atomically() {
+    use holmes_session::{BranchSummarySpec, ForkStartupSpec};
+
+    let db = SessionDB::open(":memory:").await.unwrap();
+    let parent = db
+        .create_session_with_events(
+            CreateSessionParams {
+                id: Some("parent".into()),
+                title: Some("parent".into()),
+                mode: Some(SessionMode::Pentest),
+                model: Some("parent-model".into()),
+                system_prompt: Some("parent prompt".into()),
+                parent_session_id: None,
+                fork_point: None,
+                source: Some("test".into()),
+                tags: vec![],
+            },
+            vec![Event::UserMessage {
+                content: "hello".into(),
+                timestamp: chrono::Utc::now(),
+            }],
+        )
+        .await
+        .unwrap();
+    let parent_events = db.get_events(&parent.id).await.unwrap();
+    let fork_point = parent_events.last().unwrap().event_index;
+
+    let spec = ForkStartupSpec {
+        new_session_id: "child-atomic".into(),
+        model: Some("child-model".into()),
+        provider: None,
+        fallback_system_prompt: "fallback prompt".into(),
+        active_tool_names: vec!["shell".into()],
+        branch_summary: Some(BranchSummarySpec {
+            from_event_index: 0,
+            to_event_index: fork_point,
+            summary: "branch summary text".into(),
+            reason: "branch".into(),
+        }),
+    };
+    let child = db
+        .fork_session_with_events(&parent.id, fork_point, "child", spec)
+        .await
+        .unwrap();
+    assert_eq!(child.id, "child-atomic");
+    assert_eq!(child.parent_session_id.as_deref(), Some("parent"));
+    assert_eq!(child.fork_point, Some(fork_point));
+
+    let replayed = db.replay_session_context(&child.id).await.unwrap();
+    assert!(
+        replayed.semantic_complete,
+        "forked child must replay with complete startup semantics"
+    );
+    assert_eq!(replayed.system_prompt.as_deref(), Some("parent prompt"));
+    assert_eq!(
+        replayed.session.lineage.parent_id.as_deref(),
+        Some("parent")
+    );
+    assert_eq!(replayed.active_tools, vec!["shell".to_string()]);
+    assert!(replayed
+        .branch_summaries
+        .iter()
+        .any(|s| s == "branch summary text"));
+    let contents: Vec<&str> = replayed
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert!(contents.contains(&"hello"), "copied parent events replay");
+
+    // The startup batch comes after every retained parent event index.
+    let child_events = db.get_events(&child.id).await.unwrap();
+    let event_count = child_events.len();
+    let branch_index = child_events
+        .iter()
+        .find(|stored| matches!(&stored.event, Event::BranchSummary { .. }))
+        .map(|stored| stored.event_index)
+        .expect("branch summary recorded");
+    assert!(branch_index > fork_point);
+
+    // A conflicting fork (same caller-generated child id) fails as a whole:
+    // no partial session row, no stray extra events.
+    let conflict = db
+        .fork_session_with_events(
+            &parent.id,
+            fork_point,
+            "child-again",
+            ForkStartupSpec {
+                new_session_id: "child-atomic".into(),
+                model: None,
+                provider: None,
+                fallback_system_prompt: "fallback prompt".into(),
+                active_tool_names: vec![],
+                branch_summary: None,
+            },
+        )
+        .await;
+    assert!(conflict.is_err());
+    let child_events_after = db.get_events(&child.id).await.unwrap();
+    assert_eq!(
+        child_events_after.len(),
+        event_count,
+        "failed fork leaves the child's event log untouched"
+    );
+    let record = db.get_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(record.title.as_deref(), Some("child"));
 }

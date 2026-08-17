@@ -1,0 +1,36 @@
+name: approval-fail-closed
+description: >-
+  Fault injection (AGT-005): permission mode ask with no approval surface
+  installed (the harness never installs one). The mutating tool call must be
+  denied fail-closed — the tool body never executes — and the denial reason is
+  fed back so the agent can report the blockage instead of silently proceeding.
+mode: pentest
+config:
+  permissions:
+    mode: ask
+  # The denied call leaves an unresolved failure, so the unified completion gate
+  # (P0-02) will not let the report-the-blockage answer complete the task; zero
+  # verification retries makes the turn end as an explicit partial result instead.
+  supervisor:
+    max_verification_retries: 0
+turns:
+  - input: "Use mutating_write to fix the config."
+tools:
+  - name: mutating_write
+    description: Would mutate state if it ever ran.
+    output: MUTATED
+  # The read_only default (false) makes this a mutating tool.
+scripted_responses:
+  - tool_calls:
+      - id: call-write-1
+        type: function
+        function:
+          name: mutating_write
+          arguments: '{"path":"config.yml"}'
+  - content: '<holmes_decision>{"type":"answer","message":"Write blocked: no approval surface available."}</holmes_decision>'
+expectations:
+  final_contains:
+    - blocked
+  tool_calls:
+    - mutating_write
+  max_errors: 1

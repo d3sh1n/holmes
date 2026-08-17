@@ -1,11 +1,20 @@
+//! Browser manager integration tests.
+//!
+//! Ignore classification (Phase 0 baseline; see .github/workflows/nightly-reliability.yml):
+//! - `[nightly]`         — launch a local Chromium against `data:` pages, no
+//!   network access. Run by the nightly `browser-smoke-local` job.
+//! - `[nightly:network]` — additionally need outbound internet (example.com /
+//!   xiaohongshu.com). Run by the nightly `browser-smoke-network` job; anti-bot
+//!   targets can be flaky from CI egress IPs.
+//! - `[env-dependent]`   — require a specific local setup (a user Chrome on
+//!   port 9222, or a hardcoded macOS Chrome path). Never run in CI; invoke
+//!   manually with `cargo test -p holmes-browser -- --ignored`.
 use holmes_browser::BrowserManager;
 use holmes_core::config::BrowserConfig;
 
 fn enabled_config() -> BrowserConfig {
     BrowserConfig {
         enabled: true,
-        headless: false,
-        vision: false,
         content_limit: 2000,
         timeout: 30,
         proxy: None,
@@ -18,7 +27,7 @@ fn enabled_config() -> BrowserConfig {
 }
 
 #[tokio::test]
-#[ignore = "launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
+#[ignore = "[nightly] launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
 async fn manager_navigates_and_returns_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = BrowserManager::new("it-session", tmp.path(), enabled_config()).unwrap();
@@ -36,7 +45,7 @@ async fn manager_navigates_and_returns_snapshot() {
 }
 
 #[tokio::test]
-#[ignore = "launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
+#[ignore = "[nightly] launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
 async fn manager_resume_reopens_same_profile() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = BrowserManager::new("resume-session", tmp.path(), enabled_config()).unwrap();
@@ -47,15 +56,14 @@ async fn manager_resume_reopens_same_profile() {
 
     // Re-open on the SAME profile dir (same session id) — must relaunch fine.
     let mgr2 = BrowserManager::new("resume-session", tmp.path(), enabled_config()).unwrap();
-    mgr2
-        .navigate("data:text/html,<body><p>second</p></body>")
+    mgr2.navigate("data:text/html,<body><p>second</p></body>")
         .await
         .expect("re-navigate");
     mgr2.close().await;
 }
 
 #[tokio::test]
-#[ignore = "launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
+#[ignore = "[nightly] launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
 async fn fill_and_get_content_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = BrowserManager::new("fill-session", tmp.path(), enabled_config()).unwrap();
@@ -76,7 +84,7 @@ async fn fill_and_get_content_round_trip() {
 }
 
 #[tokio::test]
-#[ignore = "launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
+#[ignore = "[nightly] launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
 async fn execute_js_returns_value() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = BrowserManager::new("js-session", tmp.path(), enabled_config()).unwrap();
@@ -87,7 +95,7 @@ async fn execute_js_returns_value() {
 }
 
 #[tokio::test]
-#[ignore = "launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
+#[ignore = "[nightly] launches real Chromium; run with: cargo test -p holmes-browser -- --ignored"]
 async fn screenshot_writes_png_file() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = enabled_config();
@@ -97,13 +105,17 @@ async fn screenshot_writes_png_file() {
         .await
         .unwrap();
     let shot = mgr.screenshot(false).await.expect("screenshot");
-    assert!(shot.path.exists(), "screenshot file: {}", shot.path.display());
+    assert!(
+        shot.path.exists(),
+        "screenshot file: {}",
+        shot.path.display()
+    );
     assert!(shot.path.extension().and_then(|e| e.to_str()) == Some("png"));
     mgr.close().await;
 }
 
 #[tokio::test]
-#[ignore = "real network + Chromium; run with: cargo test -p holmes-browser xiaohongshu -- --ignored"]
+#[ignore = "[nightly:network] real network + Chromium; run with: cargo test -p holmes-browser xiaohongshu -- --ignored"]
 async fn xiaohongshu_smoke() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = enabled_config();
@@ -137,19 +149,23 @@ async fn xiaohongshu_smoke() {
 }
 
 #[tokio::test]
-#[ignore = "real network; confirms browser works against a normal HTTPS site"]
+#[ignore = "[nightly:network] real network; confirms browser works against a normal HTTPS site"]
 async fn real_site_example_com_works() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = enabled_config();
     let mgr = BrowserManager::new("example-com", tmp.path(), cfg).unwrap();
     let snap = mgr.navigate("https://example.com").await.expect("navigate");
     println!("url: {} | title: {}", snap.url, snap.title);
-    assert!(snap.text_excerpt.contains("Example Domain"), "body: {}", snap.text_excerpt);
+    assert!(
+        snap.text_excerpt.contains("Example Domain"),
+        "body: {}",
+        snap.text_excerpt
+    );
     mgr.close().await;
 }
 
 #[tokio::test]
-#[ignore = "launches real Chromium; verifies stealth hides the webdriver flag"]
+#[ignore = "[nightly] launches real Chromium; verifies stealth hides the webdriver flag"]
 async fn stealth_hides_webdriver_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = enabled_config();
@@ -165,7 +181,7 @@ async fn stealth_hides_webdriver_flag() {
 }
 
 #[tokio::test]
-#[ignore = "requires a real Chrome running with --remote-debugging-port=9222; attach mode"]
+#[ignore = "[env-dependent] requires a real Chrome running with --remote-debugging-port=9222; attach mode; local-only, never run in CI"]
 async fn attach_to_real_chrome_navigates() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = enabled_config();
@@ -173,7 +189,10 @@ async fn attach_to_real_chrome_navigates() {
     cfg.timeout = 60;
     let mgr = BrowserManager::new("attach-test", tmp.path(), cfg).unwrap();
     // about:blank navigation proves the attach + new_page path works.
-    let snap = mgr.navigate("https://example.com").await.expect("attach navigate");
+    let snap = mgr
+        .navigate("https://example.com")
+        .await
+        .expect("attach navigate");
     println!("attached url: {} | title: {}", snap.url, snap.title);
     assert!(snap.text_excerpt.contains("Example Domain"));
     // close() in attach mode must NOT kill the user's Chrome; verify the
@@ -184,7 +203,7 @@ async fn attach_to_real_chrome_navigates() {
 }
 
 #[tokio::test]
-#[ignore = "real network; launch with system Chrome binary to bypass anti-bot"]
+#[ignore = "[env-dependent] real network + hardcoded macOS Chrome binary path; local-only (macOS), never run in CI"]
 async fn xiaohongshu_with_system_chrome() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = enabled_config();
@@ -217,14 +236,17 @@ async fn xiaohongshu_with_system_chrome() {
 }
 
 #[tokio::test]
-#[ignore = "real network; verifies auto-detected system Chrome bypasses xiaohongshu anti-bot without explicit executable_path"]
+#[ignore = "[nightly:network] real network; verifies auto-detected system Chrome bypasses xiaohongshu anti-bot without explicit executable_path"]
 async fn xiaohongshu_auto_detected_chrome() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = enabled_config();
     cfg.timeout = 60;
     // intentionally no executable_path — should auto-detect system Chrome
     let mgr = BrowserManager::new("xhs-auto", tmp.path(), cfg).unwrap();
-    let snap = mgr.navigate("https://www.xiaohongshu.com").await.expect("navigate");
+    let snap = mgr
+        .navigate("https://www.xiaohongshu.com")
+        .await
+        .expect("navigate");
     println!("XHS auto url: {} | title: {}", snap.url, snap.title);
     assert!(!snap.title.is_empty());
     assert!(!snap.text_excerpt.is_empty());

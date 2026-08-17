@@ -2,6 +2,9 @@
 name = "holmes-cli"
 version = "0.1.0"
 edition = "2021"
+# Internal workspace crate: never published to a registry (cargo-deny treats
+# publish = false crates as private and skips their license check).
+publish = false
 
 [[bin]]
 name = "holmes"
@@ -18,6 +21,7 @@ holmes-guards = { path = "../holmes-guards" }
 holmes-runtime = { path = "../holmes-runtime" }
 holmes-harness = { path = "../holmes-harness" }
 tokio = { workspace = true }
+tokio-util = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -33,3 +37,16 @@ rpassword = "7"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 reedline = "0.48.0"
 crossterm = "0.29.0"
+ratatui = "0.30"
+pulldown-cmark = { version = "0.12", default-features = false }
+similar = "2"
+syntect = "5"
+unicode-width = "0.2"
+gag = "1"
+nucleo-matcher = "0.3"
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
+tempfile = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

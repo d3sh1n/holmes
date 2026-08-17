@@ -1,8 +1,9 @@
 use crate::chat::{
     create_chat_context, event_summary, event_type_label, folded_tool_output_summary,
-    format_relative_time, load_session_runtime, parse_mode, refresh_guard_chain,
-    run_runtime_input_with_sink, save_config, truncate_chars, ChatContext, ChatStartup,
+    format_relative_time, parse_mode, refresh_guard_chain, run_runtime_input_with_sink,
+    save_config, truncate_chars, ChatContext, ChatStartup,
 };
+use crate::session_assembly::{switch_to, SessionAssembler};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent,
@@ -11,16 +12,15 @@ use crossterm::event::{
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use holmes_core::config::PermissionMode;
+use holmes_core::config::{resolve_attack_model_provider, PermissionMode};
 use holmes_core::event::StoredEvent;
 use holmes_core::types::{SessionFilter, SessionSummary};
-use holmes_guards::GuardChain;
-use holmes_mind_palace::MindPalace;
-use holmes_runtime::{RuntimeSink, RuntimeState, RuntimeYield, StreamEvent};
-use holmes_session::selector::Selector;
-use holmes_session::CreateSessionParams;
+use holmes_runtime::runtime::TurnOutcome;
+use holmes_runtime::{RuntimeSink, RuntimeYield, StreamEvent};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const CHAT_MARGIN: u16 = 1;
@@ -36,7 +36,12 @@ pub async fn run_tui(
     else {
         return Ok(());
     };
+    run_tui_with_context(ctx, is_resume).await
+}
 
+/// Run the classic full-screen TUI with an already-built context. Used both by `run_tui`
+/// and as the fallback when the inline UI can't initialize.
+pub async fn run_tui_with_context(ctx: ChatContext, is_resume: bool) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     let _guard = TerminalGuard::enter(&mut stdout)?;
     let mut app = TuiApp::new(ctx, is_resume);
@@ -91,8 +96,9 @@ impl TuiEntry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 enum Overlay {
+    #[default]
     None,
     Help,
     CommandPalette(SelectorOverlay),
@@ -102,12 +108,6 @@ enum Overlay {
     Permissions(PermissionsOverlay),
     Guards(GuardsOverlay),
     Prompt(TextPrompt),
-}
-
-impl Default for Overlay {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Clone, Default)]
@@ -228,9 +228,9 @@ impl TuiApp {
 
     async fn handle_key(&mut self, key: KeyEvent, stdout: &mut Stdout) -> anyhow::Result<()> {
         if self.busy {
-            if key.code == KeyCode::Esc {
-                self.status = "Current turn is running; cancellation is not wired yet.".into();
-            }
+            // While a turn runs, the keyboard is drained by the interrupt watcher in
+            // `run_turn` (Esc / Ctrl+C requests cancellation), so this guard is only a
+            // fallback for the brief windows between turns when `busy` is still set.
             return Ok(());
         }
 
@@ -883,7 +883,7 @@ impl TuiApp {
                 }
             }
             "status" | "session" => self.push_session_status().await,
-            "dashboard" => self.push_dashboard(),
+            "ledger" => self.push_ledger_status(args).await,
             "tools" => self.push_tools(args),
             "provider" | "model" | "config" | "usage" | "workflows" => {
                 self.push_basic_info(canonical).await
@@ -902,8 +902,19 @@ impl TuiApp {
         self.entries
             .push(TuiEntry::new(EntryKind::User, input.clone()));
         self.busy = true;
-        self.status = "Holmes is working... Esc notes cancellation status.".into();
+        self.status =
+            "Holmes is working... Esc/Ctrl+C to interrupt, or type a line to queue it.".into();
         self.render(stdout)?;
+
+        // Spawn a background watcher that reads the keyboard while the turn runs: Esc/
+        // Ctrl+C flips the cancel flag; any other typed line is captured for queuing.
+        // The main input loop is parked on the turn future below, so the watcher is the
+        // only reader until the turn ends.
+        self.ctx.cancel.store(false, Ordering::Relaxed);
+        let stop_watcher = Arc::new(AtomicBool::new(false));
+        let typed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let watcher =
+            spawn_interrupt_watcher(self.ctx.cancel.clone(), stop_watcher.clone(), typed.clone());
 
         let footer = self.footer_line();
         let mut sink = TuiRuntimeSink {
@@ -912,10 +923,35 @@ impl TuiApp {
             show_tool_output: self.show_tool_output,
             footer,
         };
-        let result = run_runtime_input_with_sink(&mut self.ctx, input, false, &mut sink).await;
+        // Classic TUI stays a compile-adapted fallback: no approval card here, so no
+        // approver is installed (Ask-mode mutating calls proceed, as before Phase 1).
+        let result =
+            run_runtime_input_with_sink(&mut self.ctx, input, false, &mut sink, None).await;
         drop(sink);
+
+        // Tear the watcher down before the main loop resumes reading the keyboard.
+        stop_watcher.store(true, Ordering::Relaxed);
+        let _ = watcher.await;
+
+        // Drain any lines typed during the turn into the follow-up queue (type-ahead /
+        // steering); `drain_queued_turns` runs them after this turn completes.
+        if let Ok(mut queue) = typed.lock() {
+            for line in queue.drain(..) {
+                self.entries.push(TuiEntry::new(
+                    EntryKind::System,
+                    format!("Queued follow-up: {line}"),
+                ));
+                self.ctx.queued_turns.push_back(line);
+            }
+        }
+
         self.busy = false;
         match result {
+            Ok(TurnOutcome::Interrupted { .. }) => {
+                self.status = "Turn interrupted.".into();
+                self.refresh_events().await;
+                self.refresh_sessions().await;
+            }
             Ok(_) => {
                 self.status = "Turn complete.".into();
                 self.refresh_events().await;
@@ -944,33 +980,21 @@ impl TuiApp {
     }
 
     async fn new_session(&mut self) -> anyhow::Result<()> {
-        let session = self
-            .ctx
-            .session_db
-            .create_session(CreateSessionParams {
-                id: None,
-                title: None,
-                mode: Some(self.ctx.runtime_session.mode.clone()),
-                model: None,
-                system_prompt: Some(self.ctx.system_prompt.clone()),
-                parent_session_id: None,
-                fork_point: None,
-                source: Some("tui".into()),
-                tags: vec![],
-            })
+        // Same lifecycle as the chat REPL `/new` (P1-04): the assembler commits
+        // the session row plus the full startup event batch atomically and
+        // rebuilds registry/browser/guards in one switch.
+        let assembler = SessionAssembler::from_context(&self.ctx);
+        let model = resolve_attack_model_provider(&self.ctx.config, None);
+        let assembled = assembler
+            .assemble_fresh(
+                self.ctx.runtime_session.mode.clone(),
+                model,
+                self.ctx.system_prompt.clone(),
+                "tui",
+            )
             .await?;
-        let new_id = session.id.clone();
-        self.ctx.session_id = new_id.clone();
-        self.ctx.runtime_session =
-            holmes_core::session::RuntimeSession::new(new_id.clone(), session.mode)
-                .with_system_prompt(&self.ctx.system_prompt);
-        self.ctx.mind_palace =
-            MindPalace::new(self.ctx.session_db.clone(), self.ctx.memory_store.clone());
-        self.ctx.runtime_state = RuntimeState::new(self.ctx.runtime_session.mode.clone());
-        self.ctx.runtime_guards = GuardChain::from_config(&self.ctx.config.guards);
-        self.ctx.queued_turns.clear();
-        self.ctx.steering_notes.clear();
-        self.rebuild_selector();
+        let new_id = assembled.session_id.clone();
+        switch_to(&mut self.ctx, assembled);
         self.entries.clear();
         self.entries.push(TuiEntry::new(
             EntryKind::System,
@@ -986,18 +1010,31 @@ impl TuiApp {
             self.status = format!("Session not found: {session_id}");
             return Ok(());
         };
-        let (runtime_session, mind_palace) =
-            load_session_runtime(&self.ctx, &session_record.id, session_record.mode.clone())
-                .await?;
-        self.ctx.session_id = session_record.id.clone();
-        self.ctx.runtime_session = runtime_session;
-        self.ctx.mind_palace = mind_palace;
-        self.ctx.runtime_state = RuntimeState::new(self.ctx.runtime_session.mode.clone());
-        self.ctx.runtime_state.active_goal = session_record.goal_condition;
-        self.ctx.runtime_guards = GuardChain::from_config(&self.ctx.config.guards);
-        self.ctx.queued_turns.clear();
-        self.ctx.steering_notes.clear();
-        self.rebuild_selector();
+        // Same lifecycle as CLI --resume and `/resume` (P1-04): canonical
+        // semantic replay plus a full registry/browser/parent-binding rebuild.
+        let assembler = SessionAssembler::from_context(&self.ctx);
+        let assembled = assembler
+            .assemble_resume(&session_record.id, session_record.mode.clone())
+            .await?;
+        if !assembled.semantic_complete {
+            self.entries.push(TuiEntry::new(
+                EntryKind::System,
+                format!(
+                    "Session {} predates semantic startup metadata; used legacy replay fallback.",
+                    short_id(&session_record.id)
+                ),
+            ));
+        }
+        if assembled.pending_task_results > 0 {
+            self.entries.push(TuiEntry::new(
+                EntryKind::System,
+                format!(
+                    "{} background task result(s) pending; delivered at the next turn boundary.",
+                    assembled.pending_task_results
+                ),
+            ));
+        }
+        switch_to(&mut self.ctx, assembled);
         self.refresh_events().await;
         self.rebuild_transcript_from_events().await;
         self.refresh_sessions().await;
@@ -1025,39 +1062,34 @@ impl TuiApp {
             .map(|event| event.event_index)
             .unwrap_or_default();
         let title = title.unwrap_or_else(|| "branch".into());
-        let new_session = self
-            .ctx
-            .session_db
-            .fork_session(session_id, fork_point, &title)
-            .await?;
-        self.resume_session(&new_session.id).await
+        self.fork_from(session_id, fork_point, title).await
     }
 
     async fn fork_at(&mut self, event_index: u64, title: Option<String>) -> anyhow::Result<()> {
         let title = title.unwrap_or_else(|| format!("branch at event {event_index}"));
-        let new_session = self
-            .ctx
-            .session_db
-            .fork_session(&self.ctx.session_id, event_index, &title)
-            .await?;
-        self.resume_session(&new_session.id).await?;
-        self.status = format!(
-            "Forked at event {event_index} into {}.",
-            short_id(&new_session.id)
-        );
-        Ok(())
+        let parent_id = self.ctx.session_id.clone();
+        self.fork_from(&parent_id, event_index, title).await
     }
 
-    fn rebuild_selector(&mut self) {
-        let mut selector = Selector::new();
-        for wf in crate::workflows::create_builtin_workflows(
-            self.ctx.llm.clone(),
-            self.ctx.registry.clone(),
-            self.ctx.guards.clone(),
-        ) {
-            selector.register(wf);
-        }
-        self.ctx.selector = selector;
+    /// Fork `parent_id` at `fork_point` and switch into the child — the same
+    /// atomic fork + canonical load every other entry point uses (P1-04).
+    async fn fork_from(
+        &mut self,
+        parent_id: &str,
+        fork_point: u64,
+        title: String,
+    ) -> anyhow::Result<()> {
+        let assembler = SessionAssembler::from_context(&self.ctx);
+        let assembled = assembler
+            .assemble_fork(parent_id, fork_point, &title, "branch")
+            .await?;
+        let new_id = assembled.session_id.clone();
+        switch_to(&mut self.ctx, assembled);
+        self.refresh_events().await;
+        self.rebuild_transcript_from_events().await;
+        self.refresh_sessions().await;
+        self.status = format!("Forked at event {fork_point} into {}.", short_id(&new_id));
+        Ok(())
     }
 
     async fn refresh_sessions(&mut self) {
@@ -1170,24 +1202,86 @@ impl TuiApp {
         }
     }
 
-    fn push_dashboard(&mut self) {
-        let dashboard = self
+    async fn push_ledger_status(&mut self, args: &str) {
+        let case_id = match self
             .ctx
-            .mind_palace
-            .dashboard(&self.ctx.runtime_session.mode);
-        if dashboard.sections.is_empty() {
-            self.entries
-                .push(TuiEntry::new(EntryKind::System, "Dashboard is empty."));
-            return;
+            .session_db
+            .case_id_for_session(&self.ctx.session_id)
+            .await
+        {
+            Ok(case_id) => case_id,
+            Err(error) => {
+                self.entries.push(TuiEntry::new(
+                    EntryKind::Error,
+                    format!("Case lookup failed: {error}"),
+                ));
+                return;
+            }
+        };
+        if args.trim() == "compact" {
+            match self.ctx.session_db.compact_snapshot(&case_id, 1).await {
+                Ok(result) => {
+                    self.status = format!(
+                        "Ledger snapshot {} at event {}.",
+                        if result.written { "rebuilt" } else { "current" },
+                        result.projected_seq
+                    )
+                }
+                Err(error) => {
+                    self.entries.push(TuiEntry::new(
+                        EntryKind::Error,
+                        format!("Ledger snapshot rebuild failed: {error}"),
+                    ));
+                    return;
+                }
+            }
         }
-        let mut text = String::new();
-        for (_name, section) in dashboard.sections {
-            text.push_str(&format!(
-                "[{}]\n{}\n\n",
-                section.title, section.content_summary
-            ));
+        match self.ctx.session_db.load(&case_id).await {
+            Ok(snapshot) => {
+                let mut lines = vec![
+                    format!("Case Ledger {} @ v{}", snapshot.case_id, snapshot.version),
+                    format!(
+                        "Hypotheses: {}  Predictions: {}  Experiments: {}",
+                        snapshot.hypotheses.len(),
+                        snapshot.predictions.len(),
+                        snapshot.experiments.len()
+                    ),
+                    format!(
+                        "Evidence: {}  Links: {}  Resolutions: {}  Contradictions: {}",
+                        snapshot.evidence.len(),
+                        snapshot.evidence_links.len(),
+                        snapshot.resolutions.len(),
+                        snapshot.contradictions.len()
+                    ),
+                ];
+                lines.extend(snapshot.hypotheses.values().map(|hypothesis| {
+                    format!(
+                        "[{} {:?}/{:?} r{}] {}",
+                        hypothesis.id,
+                        hypothesis.status,
+                        hypothesis.priority,
+                        hypothesis.revision,
+                        truncate_chars(&hypothesis.claim, 100)
+                    )
+                }));
+                lines.extend(snapshot.experiments.values().map(|experiment| {
+                    format!(
+                        "[{} {:?} attempt={} task={}] {}",
+                        experiment.id,
+                        experiment.status,
+                        experiment.attempt,
+                        experiment.task_id.as_deref().unwrap_or("-"),
+                        truncate_chars(&experiment.action, 80)
+                    )
+                }));
+                self.entries
+                    .push(TuiEntry::new(EntryKind::System, lines.join("\n")));
+            }
+            Err(error) => self.entries.push(TuiEntry::new(
+                EntryKind::Error,
+                format!("Ledger load failed: {error}"),
+            )),
         }
-        self.entries.push(TuiEntry::new(EntryKind::System, text));
     }
 
     fn push_tools(&mut self, arg: &str) {
@@ -1993,18 +2087,16 @@ impl TuiApp {
         height: u16,
         input_height: u16,
     ) -> anyhow::Result<()> {
+        // While the model is working or an overlay owns the screen, the text input is not
+        // the focus — keep the terminal caret hidden.
         if self.busy || !matches!(self.overlay, Overlay::None) {
+            queue!(stdout, Hide)?;
             return Ok(());
         }
-        let body_width = width.saturating_sub(12).max(10) as usize;
-        let before = &self.input[..self.cursor.min(self.input.len())];
-        let line = before.chars().count() / body_width;
-        let col = before.chars().count() % body_width;
-        let y = height
-            .saturating_sub(input_height + 2)
-            .saturating_add(1 + line as u16);
-        let x = 9 + col as u16;
-        queue!(stdout, MoveTo(x.min(width.saturating_sub(1)), y))?;
+        let (x, y) = input_caret_pos(&self.input, self.cursor, width, height, input_height);
+        // Position AND show the caret so it visibly advances as the user types (it was
+        // globally hidden at startup and only MoveTo'd here — never shown).
+        queue!(stdout, MoveTo(x, y), Show)?;
         Ok(())
     }
 }
@@ -2019,13 +2111,15 @@ struct TuiRuntimeSink<'a> {
 impl RuntimeSink for TuiRuntimeSink<'_> {
     fn emit(&mut self, event: StreamEvent) {
         match event.data {
+            // The classic TUI renders whole assistant blocks; ignore streaming fragments.
+            RuntimeYield::TextDelta { .. } => {}
             RuntimeYield::MessageToUser { content }
             | RuntimeYield::PlanUpdate { content }
             | RuntimeYield::FinalAnswer { content, .. } => {
                 self.entries
                     .push(TuiEntry::new(EntryKind::Assistant, content));
             }
-            RuntimeYield::ToolStarted { name, call_id } => {
+            RuntimeYield::ToolStarted { name, call_id, .. } => {
                 let suffix = call_id
                     .as_deref()
                     .map(|id| format!(" ({})", short_id(id)))
@@ -2074,6 +2168,25 @@ impl RuntimeSink for TuiRuntimeSink<'_> {
             RuntimeYield::EvidenceUpdate { content } => {
                 self.entries
                     .push(TuiEntry::new(EntryKind::Evidence, content));
+            }
+            RuntimeYield::SteeringInjected { content } => {
+                self.entries.push(TuiEntry::new(
+                    EntryKind::System,
+                    format!("steering: {content}"),
+                ));
+            }
+            RuntimeYield::BackgroundTaskFinished {
+                description,
+                success,
+                ..
+            } => {
+                self.entries.push(TuiEntry::new(
+                    EntryKind::System,
+                    format!(
+                        "⚑ background task \"{description}\" {}",
+                        if success { "completed" } else { "failed" }
+                    ),
+                ));
             }
             RuntimeYield::NeedsUserInput { prompt } => {
                 self.entries
@@ -2256,6 +2369,30 @@ fn flatten_entries(entries: &[TuiEntry], width: usize) -> Vec<RenderLine> {
     lines
 }
 
+/// Screen (col, row) of the text caret for the input area. Kept pure (no I/O) so the
+/// "caret advances as you type" behavior is unit-testable. `body_width` mirrors
+/// render_input's wrap width; row 0 is prefixed by "Watson > "/"Holmes > " (9 cols),
+/// continuation rows by 8 spaces.
+fn input_caret_pos(
+    input: &str,
+    cursor: usize,
+    width: u16,
+    height: u16,
+    input_height: u16,
+) -> (u16, u16) {
+    let body_width = width.saturating_sub(10).max(10) as usize;
+    let before = &input[..cursor.min(input.len())];
+    let chars_before = before.chars().count();
+    let line = chars_before / body_width;
+    let col = chars_before % body_width;
+    let prefix: u16 = if line == 0 { 9 } else { 8 };
+    let y = height
+        .saturating_sub(input_height + 2)
+        .saturating_add(1 + line as u16);
+    let x = (prefix + col as u16).min(width.saturating_sub(1));
+    (x, y)
+}
+
 fn wrap_plain(input: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
@@ -2433,4 +2570,106 @@ fn mark(selected: usize, row: usize) -> &'static str {
 
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// Is this key an interrupt request (Esc, or Ctrl+C)?
+fn is_interrupt_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Esc)
+        || (matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Spawn a background task that watches the keyboard while a turn runs and sets
+/// `cancel` on Esc/Ctrl+C. It polls on a short timeout so it can observe `stop`
+/// (set by `run_turn` once the turn ends) and exit promptly. Non-interrupt keys
+/// pressed during a turn are consumed and discarded (input is otherwise frozen).
+fn spawn_interrupt_watcher(
+    cancel: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    typed: Arc<std::sync::Mutex<Vec<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // While a turn runs the watcher is the only keyboard reader: Esc/Ctrl+C cancels
+        // the turn, and any other typed line is captured as a queued follow-up (steering
+        // / type-ahead), drained into `queued_turns` once the turn ends.
+        let mut line = String::new();
+        while !stop.load(Ordering::Relaxed) {
+            let key =
+                tokio::task::spawn_blocking(|| match event::poll(Duration::from_millis(80)) {
+                    Ok(true) => match event::read() {
+                        Ok(TerminalEvent::Key(key)) => Some(key),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .await
+                .unwrap_or(None);
+
+            let Some(key) = key else { continue };
+            if is_interrupt_key(&key) {
+                cancel.store(true, Ordering::Relaxed);
+                line.clear();
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    let text = line.trim().to_string();
+                    line.clear();
+                    if !text.is_empty() {
+                        if let Ok(mut queue) = typed.lock() {
+                            queue.push(text);
+                        }
+                    }
+                }
+                KeyCode::Char(c) => line.push(c),
+                KeyCode::Backspace => {
+                    line.pop();
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod caret_tests {
+    use super::input_caret_pos;
+
+    const W: u16 = 80;
+    const H: u16 = 24;
+    const IH: u16 = 3;
+
+    #[test]
+    fn caret_advances_one_column_per_typed_char() {
+        // "abc": caret at byte offsets 0..=3 → columns 9,10,11,12 on row 0.
+        for (cursor, expected_x) in [(0u16, 9u16), (1, 10), (2, 11), (3, 12)] {
+            let (x, y) = input_caret_pos("abc", cursor as usize, W, H, IH);
+            assert_eq!(x, expected_x, "cursor {cursor}");
+            assert_eq!(y, H - (IH + 2) + 1, "row 0");
+        }
+    }
+
+    #[test]
+    fn empty_input_caret_sits_after_the_prompt() {
+        assert_eq!(input_caret_pos("", 0, W, H, IH).0, 9);
+    }
+
+    #[test]
+    fn multibyte_chars_advance_by_one_column_each() {
+        // "你好" — each char is 3 bytes. Caret after the first char (byte 3) is one column
+        // past the prompt, not three.
+        let (x, _) = input_caret_pos("你好", 3, W, H, IH);
+        assert_eq!(x, 10, "one visual column per CJK char");
+        let (x2, _) = input_caret_pos("你好", 6, W, H, IH);
+        assert_eq!(x2, 11);
+    }
+
+    #[test]
+    fn wraps_to_continuation_row_past_body_width() {
+        let body_width = (W - 10) as usize; // 70
+        let input = "a".repeat(body_width + 5);
+        let (x, y) = input_caret_pos(&input, input.len(), W, H, IH);
+        assert_eq!(y, H - (IH + 2) + 1 + 1, "second row");
+        assert_eq!(x, 8 + 5, "continuation prefix is 8 + col");
+    }
 }

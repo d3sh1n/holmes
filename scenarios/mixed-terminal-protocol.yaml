@@ -1,0 +1,61 @@
+name: mixed-terminal-protocol
+description: >-
+  P0-02 acceptance: a single model response combining `finish` with an executable
+  tool call is a protocol error. Nothing in it is executed — the tool is not silently
+  dropped nor run — the violation is fed back, and the model recovers by re-issuing
+  the tool call first and finishing (alone) afterwards.
+mode: pentest
+turns:
+  - input: "Confirm example.test is reachable."
+tools:
+  - name: echo_probe
+    description: Returns deterministic probe evidence.
+    output: example.test is reachable
+    read_only: true
+scripted_responses:
+  # 1. Protocol violation: finish + executable tool in one response. Rejected
+  #    wholesale; the probe does NOT run here.
+  - tool_calls:
+      - id: call-finish-mixed
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"reachable","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+      - id: call-probe-mixed
+        type: function
+        function:
+          name: echo_probe
+          arguments: '{"target":"example.test"}'
+  # 2. The tool call, re-issued alone.
+  - tool_calls:
+      - id: call-probe
+        type: function
+        function:
+          name: echo_probe
+          arguments: '{"target":"example.test"}'
+  # 3. finish, alone this time.
+  - tool_calls:
+      - id: call-finish
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"Reachability confirmed by probe.","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+  # 4. Consumed by the semantic verifier (goal_evaluator role).
+  - content: '{"schema_version":1,"satisfied":true,"gaps":[],"evidence_ids":["ev-1"]}'
+expectations:
+  final_contains:
+    - Reachability confirmed by probe
+  event_sequence:
+    - user_message
+    - tool_call
+    - tool_result
+    - goal_evaluated
+    - turn_complete
+  event_payloads:
+    - event_type: user_message
+      contains:
+        - Protocol violation
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":true'
+  max_errors: 0

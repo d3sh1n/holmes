@@ -2,12 +2,19 @@
 name = "holmes-core"
 version = "0.1.0"
 edition = "2021"
+# Internal workspace crate: never published to a registry (cargo-deny treats
+# publish = false crates as private and skips their license check).
+publish = false
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-util = "0.7"
+tracing = { workspace = true }

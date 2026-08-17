@@ -1,0 +1,45 @@
+name: answer-gate-plain-text
+description: >-
+  P0-02 acceptance: on an action-classified request the model answers in plain text
+  without running any tool. The unified completion gate rejects the claim (derived
+  task contract requirement unmet), feeds the gap back, and only the later
+  evidence-backed answer — after the semantic verifier signs off — completes the turn.
+mode: pentest
+turns:
+  - input: "Confirm example.test is reachable."
+tools:
+  - name: echo_probe
+    description: Returns deterministic probe evidence.
+    output: example.test is reachable
+    read_only: true
+scripted_responses:
+  # 1. Premature plain-text answer: no tool has run — the gate must reject it.
+  - content: "example.test is reachable."
+  # 2. The actual probe, driven by the rejection feedback.
+  - tool_calls:
+      - id: call-probe
+        type: function
+        function:
+          name: echo_probe
+          arguments: '{"target":"example.test"}'
+  # 3. The evidence-backed answer.
+  - content: "Reachability confirmed by probe."
+  # 4. Consumed by the semantic verifier (goal_evaluator role).
+  - content: '{"schema_version":1,"satisfied":true,"gaps":[],"evidence_ids":["ev-1"]}'
+expectations:
+  final_contains:
+    - Reachability confirmed by probe
+  tool_calls:
+    - echo_probe
+  event_payloads:
+    # The gated rejection records the unmet contract requirement.
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":false'
+        - req-1
+    # The evidence-backed answer passes with evidence attached.
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":true'
+        - "verified; evidence"
+  max_errors: 0

@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use holmes_cli::{chat, setup, tui};
+use holmes_cli::{chat, inline_ui, setup, tui};
 use holmes_harness::{HarnessRunner, HarnessScenario};
 use std::path::PathBuf;
 
@@ -21,11 +21,11 @@ struct Cli {
     #[arg(short, long)]
     query: Option<String>,
 
-    /// Start the legacy line REPL instead of the default full-screen TUI
+    /// Start the legacy line REPL instead of the default inline TUI
     #[arg(long)]
     repl: bool,
 
-    /// Start the full-screen TUI explicitly
+    /// Start the legacy full-screen TUI explicitly
     #[arg(long)]
     tui: bool,
 
@@ -40,16 +40,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start interactive chat (full-screen TUI by default)
+    /// Start interactive chat (inline TUI by default)
     Chat {
-        /// Start the legacy line REPL instead of the default full-screen TUI
+        /// Start the legacy line REPL instead of the default inline TUI
         #[arg(long)]
         repl: bool,
-        /// Start the full-screen TUI explicitly
+        /// Start the legacy full-screen TUI explicitly
         #[arg(long)]
         tui: bool,
     },
-    /// Start full-screen TUI
+    /// Start the legacy full-screen TUI
     Tui,
     /// Start legacy line REPL
     Repl,
@@ -71,27 +71,18 @@ fn holmes_data_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // Default `warn`, but silence chromiumoxide's noisy CDP stream:
-                // Chrome 149 emits event variants the chromiumoxide 0.9 schema
-                // can't deserialize, so it logs a WARN per ignored message and
-                // floods the TUI on heavy SPA pages. Drop that crate to ERROR.
-                .unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new("warn,chromiumoxide=error")
-                }),
-        )
-        .init();
-
     let cli = Cli::parse();
+    // Interactive terminal UIs (inline/classic TUI, REPL) own the screen — tracing logs
+    // written to stderr would corrupt the display (interleave with the ratatui viewport).
+    // Route logs to a file for those; keep stderr for one-shot / non-interactive commands.
+    init_tracing(is_interactive_session(&cli));
 
     match cli.command {
         None if cli.query.is_some() || cli.repl => {
             chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
         }
         None => {
-            tui::run_tui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
+            launch_ui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
         }
         Some(Commands::Chat {
             repl: chat_repl,
@@ -100,14 +91,14 @@ async fn main() -> anyhow::Result<()> {
             if cli.query.is_some() || cli.repl || chat_repl {
                 chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
             } else {
-                tui::run_tui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
+                launch_ui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
             }
         }
         Some(Commands::Tui) => {
             if cli.query.is_some() {
                 eprintln!("tui is interactive; ignoring --query and starting the TUI.");
             }
-            tui::run_tui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
+            launch_ui(cli.resume, cli.r#continue, cli.model, cli.mode).await?;
         }
         Some(Commands::Repl) => {
             chat::run_chat(cli.resume, cli.r#continue, cli.query, cli.model, cli.mode).await?;
@@ -132,4 +123,58 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether this invocation runs an interactive terminal UI (TUI/REPL) that owns the screen
+/// — in which case tracing logs must NOT go to stderr (they'd corrupt the display).
+fn is_interactive_session(cli: &Cli) -> bool {
+    if cli.query.is_some() {
+        return false;
+    }
+    matches!(
+        &cli.command,
+        None | Some(Commands::Tui) | Some(Commands::Repl) | Some(Commands::Chat { .. })
+    )
+}
+
+/// Initialize tracing. For interactive sessions, logs go to `<data_dir>/holmes.log` so the
+/// terminal UI isn't corrupted; otherwise they go to stderr as before.
+fn init_tracing(interactive: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        // Default `warn`, but silence chromiumoxide's noisy CDP stream (Chrome emits event
+        // variants chromiumoxide can't deserialize → a WARN per ignored message).
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,chromiumoxide=error"));
+
+    if interactive {
+        let dir = holmes_data_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("holmes.log"))
+        {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(move || file.try_clone().expect("clone holmes.log handle"))
+                .init();
+            return;
+        }
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Launch the interactive UI. Defaults to the new inline (Claude-Code-style) UI; set
+/// `HOLMES_CLASSIC_TUI=1` to use the legacy full-screen TUI during the transition.
+async fn launch_ui(
+    resume: Option<String>,
+    continue_last: bool,
+    model: Option<String>,
+    mode: String,
+) -> anyhow::Result<()> {
+    if std::env::var_os("HOLMES_CLASSIC_TUI").is_some() {
+        tui::run_tui(resume, continue_last, model, mode).await
+    } else {
+        inline_ui::run(resume, continue_last, model, mode).await
+    }
 }

@@ -1,0 +1,35 @@
+name: tool-deadline
+description: >-
+  Fault injection (AGT-002/AGT-015): a hung tool (10s artificial latency) is cut
+  off by the configured 150ms tool deadline (plus the registry grace), the
+  deadline error is fed back to the model, and control is never surrendered to
+  the hung call. Because the probe never produced output, the unified completion
+  gate (P0-02) refuses to treat the follow-up report as a completion: with zero
+  verification retries configured, the turn ends as an explicit partial result
+  that still carries the model's report.
+mode: pentest
+config:
+  execution:
+    tool_deadline_ms: 150
+  supervisor:
+    max_verification_retries: 0
+turns:
+  - input: "Run slow_probe and report what it says."
+tools:
+  - name: slow_probe
+    description: Hangs for ten seconds before answering.
+    output: SHOULD-NEVER-APPEAR
+    read_only: true
+    delay_ms: 10000
+scripted_responses:
+  - tool_calls:
+      - id: call-slow-1
+        type: function
+        function:
+          name: slow_probe
+          arguments: '{"target":"example.test"}'
+  - content: '<holmes_decision>{"type":"answer","message":"The probe exceeded its deadline; recovered without it."}</holmes_decision>'
+expectations:
+  final_contains:
+    - recovered
+  max_errors: 1

@@ -28,7 +28,6 @@ pub struct HarnessScenario {
     #[serde(default)]
     pub config: Option<HarnessConfigOverride>,
 }
-
 impl HarnessScenario {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -60,6 +59,43 @@ pub struct HarnessConfigOverride {
     pub compressor: Option<HarnessCompressorOverride>,
     #[serde(default)]
     pub learning: Option<HarnessLearningOverride>,
+    #[serde(default)]
+    pub supervisor: Option<HarnessSupervisorOverride>,
+    #[serde(default)]
+    pub execution: Option<HarnessExecutionOverride>,
+    #[serde(default)]
+    pub permissions: Option<HarnessPermissionsOverride>,
+}
+
+/// Execution-boundary override (AGT-002): lets reliability scenarios shrink the
+/// tool/turn deadlines so a hung tool times out in milliseconds instead of
+/// stretching the test for minutes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessExecutionOverride {
+    #[serde(default)]
+    pub turn_deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_deadline_ms: Option<u64>,
+}
+
+/// Permission-mode override (AGT-005): `ask` without an installed approver must
+/// deny mutating calls fail-closed; scenarios use this to prove it end-to-end.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessPermissionsOverride {
+    #[serde(default)]
+    pub mode: Option<holmes_core::config::PermissionMode>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessSupervisorOverride {
+    #[serde(default)]
+    pub max_repeat_action: Option<u32>,
+    #[serde(default)]
+    pub stagnation_limit: Option<u32>,
+    #[serde(default)]
+    pub max_verification_retries: Option<u32>,
+    #[serde(default)]
+    pub model_verification: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -80,16 +116,12 @@ pub struct HarnessCompressorOverride {
     pub target_ratio: Option<f64>,
     #[serde(default)]
     pub max_summary_tokens: Option<u32>,
-    #[serde(default)]
-    pub preserve_tool_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarnessLearningOverride {
     #[serde(default)]
     pub enabled: Option<bool>,
-    #[serde(default)]
-    pub background: Option<bool>,
     #[serde(default)]
     pub review_interval_turns: Option<u32>,
     #[serde(default)]
@@ -98,8 +130,6 @@ pub struct HarnessLearningOverride {
     pub memory_write_approval: Option<bool>,
     #[serde(default)]
     pub skill_write_approval: Option<bool>,
-    #[serde(default)]
-    pub rule_write_approval: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +149,7 @@ impl ScriptedLlmResponse {
             tool_calls: self.tool_calls,
             finish_reason: self.finish_reason,
             usage: None,
+            ..Default::default()
         }
     }
 }
@@ -134,6 +165,16 @@ pub struct HarnessTool {
     pub read_only: bool,
     #[serde(default)]
     pub fail: bool,
+    /// Fail the first N calls, then succeed. Models a flaky tool so scenarios can
+    /// exercise failure-then-retry flows (e.g. completion verification rejecting an
+    /// unresolved failure, then accepting after the retried call succeeds).
+    #[serde(default)]
+    pub fail_times: Option<u32>,
+    /// Sleep this long before responding. Models a hung/slow tool so scenarios can
+    /// exercise the execution boundary (tool deadline, cancellation) — the call
+    /// only returns `output` if it survives the configured deadline.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
 }
 
 fn default_tool_output() -> String {
@@ -192,7 +233,6 @@ config:
     protect_last_n: 2
     target_ratio: 0.4
     max_summary_tokens: 200
-    preserve_tool_groups: true
 "#,
         )
         .expect("scenario parses");
@@ -215,12 +255,10 @@ name: learning
 config:
   learning:
     enabled: true
-    background: false
     review_interval_turns: 2
     max_candidates_per_turn: 3
     memory_write_approval: true
     skill_write_approval: true
-    rule_write_approval: false
 "#,
         )
         .expect("scenario parses");
@@ -231,11 +269,10 @@ config:
             .learning
             .expect("learning override");
         assert_eq!(learning.enabled, Some(true));
-        assert_eq!(learning.background, Some(false));
         assert_eq!(learning.review_interval_turns, Some(2));
         assert_eq!(learning.max_candidates_per_turn, Some(3));
         assert_eq!(learning.memory_write_approval, Some(true));
-        assert_eq!(learning.rule_write_approval, Some(false));
+        assert_eq!(learning.skill_write_approval, Some(true));
     }
 
     #[test]

@@ -1,14 +1,16 @@
+use crate::event::Severity;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FindingConfidence {
+    #[default]
     Candidate,
     Confirmed,
     Rejected,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Finding {
     pub id: String,
     pub finding_type: String,
@@ -16,6 +18,17 @@ pub struct Finding {
     pub evidence: String,
     pub details: String,
     pub attack_type: String,
+    /// Triage severity (defaults to `Info` until the model scores it).
+    #[serde(default)]
+    pub severity: Severity,
+    /// Where the issue lives — endpoint / parameter / component. Empty until set.
+    #[serde(default)]
+    pub location: String,
+    /// The tool call id whose raw request/response evidences this finding, linking the
+    /// finding back to the reproducible transaction (the blob-offloaded ToolResult
+    /// payload, restorable from the `blobs` tables alone).
+    #[serde(default)]
+    pub evidence_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

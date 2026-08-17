@@ -1,7 +1,8 @@
 use holmes_core::event::{Event, StoredEvent};
 use holmes_core::session::{RuntimeSession, SessionLineage};
-use holmes_core::{FunctionCall, Message, SessionMode, TokenDelta, ToolCall};
+use holmes_core::{FunctionCall, Message, Role, SessionMode, TokenDelta, ToolCall};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 use crate::ArchivedEventRange;
 
@@ -29,6 +30,147 @@ impl ReplayMessage {
             message,
             origin_event_index: origin_event_index.into(),
         }
+    }
+}
+
+/// One call inside an open tool run: the message-level tool call plus the event
+/// that produced it.
+#[derive(Debug, Clone)]
+struct PendingCall {
+    tool_call: ToolCall,
+    origin_event_index: u64,
+}
+
+/// A maximal run of consecutive tool-phase events (`ToolCall` / `ToolResult` /
+/// `ToolBlocked`). One run corresponds to one model response's tool batch, so
+/// the flush emits a single assistant message carrying every call, followed by
+/// one result message per call — correlated by call id, never by adjacency or
+/// tool name (P1-03).
+#[derive(Debug, Default)]
+struct ToolRun {
+    calls: Vec<PendingCall>,
+    /// Answered results, keyed by the assigned tool-call id.
+    results: HashMap<String, Message>,
+}
+
+impl ToolRun {
+    /// Match a result/blocked event to a pending call: by native call id when
+    /// the event carries one, otherwise (legacy events) the first still
+    /// unanswered call with the same tool name.
+    fn match_call(&self, call_id: Option<&str>, name: &str) -> Option<String> {
+        if let Some(call_id) = call_id {
+            return self
+                .calls
+                .iter()
+                .find(|pending| pending.tool_call.id == call_id)
+                .map(|pending| pending.tool_call.id.clone());
+        }
+        self.calls
+            .iter()
+            .find(|pending| {
+                pending.tool_call.function.name == name
+                    && !self.results.contains_key(&pending.tool_call.id)
+            })
+            .map(|pending| pending.tool_call.id.clone())
+    }
+}
+
+/// Flush an open tool run into replayed messages: one assistant message with
+/// every call, then one result message per call in call order. Calls left
+/// unanswered at run end (crash between `ToolCall` and its outcome event, or a
+/// legacy `ToolBlocked`-only log) get a synthesized failure result so the
+/// replayed history always pairs every tool_use with a tool_result.
+fn flush_tool_run(
+    run: &mut ToolRun,
+    messages: &mut Vec<ReplayMessage>,
+    warnings: &mut Vec<String>,
+) {
+    if run.calls.is_empty() {
+        return;
+    }
+    let ToolRun { calls, results } = std::mem::take(run);
+
+    let assistant_index = calls
+        .last()
+        .map(|pending| pending.origin_event_index)
+        .unwrap_or(0);
+    let tool_calls: Vec<ToolCall> = calls
+        .iter()
+        .map(|pending| pending.tool_call.clone())
+        .collect();
+    messages.push(ReplayMessage::new(
+        Message::assistant_with_tool_calls(tool_calls),
+        assistant_index,
+    ));
+
+    for pending in &calls {
+        let id = &pending.tool_call.id;
+        let name = &pending.tool_call.function.name;
+        let result_message = results.get(id).cloned().unwrap_or_else(|| {
+            warnings.push(format!(
+                "tool_call '{}' ({}) has no result or blocked event; synthesizing failure result",
+                name, id
+            ));
+            Message::tool_result(
+                id.clone(),
+                name.clone(),
+                "[Tool result missing from the session event log — the session was interrupted before a result was recorded.]",
+            )
+        });
+        messages.push(ReplayMessage::new(
+            result_message,
+            pending.origin_event_index,
+        ));
+    }
+}
+
+/// Final safety net: after compaction replacement, an assistant message can
+/// survive while its result messages were archived away. Insert a synthesized
+/// failure result right after any assistant message whose tool calls have no
+/// matching result anywhere in the replayed history.
+fn legalize_tool_history(messages: &mut Vec<ReplayMessage>, warnings: &mut Vec<String>) {
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter(|entry| entry.message.role == Role::Tool)
+        .filter_map(|entry| entry.message.tool_call_id.as_deref())
+        .collect();
+
+    // (insert position, synthesized results); applied back-to-front so earlier
+    // positions stay valid.
+    let mut inserts: Vec<(usize, Vec<ReplayMessage>)> = Vec::new();
+    for (index, entry) in messages.iter().enumerate() {
+        if entry.message.role != Role::Assistant {
+            continue;
+        }
+        let Some(tool_calls) = entry.message.tool_calls.as_deref() else {
+            continue;
+        };
+        let missing: Vec<ReplayMessage> = tool_calls
+            .iter()
+            .filter(|call| !answered.contains(call.id.as_str()))
+            .map(|call| {
+                warnings.push(format!(
+                    "assistant tool_use '{}' ({}) lost its tool_result (e.g. archived by compaction); synthesizing failure result",
+                    call.function.name, call.id
+                ));
+                ReplayMessage::new(
+                    Message::tool_result(
+                        call.id.clone(),
+                        call.function.name.clone(),
+                        "[Tool result unavailable in the replayed session history.]",
+                    ),
+                    entry.origin_event_index,
+                )
+            })
+            .collect();
+        if !missing.is_empty() {
+            inserts.push((index + 1, missing));
+        }
+    }
+
+    for (position, synthesized) in inserts.into_iter().rev() {
+        let position = position.min(messages.len());
+        messages.splice(position..position, synthesized);
     }
 }
 
@@ -79,7 +221,7 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
     let mut compactions = Vec::new();
     let mut branch_summaries = Vec::new();
     let mut warnings = Vec::new();
-    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_run = ToolRun::default();
 
     let mut saw_session_created = false;
     let mut saw_system_prompt = false;
@@ -129,6 +271,7 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
                 active_tools = tool_names.clone();
             }
             Event::BranchSummary { summary, .. } => {
+                flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
                 branch_summaries.push(summary.clone());
                 messages.push(ReplayMessage::new(
                     Message::user(format!("[Branch summary]\n{summary}")),
@@ -141,6 +284,7 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
                 archived_event_range,
                 ..
             } => {
+                flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
                 let archived_event_range =
                     archived_event_range.map(|(start, end)| ArchivedEventRange { start, end });
                 compactions.push(CompactionReplayMarker {
@@ -164,42 +308,54 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
                     messages.push(summary_message);
                 }
             }
-            Event::UserMessage { content, .. } => messages.push(ReplayMessage::new(
-                Message::user(content.clone()),
-                stored.event_index,
-            )),
-            Event::Thinking { content, .. } => messages.push(ReplayMessage::new(
-                Message::assistant(content.clone()),
-                stored.event_index,
-            )),
+            Event::UserMessage { content, .. } => {
+                flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
+                messages.push(ReplayMessage::new(
+                    Message::user(content.clone()),
+                    stored.event_index,
+                ));
+            }
+            Event::Thinking { content, .. } => {
+                flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
+                messages.push(ReplayMessage::new(
+                    Message::assistant(content.clone()),
+                    stored.event_index,
+                ));
+            }
             Event::ToolCall {
-                name, arguments, ..
+                name,
+                arguments,
+                call_id,
+                ..
             } => {
                 let tool_call = ToolCall {
-                    id: format!("replay-tool-call-{}", stored.event_index),
+                    id: call_id
+                        .clone()
+                        .unwrap_or_else(|| format!("replay-tool-call-{}", stored.event_index)),
                     call_type: "function".into(),
                     function: FunctionCall {
                         name: name.clone(),
                         arguments: arguments.to_string(),
                     },
                 };
-                pending_tool_calls.push(tool_call.clone());
-                messages.push(ReplayMessage::new(
-                    Message::assistant_with_tool_calls(vec![tool_call]),
-                    stored.event_index,
-                ));
+                tool_run.calls.push(PendingCall {
+                    tool_call,
+                    origin_event_index: stored.event_index,
+                });
             }
-            Event::ToolResult { name, content, .. } => {
-                if let Some(position) = pending_tool_calls
-                    .iter()
-                    .position(|call| call.function.name == *name)
-                {
-                    let tool_call = pending_tool_calls.remove(position);
-                    messages.push(ReplayMessage::new(
-                        Message::tool_result(tool_call.id, name.clone(), content.clone()),
-                        stored.event_index,
-                    ));
+            Event::ToolResult {
+                name,
+                content,
+                call_id,
+                ..
+            } => {
+                if let Some(id) = tool_run.match_call(call_id.as_deref(), name) {
+                    tool_run.results.insert(
+                        id.clone(),
+                        Message::tool_result(id, name.clone(), content.clone()),
+                    );
                 } else {
+                    flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
                     warnings.push(format!(
                         "tool_result event {} for '{}' has no preceding tool_call; replaying as text context",
                         stored.event_index, name
@@ -210,9 +366,40 @@ pub fn replay_events(session_id: &str, events: &[StoredEvent]) -> ReplayedSessio
                     ));
                 }
             }
+            Event::ToolBlocked {
+                tool_name,
+                guard_name,
+                reason,
+                call_id,
+            } => {
+                // A blocked call never executed, but the model still saw a
+                // tool_use for it — synthesize the failure tool-result so the
+                // replayed history stays legal. The guard name and reason are
+                // the audit metadata of this event.
+                let content = format!("[Tool blocked by {guard_name}] {reason}");
+                if let Some(id) = tool_run.match_call(call_id.as_deref(), tool_name) {
+                    tool_run.results.insert(
+                        id.clone(),
+                        Message::tool_result(id, tool_name.clone(), content),
+                    );
+                } else {
+                    flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
+                    warnings.push(format!(
+                        "tool_blocked event {} for '{}' has no preceding tool_call; replaying as text context",
+                        stored.event_index, tool_name
+                    ));
+                    messages.push(ReplayMessage::new(
+                        Message::user(format!("[Tool blocked: {tool_name}]\n{content}")),
+                        stored.event_index,
+                    ));
+                }
+            }
             _ => {}
         }
     }
+
+    flush_tool_run(&mut tool_run, &mut messages, &mut warnings);
+    legalize_tool_history(&mut messages, &mut warnings);
 
     if let Some(prompt) = &system_prompt {
         if !matches!(messages.first(), Some(replay_message) if replay_message.message.role == holmes_core::Role::System && replay_message.message.content.as_deref() == Some(prompt.as_str()))

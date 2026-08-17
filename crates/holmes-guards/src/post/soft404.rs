@@ -4,16 +4,26 @@ use holmes_core::{ToolCall, ToolResult};
 use std::collections::HashMap;
 use tracing::debug;
 
+/// Length bucket (bytes) — near-identical bodies that differ only by a timestamp/nonce
+/// collapse to the same fingerprint instead of each looking unique.
+const LEN_BUCKET: usize = 64;
+
 pub struct Soft404Detector {
     response_fingerprints: HashMap<(u16, usize), u32>,
     threshold: u32,
+}
+
+impl Default for Soft404Detector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Soft404Detector {
     pub fn new() -> Self {
         Self {
             response_fingerprints: HashMap::new(),
-            threshold: 5,
+            threshold: 3,
         }
     }
 
@@ -35,7 +45,9 @@ impl Soft404Detector {
                 })
                 .unwrap_or(0);
             if status > 0 {
-                return Some((status, body_len));
+                // Bucket the length so responses differing only by a nonce/timestamp
+                // fingerprint together.
+                return Some((status, body_len / LEN_BUCKET * LEN_BUCKET));
             }
         }
         None
@@ -107,7 +119,7 @@ mod tests {
         })
         .to_string();
 
-        for _ in 0..5 {
+        for _ in 0..3 {
             let result = ToolResult::success("1", "http_request", &result_content);
             guard.process(&http_call(), &result, &mut state).await;
         }
@@ -115,7 +127,26 @@ mod tests {
         assert!(state.soft404_baseline.is_some());
         let (status, len) = state.soft404_baseline.unwrap();
         assert_eq!(status, 200);
-        assert_eq!(len, 4835);
+        assert_eq!(len, 4835 / 64 * 64); // bucketed
+    }
+
+    #[tokio::test]
+    async fn responses_differing_only_by_nonce_fingerprint_together() {
+        // Two bodies within the same 64-byte bucket must collapse to one fingerprint,
+        // so a timestamp/nonce doesn't defeat detection.
+        let mut guard = Soft404Detector::new();
+        let mut state = make_state();
+        for i in 0..3 {
+            // vary length by a few bytes (like a changing timestamp), same bucket
+            let body = "a".repeat(4820 + i);
+            let content = serde_json::json!({"status_code": 200, "body": body}).to_string();
+            let result = ToolResult::success("1", "http_request", &content);
+            guard.process(&http_call(), &result, &mut state).await;
+        }
+        assert!(
+            state.soft404_baseline.is_some(),
+            "near-identical bodies should still fingerprint together"
+        );
     }
 
     #[tokio::test]
@@ -128,7 +159,7 @@ mod tests {
         })
         .to_string();
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             let result = ToolResult::success("1", "http_request", &result_content);
             guard.process(&http_call(), &result, &mut state).await;
         }

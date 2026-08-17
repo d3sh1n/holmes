@@ -1,0 +1,61 @@
+name: false-evidence-finish
+description: Wrong evidence must not be accepted — a tool call fails, yet the model claims success in its finish summary. The deterministic verifier rejects the claim (unresolved failing call), the model retries the same call which now succeeds, and only then does the finish verify.
+mode: pentest
+turns:
+  - input: "Confirm the admin panel on example.test is reachable."
+tools:
+  - name: admin_probe
+    description: Fails once (connection refused), then succeeds.
+    output: admin panel responds 200
+    read_only: true
+    fail_times: 1
+scripted_responses:
+  # 1. set_goal (meta) + probe; the probe fails (first call).
+  - tool_calls:
+      - id: call-goal
+        type: function
+        function:
+          name: set_goal
+          arguments: '{"condition":"confirm the admin panel on example.test is reachable"}'
+      - id: call-probe-1
+        type: function
+        function:
+          name: admin_probe
+          arguments: '{"host":"example.test","path":"/admin"}'
+  # 2. Finish claiming success on the back of a failed call: rejected.
+  - tool_calls:
+      - id: call-finish-1
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"Admin panel confirmed reachable.","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+  # 3. Retry the same call; it succeeds this time.
+  - tool_calls:
+      - id: call-probe-2
+        type: function
+        function:
+          name: admin_probe
+          arguments: '{"host":"example.test","path":"/admin"}'
+  # 4. Finish again, now backed by a real success.
+  - tool_calls:
+      - id: call-finish-2
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"Admin panel confirmed via successful probe.","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+  # 5. Consumed by the completion verifier's semantic model check.
+  - content: '{"schema_version":1,"satisfied":true,"gaps":[],"evidence_ids":["ev-1"]}'
+expectations:
+  final_contains:
+    - Admin panel confirmed via successful probe
+  event_payloads:
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":false'
+        - admin_probe
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":true'
+        - "verified; evidence"
+  # One tool failure is expected (the first admin_probe call).
+  max_errors: 1

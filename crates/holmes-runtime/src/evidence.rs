@@ -258,6 +258,7 @@ mod tests {
                 evidence: "object id accepted".into(),
                 details: "user object reference".into(),
                 attack_type: "authorization".into(),
+                ..Default::default()
             },
         );
 
@@ -318,6 +319,7 @@ mod tests {
                 evidence: "script reflected".into(),
                 details: String::new(),
                 attack_type: "client-side".into(),
+                ..Default::default()
             },
         );
         context.state.compatibility_state.findings_mut().insert(
@@ -329,6 +331,7 @@ mod tests {
                 evidence: "sql error".into(),
                 details: String::new(),
                 attack_type: "injection".into(),
+                ..Default::default()
             },
         );
 
@@ -393,6 +396,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: None,
             usage: None,
+            ..Default::default()
         }));
 
         RuntimeContext::new(

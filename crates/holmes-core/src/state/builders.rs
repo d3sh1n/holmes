@@ -1,20 +1,25 @@
 use super::immutable::ImmutableFields;
 use super::tool_truth::{AttackSurface, EvidenceBundle};
 use super::validated::Finding;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+/// A single task in the agent's working plan (written via the `write_todos` tool,
+/// tracked by the `PlanTracker` PostGuard, surfaced in the perception frame).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    /// "pending" | "in_progress" | "completed".
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum AttackPhase {
+    #[default]
     Recon,
     Hypothesize,
     Validate,
     Exploit,
-}
-
-impl Default for AttackPhase {
-    fn default() -> Self {
-        Self::Recon
-    }
 }
 
 impl std::fmt::Display for AttackPhase {
@@ -47,18 +52,21 @@ pub struct AttackState {
     pub(crate) findings: HashMap<String, Finding>,
 
     // Free zone (pub — agent loop writes directly)
-    pub current_attack_type: String,
     pub current_objective: String,
     pub consecutive_failures: u32,
     pub no_tool_rounds: u32,
     pub is_finished: bool,
     pub is_authenticated: bool,
     pub flag: Option<String>,
-    pub action_history: Vec<String>,
+    /// The agent's working task list (written by `write_todos` / `PlanTracker`).
+    pub plan: Vec<TodoItem>,
     pub phase: AttackPhase,
     pub soft404_baseline: Option<(u16, usize)>,
     pub last_progress_at: u32,
     pub file_access_tracker: HashMap<String, u64>,
+    /// Findings recorded this step that the runtime should persist as `FindingRecorded`
+    /// events (drained after PostGuards run, so findings survive turn boundaries/resume).
+    pub pending_findings: Vec<Finding>,
 }
 
 impl AttackState {
@@ -80,18 +88,18 @@ impl AttackState {
             attack_surface: AttackSurface::default(),
             evidence_bundle: EvidenceBundle::default(),
             findings: HashMap::new(),
-            current_attack_type: String::new(),
             current_objective: String::new(),
             consecutive_failures: 0,
             no_tool_rounds: 0,
             is_finished: false,
             is_authenticated: false,
             flag: None,
-            action_history: Vec::new(),
+            plan: Vec::new(),
             phase: AttackPhase::default(),
             soft404_baseline: None,
             last_progress_at: 0,
             file_access_tracker: HashMap::new(),
+            pending_findings: Vec::new(),
         }
     }
 
@@ -133,11 +141,46 @@ impl AttackState {
     /// cross-checks before being recorded. Callers in other production
     /// modules should treat findings as read-only via `findings()`.
     ///
-    /// The key is `finding.id`; an existing entry with the same id is
-    /// overwritten (matches the previous `findings_mut().insert(..)` behavior
-    /// SkepticGate relied on).
+    /// The key is `finding.id`. Confidence is **monotonic**: a re-report of an
+    /// already-`Confirmed` finding with a weaker confidence (e.g. a thin restatement
+    /// downgraded to `Candidate`) does NOT clobber the stronger record — it keeps the
+    /// Confirmed one (but still refreshes evidence/severity/location if richer). This
+    /// prevents a sloppy restatement from demoting a real vulnerability.
     pub fn record_finding(&mut self, finding: Finding) {
+        use crate::state::validated::FindingConfidence;
+        if let Some(existing) = self.findings.get(&finding.id) {
+            if existing.confidence == FindingConfidence::Confirmed
+                && finding.confidence != FindingConfidence::Confirmed
+            {
+                // Keep the confirmed verdict; adopt longer evidence/location if provided.
+                let mut merged = existing.clone();
+                if finding.evidence.len() > merged.evidence.len() {
+                    merged.evidence = finding.evidence;
+                }
+                if !finding.location.is_empty() {
+                    merged.location = finding.location;
+                }
+                self.findings.insert(merged.id.clone(), merged);
+                return;
+            }
+        }
         self.findings.insert(finding.id.clone(), finding);
+    }
+
+    /// Record a finding AND queue it for durable persistence as a `FindingRecorded`
+    /// event (drained by the runtime after PostGuards). Use this from SkepticGate so
+    /// findings survive turn boundaries and session resume.
+    pub fn record_and_persist_finding(&mut self, finding: Finding) {
+        self.record_finding(finding.clone());
+        // Persist the *effective* stored finding (post-monotonic-merge).
+        if let Some(stored) = self.findings.get(&finding.id).cloned() {
+            self.pending_findings.push(stored);
+        }
+    }
+
+    /// Drain findings awaiting persistence (called by the runtime after PostGuards).
+    pub fn take_pending_findings(&mut self) -> Vec<Finding> {
+        std::mem::take(&mut self.pending_findings)
     }
 
     /// Raw mutable access to the validated zone.
@@ -186,10 +229,10 @@ mod tests {
     #[test]
     fn free_zone_writable() {
         let mut state = make_state();
-        state.current_attack_type = "sqli".into();
+        state.current_objective = "enumerate".into();
         state.consecutive_failures = 3;
         state.is_finished = true;
-        assert_eq!(state.current_attack_type, "sqli");
+        assert_eq!(state.current_objective, "enumerate");
         assert!(state.is_finished);
     }
 

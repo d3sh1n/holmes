@@ -2,6 +2,9 @@
 name = "holmes-harness"
 version = "0.1.0"
 edition = "2021"
+# Internal workspace crate: never published to a registry (cargo-deny treats
+# publish = false crates as private and skips their license check).
+publish = false
 
 [dependencies]
 anyhow = { workspace = true }

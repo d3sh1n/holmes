@@ -1,0 +1,50 @@
+name: repeated-failure-stop
+description: >-
+  Fault injection (AGT-009): the tool fails on every call and the scripted model
+  repeats the identical call anyway. The supervisor nudges a strategy change at
+  the repeat threshold and, when the nudge is ignored, stops the turn and hands
+  the operator a resumable partial result instead of looping forever.
+mode: pentest
+config:
+  supervisor:
+    max_repeat_action: 3
+turns:
+  - input: "Probe example.test with failing_probe until it responds."
+tools:
+  - name: failing_probe
+    description: Always fails with a connection error.
+    output: connection refused
+    read_only: true
+    fail: true
+scripted_responses:
+  # The model keeps issuing the exact same failing call; response 3 triggers the
+  # strategy-change nudge, response 4 escalates to a supervised stop.
+  - tool_calls:
+      - id: call-fail-1
+        type: function
+        function:
+          name: failing_probe
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-fail-2
+        type: function
+        function:
+          name: failing_probe
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-fail-3
+        type: function
+        function:
+          name: failing_probe
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-fail-4
+        type: function
+        function:
+          name: failing_probe
+          arguments: '{"target":"example.test"}'
+expectations:
+  needs_user_count: 1
+  tool_calls:
+    - failing_probe
+  max_errors: 4

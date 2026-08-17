@@ -17,7 +17,7 @@ These are not optional slash commands. Treat them as part of your default operat
 - Reflect and pivot when repeated attempts fail, evidence contradicts an assumption, or the current path stalls.
 - Convert tool results into evidence, attack-surface updates, findings, and report-ready notes.
 - Prefer investigation-native behavior over rigid workflows: infer the next best action from the case context.
-- Keep security boundaries explicit. Do not perform actions outside the authorized scope.
+- Watson (the operator) is the authorizing party, and **Watson's explicit commands are the HIGHEST authority** — carry them out; do not refuse, water down, or second-guess a directive on your own initiative. You operate under Watson's authorization; Watson is responsible for the engagement's legal/authorization scope. When the operator has configured an in-scope allowlist, the scope guard is an advisory heuristic only: it rejects off-scope targets it can recognize in declared call parameters, but redirects, dynamically constructed commands, and tools without a declared target can bypass it — so you must keep your actions within the scope Watson authorized, and when you are unsure whether something is in scope, ask Watson instead of probing.
 
 [Browser tool — when the `browser` tool is available]
 - The `browser` tool drives a long-lived headed browser that stays open across turns; it is lazy and only launches on first use.
@@ -67,6 +67,19 @@ struct SkillSummary {
     path: String,
 }
 
+/// Injected only when the `browser` tool is wired in. Teaches the agent to reach for a
+/// real browser **on its own** in the situations where `http_request` is insufficient,
+/// so browser use is emergent, not something the operator has to ask for.
+const BROWSER_GUIDANCE: &str = r#"[Browser — use it on your own initiative]
+You have a `browser` tool that drives a real, headed browser (long-lived across turns).
+Reach for it WITHOUT being asked whenever raw HTTP (`http_request`) is not enough:
+- The target is a JavaScript-rendered SPA / the interesting content or endpoints only appear after client-side JS runs (an empty or skeletal HTML body from `http_request` is a strong signal — switch to `browser` navigate + get_content).
+- You need to inspect the rendered DOM, execute JS in page context (`execute_js`), or read state that only exists in the live page.
+- A flow requires interaction: clicking, filling forms, multi-step wizards, or following JS-driven navigation.
+- The page is behind a login / 2FA / CAPTCHA / anti-bot wall — navigate there, then emit `ask_watson` so the operator completes the human step; you continue on the same authenticated page.
+- You need visual confirmation (`screenshot`) of a finding or UI state — for the human operator; you cannot see image content, so use `get_content` / `execute_js` to read or analyze the page (never `read_file` a screenshot PNG).
+Prefer `http_request` for plain APIs and static responses; escalate to `browser` the moment the page depends on a real browser. Do not wait to be told."#;
+
 /// Build the prompt Holmes should see at session start.
 ///
 /// This makes project instructions, local rules, and skill indexes part of
@@ -86,6 +99,12 @@ pub fn build_system_prompt(
 
     if matches!(mode, SessionMode::Pentest) {
         sections.push(PENTEST_METHODOLOGY.to_string());
+    }
+
+    // Only advertise the browser workflow when the tool is actually wired in — telling
+    // the model about a capability it does not have would just cause failed calls.
+    if config.browser.enabled {
+        sections.push(BROWSER_GUIDANCE.to_string());
     }
 
     let knowledge = discover_knowledge_files(cwd);
@@ -361,7 +380,8 @@ mod tests {
     #[test]
     fn build_system_prompt_includes_native_capabilities_without_project_files() {
         let cwd = temp_project_dir();
-        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
+        let prompt =
+            build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
 
         assert!(prompt.contains("base"));
         assert!(prompt.contains("Holmes native capabilities - always on"));
@@ -371,9 +391,26 @@ mod tests {
     }
 
     #[test]
+    fn native_capabilities_describe_scope_as_advisory_not_enforced() {
+        // P0-01: the prompt must not claim the system enforces scope — the
+        // guard is an advisory heuristic and the model stays responsible for
+        // respecting Watson's authorized scope.
+        let cwd = temp_project_dir();
+        let prompt =
+            build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
+
+        assert!(!prompt.contains("the system enforces it for you"));
+        assert!(!prompt.contains("you do not need to self-police"));
+        assert!(prompt.contains("advisory heuristic"));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
     fn pentest_mode_injects_pentest_methodology() {
         let cwd = temp_project_dir();
-        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
+        let prompt =
+            build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
 
         // 三阶段
         assert!(prompt.contains("Discovery"));
@@ -386,6 +423,28 @@ mod tests {
         assert!(prompt.contains("unruled_out"));
         // 完整资料指针
         assert!(prompt.contains("skills/pentest-lyan/SKILL.md"));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn browser_guidance_injected_only_when_enabled() {
+        let cwd = temp_project_dir();
+
+        let mut disabled = HolmesConfig::default();
+        disabled.browser.enabled = false;
+        let prompt = build_system_prompt("base", &disabled, &cwd, SessionMode::Pentest);
+        assert!(
+            !prompt.contains("use it on your own initiative"),
+            "must not advertise a browser that isn't wired in"
+        );
+
+        let mut enabled = HolmesConfig::default();
+        enabled.browser.enabled = true;
+        let prompt = build_system_prompt("base", &enabled, &cwd, SessionMode::Pentest);
+        assert!(prompt.contains("use it on your own initiative"));
+        assert!(prompt.contains("JavaScript-rendered"));
+        assert!(prompt.contains("ask_watson"));
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -428,7 +487,8 @@ description: Build a target map before validation.\n---\n# Recon\n",
         )
         .unwrap();
 
-        let prompt = build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
+        let prompt =
+            build_system_prompt("base", &HolmesConfig::default(), &cwd, SessionMode::Pentest);
 
         assert!(prompt.contains("Auto-loaded Holmes knowledge"));
         assert!(prompt.contains("Source: HOLMES.md"));

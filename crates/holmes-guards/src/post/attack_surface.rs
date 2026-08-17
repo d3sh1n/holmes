@@ -11,6 +11,12 @@ pub struct AttackSurfaceUpdater {
     link_re: Regex,
 }
 
+impl Default for AttackSurfaceUpdater {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AttackSurfaceUpdater {
     pub fn new() -> Self {
         Self {

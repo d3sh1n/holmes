@@ -1,8 +1,8 @@
 use crate::tool_types::{ToolCall, ToolResult};
 
 /// Lifecycle hook for agent execution phases.
-/// 
-/// Allows external modules to hook into the agent loop and monitor, log, 
+///
+/// Allows external modules to hook into the agent loop and monitor, log,
 /// or block specific phases of execution without hardcoding logic into the loop.
 pub trait AgentHook: Send + Sync + std::fmt::Debug {
     /// Triggered before a tool call is executed.

@@ -1,21 +1,18 @@
-pub mod context_layer;
-pub mod context_stack;
-pub mod dashboard_layer;
 pub mod memory_layer;
-pub mod retrieval;
 
 use holmes_core::event::Event;
-use holmes_core::types::*;
 use holmes_session::memory_store::MemoryStore;
 use std::sync::Arc;
 
-use context_layer::ContextLayer;
-use dashboard_layer::DashboardLayer;
 use memory_layer::MemoryLayer;
 
+/// The Mind Palace is now a thin wrapper over the event-sourced memory layer. The old
+/// typed "context layer" / dashboard projection was removed: it was fed by situational
+/// events the runtime never emits, so it stayed empty and never reached the model. The
+/// prompt's `[Current situation]` is projected live from `AttackState` in the runtime's
+/// perception engine instead.
 pub struct MindPalace {
     pub memory: MemoryLayer,
-    pub context: ContextLayer,
 }
 
 impl MindPalace {
@@ -25,7 +22,6 @@ impl MindPalace {
     ) -> Self {
         Self {
             memory: MemoryLayer::new(session_db, long_term),
-            context: ContextLayer::new(),
         }
     }
 
@@ -36,40 +32,10 @@ impl MindPalace {
     ) -> Result<Self, String> {
         let mut palace = Self::new(session_db, long_term);
         palace.memory.replay(session_id).await?;
-        let events = palace.memory.session_events.clone();
-        for event in &events {
-            palace.context.ingest(event);
-        }
         Ok(palace)
     }
 
     pub fn ingest(&mut self, event: Event) {
-        self.context.ingest(&event);
         self.memory.ingest(event);
-    }
-
-    pub fn dashboard(&self, mode: &SessionMode) -> DashboardSnapshot {
-        DashboardLayer::generate(&self.context, mode)
-    }
-
-    pub fn situation_summary(&self, mode: &SessionMode) -> String {
-        let snapshot = DashboardLayer::generate(&self.context, mode);
-        let mut parts = Vec::new();
-        if !snapshot.sections.is_empty() {
-            for (_, section) in snapshot.sections {
-                parts.push(format!("[{}] {}", section.title, section.content_summary));
-            }
-        } else {
-            parts.push("No significant context yet.".into());
-        }
-        parts.join("\n")
-    }
-
-    pub fn snapshot(&self) -> ContextSnapshot {
-        self.context.snapshot()
-    }
-
-    pub fn compress(&mut self) {
-        self.context.compress();
     }
 }

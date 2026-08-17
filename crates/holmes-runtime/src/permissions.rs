@@ -24,6 +24,16 @@ impl PermissionDecision {
     }
 }
 
+/// Interactive approval hook consulted for mutating tool calls when the permission
+/// mode is `Ask`. A surface (e.g. the TUI) implements it to prompt the operator y/n.
+/// When no handler is installed (e.g. one-shot / non-interactive runs), `Ask` mutating
+/// calls are denied (fail-closed — there is nobody to ask).
+#[async_trait::async_trait]
+pub trait ApprovalHandler: std::fmt::Debug + Send + Sync {
+    /// Return `true` to allow the call, `false` to block it.
+    async fn request_approval(&self, call: &ToolCall) -> bool;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy;
 
@@ -35,7 +45,10 @@ impl PermissionPolicy {
         call: &ToolCall,
     ) -> PermissionDecision {
         let tool_name = call.function.name.as_str();
-        let read_only = registry.is_read_only(tool_name).unwrap_or(false);
+        // Classify the concrete call (argument-aware), not just the tool: e.g. an HTTP
+        // GET is read-only while a POST through the same tool is mutating. Unknown
+        // tools classify as mutating (fail-closed).
+        let read_only = registry.effect_of(call) == holmes_tools::Effect::ReadOnly;
 
         if matches_any(&config.disallowed_tools, tool_name) {
             return PermissionDecision::deny(format!(
@@ -61,6 +74,9 @@ impl PermissionPolicy {
                 PermissionDecision::allow("read-only tool auto-approved")
             }
             PermissionMode::Default => PermissionDecision::allow("default permission policy allowed"),
+            // Policy allows; a mutating tool is then referred to the ApprovalHandler in
+            // the action loop (read-only tools skip approval).
+            PermissionMode::Ask => PermissionDecision::allow("ask mode: pending operator approval"),
             PermissionMode::AcceptEdits => PermissionDecision::allow("accept-edits permission policy allowed"),
             PermissionMode::DontAsk => PermissionDecision::allow("dont_ask permission policy allowed"),
             PermissionMode::Bypass => PermissionDecision::allow("bypass permission policy allowed"),
@@ -208,5 +224,48 @@ mod tests {
 
         assert!(allowed.allowed);
         assert!(!denied.allowed);
+    }
+
+    fn http_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(
+            holmes_tools::builtin::http_request::HttpRequestTool::new(),
+        ));
+        registry
+    }
+
+    fn http_call(method: &str) -> ToolCall {
+        ToolCall {
+            id: "call-1".into(),
+            call_type: "tool_use".into(),
+            function: FunctionCall {
+                name: "http_request".into(),
+                arguments: json!({ "url": "https://example.test", "method": method }).to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn read_only_mode_blocks_http_post_but_allows_get() {
+        let config = PermissionConfig {
+            mode: PermissionMode::ReadOnly,
+            ..PermissionConfig::default()
+        };
+        let registry = http_registry();
+
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let decision = PermissionPolicy.evaluate(&config, &registry, &http_call(method));
+            assert!(
+                !decision.allowed,
+                "{method} must be blocked in read_only mode"
+            );
+        }
+        for method in ["GET", "HEAD", "OPTIONS"] {
+            let decision = PermissionPolicy.evaluate(&config, &registry, &http_call(method));
+            assert!(
+                decision.allowed,
+                "{method} must be allowed in read_only mode"
+            );
+        }
     }
 }

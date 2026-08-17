@@ -93,18 +93,40 @@ pub enum Event {
         name: String,
         arguments: serde_json::Value,
         purpose: Option<String>,
+        /// Native tool-call id from the model response (P1-03). Correlates this
+        /// call with its `ToolResult`/`ToolBlocked` regardless of event ordering
+        /// or parallelism. `None` only in events written before call-id
+        /// persistence (serde default keeps old event payloads readable).
+        #[serde(default)]
+        call_id: Option<String>,
     },
     ToolResult {
         name: String,
+        /// Legacy compatibility projection. New code must derive success from
+        /// `outcome`; old events without it fall back to this boolean.
         success: bool,
+        /// Typed execution status added after schema v6. Optional so every historic
+        /// JSON event remains readable; `None` maps to Succeeded/Failed via `success`.
+        #[serde(default)]
+        outcome: Option<crate::tool_types::ToolOutcomeStatus>,
         content: String,
         error: Option<String>,
         artifacts: Vec<String>,
+        /// Native tool-call id of the call this result answers (P1-03).
+        #[serde(default)]
+        call_id: Option<String>,
     },
+    /// Audit record for a call that was never executed (permission / approval /
+    /// hook / guard / cancellation / budget denial). Replay synthesizes a
+    /// failure tool-result message from this event so the model history stays
+    /// legal; the guard name and reason stay here as audit metadata.
     ToolBlocked {
         tool_name: String,
         guard_name: String,
         reason: String,
+        /// Native tool-call id of the blocked call (P1-03).
+        #[serde(default)]
+        call_id: Option<String>,
     },
 
     // === Situational Awareness ===
@@ -131,6 +153,20 @@ pub enum Event {
         evidence: String,
         poc: Option<String>,
         status: FindingStatus,
+    },
+    /// A finding recorded by `SkepticGate` into the validated zone. Durable so findings
+    /// survive turn boundaries and session resume (the in-memory `AttackState` is rebuilt
+    /// each turn; these events are replayed back into it).
+    FindingRecorded {
+        id: String,
+        finding_type: String,
+        confidence: String,
+        severity: Severity,
+        evidence: String,
+        details: String,
+        attack_type: String,
+        location: String,
+        evidence_source: Option<String>,
     },
     CodePatternFound {
         pattern_type: String,
@@ -361,6 +397,28 @@ pub enum Event {
         content: String,
         reason: String,
     },
+    /// Audit event: a long-term memory write was refused (e.g. sensitive
+    /// content, prompt injection). The content itself is never persisted —
+    /// only a short summary and the rejection reason.
+    MemoryRejected {
+        content_summary: String,
+        reason: String,
+    },
+    /// Two recalled memories are linked as conflicting (or one supersedes the
+    /// other); only the preferred one was injected.
+    MemoryConflictDetected {
+        suppressed_id: String,
+        chosen_id: String,
+        reason: String,
+    },
+    /// Lifecycle transition of a memory/skill (staged → active, disabled,
+    /// archived, rolled back, validation recorded).
+    MemoryStatusChanged {
+        memory_id: String,
+        from_status: String,
+        to_status: String,
+        reason: String,
+    },
 
     // === Sub-Agent ===
     SubAgentSpawned {
@@ -375,7 +433,7 @@ pub enum Event {
     },
     SubAgentCompleted {
         sub_session_id: String,
-        result: SubAgentResult,
+        result: crate::subagent::AgentTaskResult,
         tokens_used: u64,
         events_count: u64,
         findings_count: usize,
@@ -427,13 +485,14 @@ pub struct CredentialRef {
     pub host: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Critical,
     High,
     Medium,
     Low,
+    #[default]
     Info,
 }
 
@@ -604,7 +663,9 @@ impl Event {
             Event::ToolResult { name, content, .. } => {
                 format!("{} {}", name, content)
             }
-            Event::SessionSystemPromptSet { content, source, .. } => {
+            Event::SessionSystemPromptSet {
+                content, source, ..
+            } => {
                 format!("system_prompt source={} {}", source, content)
             }
             Event::SessionModelSet {
@@ -667,6 +728,21 @@ impl Event {
                 format!("{} {}", kind, reason)
             }
             Event::MemoryWriteStaged { content, .. } => content.clone(),
+            Event::MemoryRejected {
+                content_summary,
+                reason,
+            } => {
+                format!("memory rejected: {} ({})", content_summary, reason)
+            }
+            Event::MemoryConflictDetected { reason, .. } => reason.clone(),
+            Event::MemoryStatusChanged {
+                from_status,
+                to_status,
+                reason,
+                ..
+            } => {
+                format!("memory {} -> {}: {}", from_status, to_status, reason)
+            }
             Event::SubAgentSpawned {
                 task_description, ..
             } => task_description.clone(),
@@ -711,6 +787,7 @@ impl Event {
             Event::TargetDiscovered { .. }
             | Event::AttackSurfaceUpdate { .. }
             | Event::VulnerabilityFound { .. }
+            | Event::FindingRecorded { .. }
             | Event::CodePatternFound { .. }
             | Event::ReverseInsight { .. }
             | Event::CredentialFound { .. }
@@ -734,6 +811,7 @@ impl Event {
             Event::MemoryStored { .. }
             | Event::MemoryRecalled { .. }
             | Event::MemoryConsolidated { .. }
+            | Event::MemoryConflictDetected { .. }
             | Event::ContextSnapshotTaken { .. }
             | Event::ContextSwitched { .. }
             | Event::DashboardUpdated { .. } => "mind_palace",
@@ -744,7 +822,9 @@ impl Event {
             Event::LearningReviewStarted { .. }
             | Event::LearningReviewCompleted { .. }
             | Event::LearningCandidateRejected { .. }
-            | Event::MemoryWriteStaged { .. } => "learning",
+            | Event::MemoryWriteStaged { .. }
+            | Event::MemoryRejected { .. }
+            | Event::MemoryStatusChanged { .. } => "learning",
             Event::SubAgentSpawned { .. }
             | Event::SubAgentCompleted { .. }
             | Event::SubAgentProgress { .. } => "subagent",

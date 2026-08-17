@@ -1,0 +1,130 @@
+# Nightly reliability suite (Phase 0 baseline + workflow H soak).
+# Runs the 11 #[ignore]d browser tests that are excluded from the default
+# `cargo test` path, plus a repeated soak of the fault-injection and recovery
+# suites. Classification lives in crates/holmes-browser/tests/manager.rs:
+#   [nightly]         -> browser-smoke-local job (this file)
+#   [nightly:network] -> browser-smoke-network job (this file)
+#   [env-dependent]   -> never in CI; run manually on a developer machine
+#                        (needs a user Chrome on :9222 or a macOS Chrome path).
+#
+# A true 24-hour soak / kill -9 drill cannot run on a GitHub-hosted nightly; the
+# reliability-soak job below approximates it by looping the deterministic
+# fault-injection scenarios (holmes-harness), the provider failover/recovery
+# integration tests (holmes-llm), the crash-recovery/concurrency/crash-point
+# matrix tests (holmes-session), and the durable-task recovery matrix plus
+# scheduler tests (holmes-runtime). Any failure here must block a release until
+# triaged. The manual 24-hour long-soak procedure and its SLO thresholds live
+# in docs/runbooks/long-soak.md.
+name: Nightly Reliability
+
+on:
+  schedule:
+    # 02:30 UTC daily.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  reliability-soak:
+    name: Reliability soak (fault injection x10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build test binaries once
+        run: |
+          cargo test -p holmes-harness --no-run
+          cargo test -p holmes-llm --no-run
+          cargo test -p holmes-session --no-run
+          cargo test -p holmes-runtime --no-run
+      # Loop the deterministic reliability suites: harness fault-injection
+      # scenarios, provider failover/recovery, MCP/process boundary tests,
+      # SQLite durability/crash-recovery/concurrency (incl. migration race,
+      # open-time reconcile, sidecar loss, and the P2-02 crash-point matrix),
+      # and the durable-task recovery matrix + scheduler unit tests
+      # (holmes-runtime). A flake or regression anywhere fails the job.
+      - name: Run soak iterations
+        run: |
+          set -e
+          for i in $(seq 1 10); do
+            echo "=== soak iteration $i/10 ==="
+            cargo test -p holmes-harness
+            cargo test -p holmes-llm
+            cargo test -p holmes-session
+            # Explicit release evidence for Hypothesis Ledger v2 Phase 5/6:
+            # Experiment lease/fencing/recovery and checksum snapshot fallback.
+            cargo test -p holmes-session --test experiment_task_tests --test ledger_store_tests
+            cargo test -p holmes-runtime --test durable_recovery_matrix
+            cargo test -p holmes-runtime scheduler
+          done
+
+  browser-smoke-local:
+    name: Browser smoke (local Chromium, no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Tests launch real Chromium; caching the build only, not the browser.
+          cache-on-failure: true
+      # Environment dependencies for chromiumoxide's downloaded Chromium on
+      # Ubuntu runners: X/graphics shared libraries even in headless mode.
+      # The tests use `headless: false` (see enabled_config() in manager.rs),
+      # so a virtual display is required as well.
+      - name: Install Chromium runtime libraries + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+            libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2
+      - name: Build test binaries
+        run: cargo test -p holmes-browser --test manager --no-run
+      # [nightly] tests only: data: URLs, no outbound network needed.
+      # --skip excludes the [nightly:network] and [env-dependent] tests.
+      - name: Run local browser smoke tests
+        run: >
+          xvfb-run -a cargo test -p holmes-browser --test manager --
+          --ignored
+          --skip xiaohongshu
+          --skip real_site_example_com_works
+          --skip attach_to_real_chrome
+
+  browser-smoke-network:
+    name: Browser smoke (real network targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Chromium runtime libraries + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+            libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2
+      - name: Build test binaries
+        run: cargo test -p holmes-browser --test manager --no-run
+      # [nightly:network] tests only. Requires outbound internet access from the
+      # runner. Known caveats:
+      # - xiaohongshu.com has anti-bot protections and geo/IP sensitivity;
+      #   failures from CI egress IPs are expected occasionally and should be
+      #   triaged against local runs before being treated as regressions.
+      # - example.com is stable; a failure there usually means the runner lost
+      #   outbound connectivity or the stealth patch regressed.
+      - name: Run network browser smoke tests
+        run: >
+          xvfb-run -a cargo test -p holmes-browser --test manager --
+          --ignored
+          --skip manager_
+          --skip fill_and_get_content_round_trip
+          --skip execute_js_returns_value
+          --skip screenshot_writes_png_file
+          --skip stealth_hides_webdriver_flag
+          --skip attach_to_real_chrome
+          --skip xiaohongshu_with_system_chrome

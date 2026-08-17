@@ -62,6 +62,10 @@ fn deterministic_session_id(scenario: &HarnessScenario) -> String {
     }
 }
 
+// Parameters mirror the startup metadata fields of a session; grouping them into
+// a struct now would ripple through the runner for no behavioral gain (Phase 0
+// keeps changes mechanical). Allow instead of refactor.
+#[allow(clippy::too_many_arguments)]
 async fn append_harness_startup_metadata(
     session_db: &Arc<dyn SessionStore>,
     session_id: &str,
@@ -352,6 +356,7 @@ pub enum TurnOutcomeReport {
     FinalAnswer { content: String, iterations: usize },
     NeedsUser { prompt: String, iterations: usize },
     MaxIterationsReached { message: String, iterations: usize },
+    Interrupted { iterations: usize },
 }
 
 impl From<TurnOutcome> for TurnOutcomeReport {
@@ -372,6 +377,7 @@ impl From<TurnOutcome> for TurnOutcomeReport {
                 message,
                 iterations,
             },
+            TurnOutcome::Interrupted { iterations } => Self::Interrupted { iterations },
         }
     }
 }
@@ -497,6 +503,11 @@ fn resolve_artifact_path(path: &PathBuf, scenario: &HarnessScenario) -> PathBuf 
 
 fn harness_config(scenario: &HarnessScenario) -> HolmesConfig {
     let mut config = HolmesConfig::default();
+    // Existing scenario fixtures script one public response per Runtime
+    // iteration. Keep that compatibility suite on the explicit fast path;
+    // Propose/Critique/Commit call-count and privacy invariants are covered by
+    // CognitiveEngine's dedicated multi-response tests.
+    config.cognition.mode = holmes_core::ledger::ThinkMode::Fast;
     config.agent.max_iterations = 12;
     config.llm.providers.clear();
 
@@ -529,8 +540,47 @@ fn harness_config(scenario: &HarnessScenario) -> HolmesConfig {
         if let Some(max_summary_tokens) = compressor.max_summary_tokens {
             config.compressor.max_summary_tokens = max_summary_tokens;
         }
-        if let Some(preserve_tool_groups) = compressor.preserve_tool_groups {
-            config.compressor.preserve_tool_groups = preserve_tool_groups;
+    }
+
+    if let Some(supervisor) = scenario
+        .config
+        .as_ref()
+        .and_then(|config| config.supervisor.as_ref())
+    {
+        if let Some(max_repeat_action) = supervisor.max_repeat_action {
+            config.supervisor.max_repeat_action = max_repeat_action;
+        }
+        if let Some(stagnation_limit) = supervisor.stagnation_limit {
+            config.supervisor.stagnation_limit = stagnation_limit;
+        }
+        if let Some(max_verification_retries) = supervisor.max_verification_retries {
+            config.supervisor.max_verification_retries = max_verification_retries;
+        }
+        if let Some(model_verification) = supervisor.model_verification {
+            config.supervisor.model_verification = model_verification;
+        }
+    }
+
+    if let Some(execution) = scenario
+        .config
+        .as_ref()
+        .and_then(|config| config.execution.as_ref())
+    {
+        if let Some(turn_deadline_ms) = execution.turn_deadline_ms {
+            config.execution.turn_deadline_ms = Some(turn_deadline_ms);
+        }
+        if let Some(tool_deadline_ms) = execution.tool_deadline_ms {
+            config.execution.tool_deadline_ms = tool_deadline_ms;
+        }
+    }
+
+    if let Some(permissions) = scenario
+        .config
+        .as_ref()
+        .and_then(|config| config.permissions.as_ref())
+    {
+        if let Some(mode) = &permissions.mode {
+            config.permissions.mode = mode.clone();
         }
     }
 
@@ -541,9 +591,6 @@ fn harness_config(scenario: &HarnessScenario) -> HolmesConfig {
     {
         if let Some(enabled) = learning.enabled {
             config.learning.enabled = enabled;
-        }
-        if let Some(background) = learning.background {
-            config.learning.background = background;
         }
         if let Some(review_interval_turns) = learning.review_interval_turns {
             config.learning.review_interval_turns = review_interval_turns;
@@ -556,9 +603,6 @@ fn harness_config(scenario: &HarnessScenario) -> HolmesConfig {
         }
         if let Some(skill_write_approval) = learning.skill_write_approval {
             config.learning.skill_write_approval = skill_write_approval;
-        }
-        if let Some(rule_write_approval) = learning.rule_write_approval {
-            config.learning.rule_write_approval = rule_write_approval;
         }
     }
 

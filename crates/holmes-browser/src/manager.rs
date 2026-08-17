@@ -106,78 +106,73 @@ impl BrowserManager {
         // Decide attach-vs-launch. Attaching reuses the user's real Chrome
         // (profile, login, fingerprint) and defeats strong anti-bot systems
         // that would block an automation-launched browser.
-        let (browser, mut handler, owned) = if let Some(endpoint) =
-            self.config.cdp_endpoint.as_ref()
-        {
-            let (b, h) = tokio::time::timeout(self.timeout_dur(), Browser::connect(endpoint.clone()))
-                .await
-                .map_err(|_| BrowserError::Timeout(self.config.timeout))?
-                .map_err(|e| BrowserError::LaunchFailed(format!("cdp connect {endpoint}: {e}")))?;
-            (b, h, false)
-        } else {
-            let profile_dir = profile_dir_for(&self.sessions_dir, &self.session_id);
-            tokio::fs::create_dir_all(&profile_dir).await?;
+        let (browser, mut handler, owned) =
+            if let Some(endpoint) = self.config.cdp_endpoint.as_ref() {
+                let (b, h) =
+                    tokio::time::timeout(self.timeout_dur(), Browser::connect(endpoint.clone()))
+                        .await
+                        .map_err(|_| BrowserError::Timeout(self.config.timeout))?
+                        .map_err(|e| {
+                            BrowserError::LaunchFailed(format!("cdp connect {endpoint}: {e}"))
+                        })?;
+                (b, h, false)
+            } else {
+                let profile_dir = profile_dir_for(&self.sessions_dir, &self.session_id);
+                tokio::fs::create_dir_all(&profile_dir).await?;
 
-            let safe_extra = sanitize_launch_args(&self.config.extra_launch_args)?;
-            // chromiumoxide's `arg(...)` renders as `--<arg>`, so strip any leading
-            // `--` the user supplied to avoid `----name`.
-            let normalized: Vec<String> = safe_extra
-                .into_iter()
-                .map(|a| a.trim_start_matches('-').to_string())
-                .collect();
+                let safe_extra = sanitize_launch_args(&self.config.extra_launch_args)?;
+                // chromiumoxide's `arg(...)` renders as `--<arg>`, so strip any leading
+                // `--` the user supplied to avoid `----name`.
+                let normalized: Vec<String> = safe_extra
+                    .into_iter()
+                    .map(|a| a.trim_start_matches('-').to_string())
+                    .collect();
 
-            let mut builder = BrowserConfig::builder();
-            // v1 is always headed: the user must see and interact with the window.
-            builder = builder.with_head();
-            builder = builder.user_data_dir(profile_dir.clone());
-            builder = builder.launch_timeout(self.timeout_dur());
-            builder = builder.arg("no-first-run");
-            builder = builder.arg("no-default-browser-check");
-            // Baseline anti-fingerprint hardening for launched mode. This is a
-            // best-effort nudge for light anti-bot targets; strong bot managers
-            // still require attach mode (real browser fingerprint).
-            builder = builder.arg("disable-blink-features=AutomationControlled");
-            if self.config.ignore_https_errors {
-                builder = builder.arg("ignore-certificate-errors");
-            }
-            if let Some(proxy) = &self.config.proxy {
-                // Chrome proxy is a launch flag; chromiumoxide has no builder method for it.
-                builder = builder.arg(format!("proxy-server={}", proxy));
-            }
-            if let Some(exe) = &self.config.executable_path {
-                builder = builder.chrome_executable(exe);
-            } else if let Some(system_chrome) = detect_system_chrome() {
-                // Prefer the user's real Chrome/Edge over the (often older,
-                // more fingerprintable) Chromium chromiumoxide would otherwise
-                // download. Real binaries defeat strong anti-bot fingerprinting.
-                builder = builder.chrome_executable(system_chrome);
-            }
-            for a in normalized {
-                builder = builder.arg(a);
-            }
-            // The built-in Chromium sandbox stays on: we intentionally do NOT call
-            // `no_sandbox()`. `sanitize_launch_args` already rejected user-supplied
-            // sandbox-disabling flags.
+                let mut builder = BrowserConfig::builder();
+                // v1 is always headed: the user must see and interact with the window.
+                builder = builder.with_head();
+                builder = builder.user_data_dir(profile_dir.clone());
+                builder = builder.launch_timeout(self.timeout_dur());
+                builder = builder.arg("no-first-run");
+                builder = builder.arg("no-default-browser-check");
+                // Baseline anti-fingerprint hardening for launched mode. This is a
+                // best-effort nudge for light anti-bot targets; strong bot managers
+                // still require attach mode (real browser fingerprint).
+                builder = builder.arg("disable-blink-features=AutomationControlled");
+                if self.config.ignore_https_errors {
+                    builder = builder.arg("ignore-certificate-errors");
+                }
+                if let Some(proxy) = &self.config.proxy {
+                    // Chrome proxy is a launch flag; chromiumoxide has no builder method for it.
+                    builder = builder.arg(format!("proxy-server={}", proxy));
+                }
+                if let Some(exe) = &self.config.executable_path {
+                    builder = builder.chrome_executable(exe);
+                } else if let Some(system_chrome) = detect_system_chrome() {
+                    // Prefer the user's real Chrome/Edge over the (often older,
+                    // more fingerprintable) Chromium chromiumoxide would otherwise
+                    // download. Real binaries defeat strong anti-bot fingerprinting.
+                    builder = builder.chrome_executable(system_chrome);
+                }
+                for a in normalized {
+                    builder = builder.arg(a);
+                }
+                // The built-in Chromium sandbox stays on: we intentionally do NOT call
+                // `no_sandbox()`. `sanitize_launch_args` already rejected user-supplied
+                // sandbox-disabling flags.
 
-            let cfg = builder
-                .build()
-                .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-            let (b, h) = Browser::launch(cfg)
-                .await
-                .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-            (b, h, true)
-        };
+                let cfg = builder
+                    .build()
+                    .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+                let (b, h) = Browser::launch(cfg)
+                    .await
+                    .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+                (b, h, true)
+            };
 
         // Drive the CDP event loop on a background task. This must live for the
         // lifetime of the browser handle.
-        tokio::spawn(async move {
-            loop {
-                match handler.next().await {
-                    Some(_) => continue,
-                    None => break,
-                }
-            }
-        });
+        tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         let new_page_fut = browser.new_page("about:blank");
         let page = Arc::new(
@@ -207,12 +202,7 @@ impl BrowserManager {
             .await
             .map(|v| v.into_value::<String>().unwrap_or_default())
             .unwrap_or_default();
-        let url_now = page
-            .url()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let url_now = page.url().await.ok().flatten().unwrap_or_default();
         let text = self.extract_text(&page).await?;
         Ok(PageSnapshot {
             url: url_now,
@@ -263,7 +253,10 @@ impl BrowserManager {
         let page = self.ensure_launched().await?;
         let js = match selector {
             Some(sel) => {
-                format!("var e=document.querySelector({:?}); e ? e.innerText : ''", sel)
+                format!(
+                    "var e=document.querySelector({:?}); e ? e.innerText : ''",
+                    sel
+                )
             }
             None => "document.body ? document.body.innerText : ''".to_string(),
         };
@@ -431,14 +424,8 @@ mod tests {
         assert!(sanitize_launch_args(&["--no-sandbox".to_string()]).is_err());
         assert!(sanitize_launch_args(&["--disable-web-security".to_string()]).is_err());
         assert!(sanitize_launch_args(&["--disable-setuid-sandbox".to_string()]).is_err());
-        assert!(sanitize_launch_args(&[
-            "--disable-site-isolation-trials".to_string()
-        ])
-        .is_err());
-        assert!(sanitize_launch_args(&[
-            "--allow-running-insecure-content".to_string()
-        ])
-        .is_err());
+        assert!(sanitize_launch_args(&["--disable-site-isolation-trials".to_string()]).is_err());
+        assert!(sanitize_launch_args(&["--allow-running-insecure-content".to_string()]).is_err());
     }
 
     #[test]

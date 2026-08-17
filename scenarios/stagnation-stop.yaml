@@ -1,0 +1,56 @@
+name: stagnation-stop
+description: >-
+  Fault injection (AGT-009): the scripted model keeps re-running the same
+  successful probe and never produces new evidence. The supervisor injects a
+  reflection prompt at the stagnation limit and, when the next full window still
+  shows no progress, stops the turn with a resumable partial result.
+mode: pentest
+config:
+  supervisor:
+    stagnation_limit: 2
+turns:
+  - input: "Keep rescanning example.test until something new shows up."
+tools:
+  - name: rescan
+    description: Returns the same result every time.
+    output: no new findings
+    read_only: true
+scripted_responses:
+  # Identical successful calls: only the first is novel, the rest make no
+  # progress. Window 1 (iterations 2-3) earns a reflection prompt; window 2
+  # (iteration 5) escalates to a supervised stop.
+  - tool_calls:
+      - id: call-scan-1
+        type: function
+        function:
+          name: rescan
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-scan-2
+        type: function
+        function:
+          name: rescan
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-scan-3
+        type: function
+        function:
+          name: rescan
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-scan-4
+        type: function
+        function:
+          name: rescan
+          arguments: '{"target":"example.test"}'
+  - tool_calls:
+      - id: call-scan-5
+        type: function
+        function:
+          name: rescan
+          arguments: '{"target":"example.test"}'
+expectations:
+  needs_user_count: 1
+  tool_calls:
+    - rescan
+  max_errors: 0

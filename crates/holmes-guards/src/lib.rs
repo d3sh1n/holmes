@@ -13,6 +13,12 @@ pub struct GuardChain {
     pub post: Vec<Box<dyn PostGuard>>,
 }
 
+impl Default for GuardChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GuardChain {
     pub fn new() -> Self {
         Self {
@@ -23,6 +29,15 @@ impl GuardChain {
 
     pub fn from_config(config: &GuardConfig) -> Self {
         let mut chain = Self::new();
+
+        // Scope enforcement is always installed; it self-disables (no-op) unless an
+        // allowlist is configured. It is a heuristic guard over the initial arguments
+        // of known tools — not a hard scope boundary (see P0-01): redirects, DNS
+        // changes, unknown/MCP tools and dynamically constructed commands can bypass
+        // it. (immutable_field is state-based and inert in the production path.)
+        chain
+            .pre
+            .push(Box::new(pre::scope::ScopeGuard::new(&config.scope)));
 
         if config.immutable_field {
             chain
@@ -75,6 +90,8 @@ impl GuardChain {
                 .post
                 .push(Box::new(post::file_tracker::FileTrackerPostGuard));
         }
+        // Always on: captures the `write_todos` plan into AttackState for the frame.
+        chain.post.push(Box::new(post::plan_tracker::PlanTracker));
 
         chain
     }
@@ -123,8 +140,13 @@ mod tests {
 
         let chain = GuardChain::from_config(&config);
 
-        assert!(chain.pre.is_empty());
-        assert!(chain.post.is_empty());
+        // ScopeGuard is always installed (self-disables without an allowlist); every
+        // other pre-guard is config-gated and disabled here.
+        assert_eq!(chain.pre.len(), 1);
+        assert_eq!(chain.pre[0].name(), "scope");
+        // PlanTracker is always installed (not config-gated).
+        assert_eq!(chain.post.len(), 1);
+        assert_eq!(chain.post[0].name(), "plan_tracker");
     }
 
     #[test]
@@ -136,7 +158,9 @@ mod tests {
 
         let chain = GuardChain::from_config(&config);
 
-        assert_eq!(chain.pre.len(), 4);
-        assert_eq!(chain.post.len(), 6);
+        // 4 config-gated (immutable_field, dangerous_command, repetition, file_tracker)
+        // + always-on scope guard.
+        assert_eq!(chain.pre.len(), 5);
+        assert_eq!(chain.post.len(), 7); // 6 config-gated + always-on plan_tracker
     }
 }

@@ -30,6 +30,12 @@ impl StreamEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeYield {
+    /// Incremental assistant text streamed token-by-token during a single LLM call. The UI
+    /// renders these live; the full text is still delivered once as `MessageToUser` /
+    /// `FinalAnswer` when the call completes (the UI dedups against the streamed prefix).
+    TextDelta {
+        content: String,
+    },
     MessageToUser {
         content: String,
     },
@@ -39,6 +45,10 @@ pub enum RuntimeYield {
     ToolStarted {
         name: String,
         call_id: Option<String>,
+        /// Raw arguments JSON (truncated), so approval UIs can show what the tool will do.
+        /// `default` keeps events persisted before this field existed deserializable.
+        #[serde(default)]
+        args: Option<String>,
     },
     PermissionDecision {
         tool_name: String,
@@ -56,6 +66,23 @@ pub enum RuntimeYield {
     },
     EvidenceUpdate {
         content: String,
+    },
+    /// An operator steering message was drained from the shared steering queue and
+    /// injected into the conversation mid-turn (grok-build-style interjection). The UI
+    /// shows this as confirmation that the agent has now seen the typed-ahead line.
+    SteeringInjected {
+        content: String,
+    },
+    /// A background subagent task finished and its outcome was injected into the
+    /// conversation as a system-reminder (grok-build backgrounded subagents). The UI
+    /// renders a one-line notice; the full result is in the conversation history and
+    /// stays queryable via `get_task_output`.
+    BackgroundTaskFinished {
+        task_id: String,
+        description: String,
+        success: bool,
+        /// Result (or error) text, truncated to the injection cap.
+        summary: String,
     },
     NeedsUserInput {
         prompt: String,

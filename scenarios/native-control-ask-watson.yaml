@@ -1,0 +1,34 @@
+name: native-control-ask-watson
+description: Proves the primary control channel — ask_watson arriving as a native tool_use call (not a text directive) — pauses for the operator and resumes.
+mode: pentest
+config:
+  compressor:
+    enabled: false
+  learning:
+    enabled: false
+turns:
+  - input: "Test the login flow."
+    expect_needs_user: true
+    reply: "Yes, authorized for staging only."
+scripted_responses:
+  - tool_calls:
+      - id: call-ask-1
+        type: function
+        function:
+          name: ask_watson
+          arguments: '{"question":"Do we have authorization to test staging login?","context":"This confirms scope before touching auth flows.","options":["yes","no"]}'
+  - content: "Authorization recorded for staging login."
+expectations:
+  final_contains:
+    - Authorization recorded
+  needs_user_count: 1
+  yield_types:
+    - needs_user_input
+    - final_answer
+  event_sequence:
+    - user_message
+    - advisor_action
+    - turn_complete
+    - user_message
+    - turn_complete
+  max_errors: 0

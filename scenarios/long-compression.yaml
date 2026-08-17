@@ -11,9 +11,10 @@ config:
     protect_last_n: 2
     target_ratio: 0.5
     max_summary_tokens: 200
-    preserve_tool_groups: true
 turns:
-  - input: "Initial authorized objective: inspect staging.example only. Keep authorization scope."
+  # Phrased as statements, not action requests: no contract is derived, so the
+  # plain-text answers below are exempt from the completion gate (pure chat).
+  - input: "Initial authorized objective covers staging.example only. Keep authorization scope."
   - input: "Observation AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
   - input: "Observation BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 scripted_responses:

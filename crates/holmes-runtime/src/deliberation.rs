@@ -15,6 +15,11 @@ pub enum RuntimeErrorKind {
     NeedsUser,
     Fatal,
     ContextOverflow,
+    /// The turn's cancellation token or absolute deadline fired while an LLM call
+    /// was in flight (P1-01). The runtime intercepts this before the usual error
+    /// handling and ends the turn as Interrupted/deadline-expired instead of
+    /// recording a failure.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,13 @@ impl RuntimeError {
     pub fn fatal(message: impl Into<String>) -> Self {
         Self {
             kind: RuntimeErrorKind::Fatal,
+            message: message.into(),
+        }
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeErrorKind::Cancelled,
             message: message.into(),
         }
     }
@@ -100,6 +112,22 @@ pub trait LlmBackend: Send + Sync {
         tools: &[ToolDefinition],
         role: &str,
     ) -> Result<LlmResponse>;
+
+    /// Streaming variant: `on_text` receives the assistant text of the successful
+    /// provider attempt (per-attempt buffered in `LlmClient`, so a failed attempt
+    /// that fails over never leaks partial output). The default ignores the
+    /// callback and delegates to `chat_completion`, so backends that don't stream
+    /// (scripted/static test doubles) need no changes.
+    async fn chat_completion_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        role: &str,
+        on_text: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<LlmResponse> {
+        let _ = on_text;
+        self.chat_completion(messages, tools, role).await
+    }
 }
 
 #[async_trait]
@@ -111,6 +139,16 @@ impl LlmBackend for LlmClient {
         role: &str,
     ) -> Result<LlmResponse> {
         LlmClient::chat_completion(self, messages, tools, role).await
+    }
+
+    async fn chat_completion_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        role: &str,
+        on_text: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<LlmResponse> {
+        LlmClient::chat_completion_streaming(self, messages, tools, role, &mut *on_text).await
     }
 }
 
@@ -165,13 +203,44 @@ impl DeliberationEngine {
         context: &RuntimeContext,
         frame: &PerceptionFrame,
     ) -> std::result::Result<DeliberationResult, RuntimeError> {
-        let messages = frame.build_transient_messages(&context.session.messages);
-        let tools = context.tools.definitions();
+        self.decide_streaming(context, frame, &mut |_| {}).await
+    }
+
+    /// Like `decide`, but forwards the assistant text of the successful LLM attempt to
+    /// `on_text` (only visible when `llm.stream` is enabled; per-attempt buffered, so a
+    /// failed attempt's partial output never reaches the callback). The authoritative
+    /// `DeliberationResult` is still built from the completed response.
+    pub async fn decide_streaming(
+        &self,
+        context: &RuntimeContext,
+        frame: &PerceptionFrame,
+        on_text: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> std::result::Result<DeliberationResult, RuntimeError> {
+        self.decide_streaming_with_addendum(context, frame, None, on_text)
+            .await
+    }
+
+    /// Final Commit pass used by `CognitiveEngine`. The addendum contains only
+    /// bounded, parsed Proposal/Critique fields; raw internal model responses are
+    /// never copied into the transcript or this prompt.
+    pub async fn decide_streaming_with_addendum(
+        &self,
+        context: &RuntimeContext,
+        frame: &PerceptionFrame,
+        addendum: Option<&str>,
+        on_text: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> std::result::Result<DeliberationResult, RuntimeError> {
+        let mut messages = frame.build_transient_messages(&context.session.messages);
+        if let Some(addendum) = addendum.filter(|value| !value.trim().is_empty()) {
+            messages.push(Message::system(addendum.to_owned()));
+        }
+        let mut tools = context.tools.definitions();
+        tools.extend(crate::decision::control_tool_definitions());
         let configured_provider_count = context.config.llm.providers.len();
 
         context
             .llm
-            .chat_completion(&messages, &tools, &self.role)
+            .chat_completion_streaming(&messages, &tools, &self.role, on_text)
             .await
             .map(DeliberationResult::from_response)
             .map_err(|error| RuntimeError::from_llm_error(error, configured_provider_count))
@@ -260,6 +329,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: Some("stop".into()),
             usage: None,
+            ..Default::default()
         }));
         let mut config = HolmesConfig::default();
         config.llm.providers.push(make_provider("primary"));
@@ -289,8 +359,25 @@ mod tests {
             .as_deref()
             .expect("transient content")
             .contains("open port 443"));
-        assert_eq!(call.tools.len(), 1);
+        // The executable tool is forwarded first, followed by the synthetic
+        // control tools (set_goal / ask_watson / finish) that
+        // carry meta-decisions over native tool_use.
         assert_eq!(call.tools[0].function.name, "inspect_target");
+        assert_eq!(
+            call.tools.len(),
+            1 + crate::decision::CONTROL_TOOL_NAMES.len()
+        );
+        let tool_names: Vec<_> = call
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        for control in crate::decision::CONTROL_TOOL_NAMES {
+            assert!(
+                tool_names.contains(control),
+                "control tool {control} not forwarded to backend"
+            );
+        }
     }
 
     #[tokio::test]
@@ -430,7 +517,6 @@ mod tests {
             model: "test-model".into(),
             api_format: Default::default(),
             priority: 0,
-            max_retries: 3,
             rpm_limit: 0,
         }
     }

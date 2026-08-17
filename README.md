@@ -4,13 +4,14 @@ Holmes is an autonomous, Rust-native AI agent for security research, penetration
 
 ## 🚀 Key Features
 
-- **Unified Agent Runtime** — every turn flows through one engine (`AgentRuntime::run_turn`) that orchestrates ~10 engines per iteration: reflection budget → compaction → perception → LLM deliberation → permission/guard/middleware → tool batch → evidence projection → deduction review → memory.
-- **Seven-Way Decision Model** — `HolmesDecision` goes beyond "answer / use-tools": `Answer`, `Finish`, `AskWatson` (human handoff), `UseTools`, `SetGoal`, `Reflect`, `Deduce` are all first-class loop outcomes.
+- **Unified Agent Runtime** — every turn flows through one engine (`AgentRuntime::run_turn`): budget/compaction → bounded Fast/Adaptive/Deep cognitive pass → commit validation → permission/guard/middleware → tool batch → typed Evidence → memory.
+- **Six-Way Decision Model** — `Answer`, `Finish`, `AskWatson` (human handoff), `UseTools`, `SetGoal`, and fail-closed `ProtocolViolation` are first-class loop outcomes.
+- **Hypothesis Ledger v2** — case-scoped append-only Hypotheses, Predictions, Experiments, Evidence, Resolutions, and bounded deliberation commits. Strong findings and finishes cite verified Resolution IDs; delegated Experiments use durable leases, heartbeat, fencing, and evidence-bound structured results.
 - **Three Independent Safety Layers** — `PermissionPolicy` (user authorization, 6 modes), `GuardChain` (system-level pre/post tool hooks; `SkepticGate` is the sole writer to the validated state zone), and `RuntimeMiddleware` (cross-cutting command blocklist, sensitive-data redaction, token budget).
 - **Event-Sourced Sessions + Semantic Kernel** — every state change is an immutable `Event` in SQLite (FTS5 + WAL). Sessions replay from events; the Semantic Kernel persists prompt/model/mode/tools metadata so a session resumes with full context. Forking is a transactional event copy; compaction is archived and replayable.
-- **Mind Palace** — three layers in one type: raw event memory + long-term FTS memory, typed working context (attack surface, findings, pitfalls, …), and a mode-aware dashboard (Pentest / SecurityResearch / CodeAudit / Reverse / Mixed).
+- **Mind Palace** — event-backed and long-term lexical (FTS5/LIKE) memory with staged learning and conflict handling; live case state is projected by the Runtime and Ledger.
 - **Native Browser Automation** *(new)* — a headed Chromium the agent launches and keeps open across turns via native CDP (`chromiumoxide`). When a page needs a human (login / 2FA / CAPTCHA), the agent hands off with `AskWatson`, you act in the browser window, reply `continue`, and the agent continues on the same authenticated page. Auto-detects your real Chrome to bypass anti-bot fingerprinting; per-session profile + userDataDir; Chromium sandbox always on.
-- **Recursive Subagents** — spawn / isolate / delegate to subagents that share the parent's store and LLM but run their own runtime.
+- **Recursive Subagents** — bounded, isolated subagent runtimes with structured `AgentTaskResult`; Ledger Experiments receive a least-privilege slice and an exact tool allowlist.
 - **Modern TUI + Legacy REPL** — full-screen TUI (default) with mouse-wheel scrollback, command palette, session tree, event timeline, fork-from-event; Reedline REPL still available for one-shot and scripted use.
 - **Bundled Pentest Methodology** — [Pentest-Lyan](https://github.com/HeaSec/Pentest-Lyan) (v2.3, MIT) is internalized as the default operating standard in Pentest mode (three phases, 12-dimension threat model, 9 Banned Patterns).
 - **Multi-Provider LLM** — any Anthropic-Messages-compatible gateway (Anthropic, GLM/Zhipu, …) with failover, rate limiting, and role-based routing over a single wire format.
@@ -25,10 +26,10 @@ The workspace is split into focused crates. `holmes-core` is the base (everythin
 | `holmes-core` | Base layer: types, `Event`, `Config`, `RuntimeSession`, `AgentHook` / `SubagentRunner` traits, four-zone `AttackState`. |
 | `holmes-session` | SQLite + FTS5 + WAL event store; `SessionStore` trait; semantic replay, fork, compaction archive. |
 | `holmes-llm` | Multi-provider client over the Anthropic Messages wire format; failover, rate limit, role routing, error classification. |
-| `holmes-tools` | Extensible tool registry: command exec, Python, HTTP, file ops, reporting, hypothesis, optional subagent + MCP, browser. |
+| `holmes-tools` | Extensible tool registry: command exec, Python, HTTP, web fetch, file read/write/edit, grep, glob, todo plan, PDF reading, reporting, optional subagent + MCP, browser. Hypothesis state is owned by the Runtime-intercepted case Ledger protocol. |
 | `holmes-guards` | Pre/Post-tool guard chain: `immutable_field`, `dangerous_command`, `repetition`, `attack_surface`, `evidence_extractor`, `skeptic_gate`, `failure_tracker`, `soft404`. |
-| `holmes-mind-palace` | Three-layer memory / context / dashboard. |
-| `holmes-runtime` | The single agent loop + reflection / deliberation / compaction / middleware / permissions. |
+| `holmes-mind-palace` | Event-backed and long-term memory with staged learning. |
+| `holmes-runtime` | Agent loop, bounded cognition, Hypothesis Ledger protocol, compaction, middleware, permissions, supervision, and completion gates. |
 | `holmes-browser` | Native CDP browser automation (`chromiumoxide`): lazy launch, per-session profile, read-only gating, stealth, sandbox-safe. |
 | `holmes-harness` | Deterministic scenario runner for regression tests. |
 | `holmes-cli` | Entrypoint: TUI, legacy REPL, one-shot, session/config plumbing, slash commands. |
@@ -89,6 +90,8 @@ Useful slash commands:
 /permissions mode read-only   # switch mode
 /guards                       # show active guards
 /browser close                # close the long-lived browser (if open)
+/ledger                       # inspect the current case Ledger
+/ledger compact               # verify/rebuild the checksum snapshot
 ```
 
 ## 🌐 Browser Automation

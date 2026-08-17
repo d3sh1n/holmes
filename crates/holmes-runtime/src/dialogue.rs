@@ -30,6 +30,7 @@ impl DialogueEngine {
         RuntimeYield::ToolStarted {
             name: call.function.name.clone(),
             call_id: Some(call.id.clone()),
+            args: Some(truncate_args(&call.function.arguments)),
         }
     }
 
@@ -37,7 +38,7 @@ impl DialogueEngine {
         RuntimeYield::ToolFinished {
             name: result.tool_name.clone(),
             call_id: Some(result.tool_call_id.clone()),
-            success: !result.is_error,
+            success: result.is_success(),
             content: concise(&result.text_content()),
             error: None,
             usage: None,
@@ -63,7 +64,8 @@ impl DialogueEngine {
             },
             RuntimeErrorKind::Recoverable
             | RuntimeErrorKind::Fatal
-            | RuntimeErrorKind::ContextOverflow => RuntimeYield::Error {
+            | RuntimeErrorKind::ContextOverflow
+            | RuntimeErrorKind::Cancelled => RuntimeYield::Error {
                 message: error.message.clone(),
             },
         }
@@ -89,6 +91,16 @@ fn concise(content: &str) -> String {
     out
 }
 
+/// Cap raw tool-call arguments carried by `ToolStarted` (8 KB); enough for an approval
+/// summary without letting a huge payload (e.g. a full file write) bloat the event log.
+fn truncate_args(args: &str) -> String {
+    const MAX_BYTES: usize = 8 * 1024;
+    if args.len() <= MAX_BYTES {
+        return args.to_string();
+    }
+    format!("{}...", holmes_core::truncate_str(args, MAX_BYTES))
+}
+
 #[cfg(test)]
 mod tests {
     use holmes_core::{FunctionCall, ToolCall, ToolResult};
@@ -111,7 +123,8 @@ mod tests {
             DialogueEngine::tool_started(&call),
             RuntimeYield::ToolStarted {
                 name: "http_request".into(),
-                call_id: Some("call-1".into())
+                call_id: Some("call-1".into()),
+                args: Some("{}".into())
             }
         );
         assert_eq!(
@@ -120,14 +133,17 @@ mod tests {
                 name: "http_request".into(),
                 call_id: Some("call-1".into()),
                 success: true,
-                content: "200 OK".into()
-            , error: None, usage: None }
+                content: "200 OK".into(),
+                error: None,
+                usage: None
+            }
         );
         assert_eq!(
             DialogueEngine::final_answer(" done "),
             RuntimeYield::FinalAnswer {
-                content: "done".into()
-            , usage: None }
+                content: "done".into(),
+                usage: None
+            }
         );
     }
 

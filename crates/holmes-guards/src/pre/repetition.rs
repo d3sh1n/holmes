@@ -56,9 +56,7 @@ impl RepetitionGuard {
 
         let path = if let Some(slash) = after_scheme.find('/') {
             let p = &after_scheme[slash..];
-            let end = p
-                .find(|c: char| c == '?' || c == '#' || c == '"' || c == '\'' || c == ' ')
-                .unwrap_or(p.len());
+            let end = p.find(['?', '#', '"', '\'', ' ']).unwrap_or(p.len());
             &p[..end]
         } else {
             "/"
@@ -82,7 +80,7 @@ impl RepetitionGuard {
         let start = text.find("http://").or_else(|| text.find("https://"))?;
         let url_part = &text[start..];
         let end = url_part
-            .find(|c: char| c == '"' || c == '\'' || c == ' ' || c == '\\' || c == ')')
+            .find(['"', '\'', ' ', '\\', ')'])
             .unwrap_or(url_part.len());
         Some(Self::normalize_url_path(&url_part[..end]))
     }

@@ -80,7 +80,8 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, args: &str) -> Result<String> {
-        let v: Value = serde_json::from_str(args).map_err(|e| anyhow!("invalid browser args: {e}"))?;
+        let v: Value =
+            serde_json::from_str(args).map_err(|e| anyhow!("invalid browser args: {e}"))?;
         let action = v
             .get("action")
             .and_then(|a| a.as_str())
@@ -131,13 +132,22 @@ impl Tool for BrowserTool {
                 Ok(o.summary)
             }
             "screenshot" => {
-                let full = v.get("full_page").and_then(|x| x.as_bool()).unwrap_or(false);
+                let full = v
+                    .get("full_page")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
                 let shot = self
                     .manager
                     .screenshot(full)
                     .await
                     .map_err(|e| anyhow!(e.to_string()))?;
-                Ok(format!("screenshot: {}", shot.path.display()))
+                // Be explicit that the file is a binary PNG for the operator, not text —
+                // otherwise the model tends to `read_file` it (which fails on non-UTF-8).
+                // Point it at `get_content` for any textual analysis of the page.
+                Ok(format!(
+                    "Screenshot saved (binary PNG, for the human operator to view — do NOT read_file it): {}\nFor the page's text/DOM, use the browser `get_content` action instead.",
+                    shot.path.display()
+                ))
             }
             "get_content" => {
                 let sel = v.get("selector").and_then(|x| x.as_str());

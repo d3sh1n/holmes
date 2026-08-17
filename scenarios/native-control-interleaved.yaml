@@ -1,0 +1,44 @@
+name: native-control-interleaved
+description: Proves true interleaving — a single model response emits set_goal (a meta-action) AND an executable tool call, so the goal is recorded and the tool runs in the SAME turn, not two separate round-trips.
+mode: pentest
+turns:
+  - input: "Confirm example.test is reachable."
+tools:
+  - name: echo_probe
+    description: Returns deterministic probe evidence.
+    output: example.test is reachable
+    read_only: true
+scripted_responses:
+  - content: "Recording the objective and probing in one step."
+    tool_calls:
+      - id: call-goal
+        type: function
+        function:
+          name: set_goal
+          arguments: '{"condition":"confirm example.test is reachable","reason":"engagement objective"}'
+      - id: call-probe
+        type: function
+        function:
+          name: echo_probe
+          arguments: '{"target":"example.test"}'
+  - content: "Objective recorded and reachability confirmed."
+  # Consumed by the unified completion gate's semantic check (the closing plain-text
+  # answer is gated because a standing goal and a derived task contract exist).
+  - content: '{"schema_version":1,"satisfied":true,"gaps":[],"evidence_ids":["ev-1"]}'
+expectations:
+  final_contains:
+    - reachability confirmed
+  # goal_set and tool_call/tool_result all occur before the single turn_complete,
+  # proving the meta-action interleaved with the executable tool in one iteration.
+  event_sequence:
+    - user_message
+    - goal_set
+    - tool_call
+    - tool_result
+    - turn_complete
+  tool_calls:
+    - echo_probe
+  yield_types:
+    - plan_update
+    - final_answer
+  max_errors: 0

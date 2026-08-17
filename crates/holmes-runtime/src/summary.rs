@@ -33,7 +33,11 @@ pub fn static_branch_summary(events: &[StoredEvent], reason: &str) -> String {
                 ..
             } => {
                 if !success {
-                    errors.push(format!("{}: {}", name, error.as_deref().unwrap_or("failed")));
+                    errors.push(format!(
+                        "{}: {}",
+                        name,
+                        error.as_deref().unwrap_or("failed")
+                    ));
                 }
             }
             Event::VulnerabilityFound {
@@ -126,6 +130,7 @@ mod tests {
                     name: "http_request".into(),
                     arguments: serde_json::json!({"url":"/login"}),
                     purpose: Some("probe".into()),
+                    call_id: None,
                 },
             ),
             stored(

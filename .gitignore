@@ -11,4 +11,8 @@ config.local.yaml
 *.db
 *.db-*
 /output/
+/outputs/
 /data/
+
+# Local Codex-generated working artifacts
+/.codex-artifacts/

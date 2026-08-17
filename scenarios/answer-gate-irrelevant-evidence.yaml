@@ -1,0 +1,52 @@
+name: answer-gate-irrelevant-evidence
+description: >-
+  P0-02 acceptance: bookkeeping/irrelevant tool calls are not completion evidence.
+  The model reads an unrelated file, then answers in plain text; the gate rejects the
+  claim because no evidence record references the task target. Only a target-relevant
+  probe plus the semantic verifier's sign-off completes the turn.
+mode: pentest
+turns:
+  - input: "Confirm example.test is reachable."
+tools:
+  - name: note_reader
+    description: Reads a local note unrelated to the task target.
+    output: unrelated notes about grocery lists
+    read_only: true
+  - name: echo_probe
+    description: Returns deterministic probe evidence.
+    output: example.test is reachable
+    read_only: true
+scripted_responses:
+  # 1. An irrelevant (target-free) tool call.
+  - tool_calls:
+      - id: call-note
+        type: function
+        function:
+          name: note_reader
+          arguments: '{"path":"/tmp/notes.txt"}'
+  # 2. Plain-text answer leaning on that irrelevant call: rejected by the gate.
+  - content: "example.test is reachable."
+  # 3. The target-relevant probe.
+  - tool_calls:
+      - id: call-probe
+        type: function
+        function:
+          name: echo_probe
+          arguments: '{"target":"example.test"}'
+  # 4. The evidence-backed answer.
+  - content: "Reachability confirmed by probe."
+  # 5. Consumed by the semantic verifier (goal_evaluator role).
+  - content: '{"schema_version":1,"satisfied":true,"gaps":[],"evidence_ids":["ev-2"]}'
+expectations:
+  final_contains:
+    - Reachability confirmed by probe
+  event_payloads:
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":false'
+        - req-1
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":true'
+        - "verified; evidence"
+  max_errors: 0

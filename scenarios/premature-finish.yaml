@@ -1,0 +1,61 @@
+name: premature-finish
+description: Model declares finish immediately after setting a goal, before any tool ran. The completion verifier rejects the evidence-free claim and feeds the gap back; only the later evidence-backed finish (plus the semantic model check) becomes a verified finish.
+mode: pentest
+turns:
+  - input: "Confirm example.test is reachable."
+tools:
+  - name: echo_probe
+    description: Returns deterministic probe evidence.
+    output: example.test is reachable
+    read_only: true
+scripted_responses:
+  # 1. Set the goal. Terminal controls must be emitted alone.
+  - tool_calls:
+      - id: call-goal
+        type: function
+        function:
+          name: set_goal
+          arguments: '{"condition":"confirm example.test is reachable"}'
+  # 2. Premature finish with no evidence: rejected.
+  - tool_calls:
+      - id: call-finish-1
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"example.test is reachable","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+  # 3. The actual probe.
+  - tool_calls:
+      - id: call-probe
+        type: function
+        function:
+          name: echo_probe
+          arguments: '{"target":"example.test"}'
+  # 4. Finish again, now backed by a tool result.
+  - tool_calls:
+      - id: call-finish-2
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"Reachability confirmed by probe.","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+  # 5. Consumed by the completion verifier's semantic model check.
+  - content: '{"schema_version":1,"satisfied":true,"gaps":[],"evidence_ids":["ev-1"]}'
+expectations:
+  final_contains:
+    - Reachability confirmed by probe
+  event_sequence:
+    - goal_set
+    - goal_evaluated # rejected finish (satisfied=false)
+    - tool_call
+    - tool_result
+    - goal_evaluated # verified finish (satisfied=true)
+    - turn_complete
+  event_payloads:
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":false'
+        - no tool results
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":true'
+        - "verified; evidence"
+  max_errors: 0

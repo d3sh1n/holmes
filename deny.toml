@@ -1,0 +1,107 @@
+# cargo-deny policy baseline (P2-02, batch 10). Checked in CI by the `deny`
+# job in .github/workflows/ci.yml. Scope: license allowlist matching the
+# current Cargo.lock inventory, duplicate/wildcard bans as warnings, crates.io
+# as the only allowed source, and the six known cargo-audit warnings
+# registered with an explicit exemption reason and review date.
+
+[graph]
+all-features = false
+
+# ---------------------------------------------------------------------------
+# Advisories: vulnerabilities and yanked crates are hard errors. The six
+# informational warnings below (unmaintained/unsound, no known exploit path
+# in our usage) are registered exemptions. GOVERNANCE: every entry must carry
+# a reason and a review date; re-evaluate at the earlier of the stated date,
+# an upstream fix release, or the dependency being dropped. Next scheduled
+# review for all six: 2026-11-14 (quarterly).
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked = "deny"
+# Surface informational advisories on transitive dependencies too (scope, not
+# lint level in cargo-deny 0.20), so the registered exemptions below are
+# matched against real detections and any NEW unmaintained/unsound advisory
+# shows up in CI output for triage instead of being silently allowed.
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    # bincode 1.3.3 unmaintained — transitive via syntect (CLI syntax
+    # highlighting), serialization of trusted local theme/dump data only, no
+    # untrusted input path. Replacement (bincode 2 / syntect fork) is an
+    # upstream decision. Review: 2026-11-14.
+    "RUSTSEC-2025-0141",
+    # proc-macro-error2 unmaintained — transitive via defmt (lockfile-only,
+    # target-gated dependency chain; not in cargo-deny's build graph for our
+    # targets, so this ignore is inert there — kept for cargo audit parity).
+    # Review: 2026-11-14.
+    "RUSTSEC-2026-0173",
+    # ttf-parser unmaintained — transitive via lopdf/pdf-extract (PDF text
+    # extraction tool input). Parser robustness risk accepted for local
+    # documents; sandboxed by the tool deadline/process boundary. Review:
+    # 2026-11-14.
+    "RUSTSEC-2026-0192",
+    # yaml-rust unmaintained — transitive via syntect (syntax theme/grammar
+    # loading from shipped assets, not untrusted YAML). Review: 2026-11-14.
+    "RUSTSEC-2024-0320",
+    # anyhow downcast_mut unsoundness — we never call downcast_mut on
+    # anyhow::Error (grep-verified); fix lands with the next anyhow release.
+    # Review: 2026-11-14.
+    "RUSTSEC-2026-0190",
+    # lru LruCache::pop use-after-free (panic safety) — transitive via
+    # ratatui-core; we do not call pop() through a panicking path and the
+    # TUI is single-threaded per terminal. Fix expected upstream. Review:
+    # 2026-11-14.
+    "RUSTSEC-2026-0253",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses: permissive allowlist matching the current dependency inventory
+# (cargo metadata audit 2026-08-14). OR-expressions pass when any branch is
+# allowed (e.g. `MIT OR Apache-2.0 OR LGPL-2.1-or-later` passes via MIT;
+# `Apache-2.0 WITH LLVM-exception OR MIT` passes via MIT). Adding a copyleft-
+# only (GPL/LGPL/AGPL-only) dependency must fail this check.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "WTFPL",
+    "CC0-1.0",
+    "MIT-0",
+    "0BSD",
+    "BSL-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+# Workspace crates are internal (`publish = false` in every crate manifest);
+# skip the license check for them — the allowlist above still governs every
+# third-party dependency.
+private = { ignore = true }
+
+# ---------------------------------------------------------------------------
+# Bans: no hard-banned crates today. Duplicate versions and wildcard
+# dependency requirements warn (informational) rather than fail, so an
+# upstream transitive bump never blocks CI without a human look.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+# ---------------------------------------------------------------------------
+# Sources: crates.io only. No git or alternative-registry dependencies may
+# enter the tree without editing this file.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

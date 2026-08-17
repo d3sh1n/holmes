@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use holmes_core::tool_types::{FunctionDefinition, ToolDefinition};
@@ -6,13 +8,17 @@ use serde_json::json;
 
 use crate::scenario::HarnessTool;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HarnessMockTool {
     name: String,
     description: String,
     output: String,
     read_only: bool,
     fail: bool,
+    /// Remaining forced failures (`fail_times` from the scenario); 0 → succeed.
+    remaining_failures: Mutex<u32>,
+    /// Artificial latency (`delay_ms` from the scenario) for deadline injection.
+    delay_ms: Option<u64>,
 }
 
 impl HarnessMockTool {
@@ -25,6 +31,8 @@ impl HarnessMockTool {
             output: config.output,
             read_only: config.read_only,
             fail: config.fail,
+            remaining_failures: Mutex::new(config.fail_times.unwrap_or(0)),
+            delay_ms: config.delay_ms,
         }
     }
 }
@@ -54,8 +62,24 @@ impl Tool for HarnessMockTool {
     }
 
     async fn execute(&self, _args: &str) -> Result<String> {
+        // Artificial latency first: a hung tool must be observable by the outer
+        // bounded race regardless of its fail/success disposition.
+        if let Some(delay_ms) = self.delay_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         if self.fail {
             bail!(self.output.clone());
+        }
+        {
+            let mut remaining = self
+                .remaining_failures
+                .lock()
+                .map_err(|_| anyhow::anyhow!("harness mock tool failure counter is poisoned"))?;
+            if *remaining > 0 {
+                *remaining -= 1;
+                drop(remaining);
+                bail!(self.output.clone());
+            }
         }
         Ok(self.output.clone())
     }

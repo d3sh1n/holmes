@@ -1,5 +1,6 @@
 use anyhow::Context;
 use chrono::Utc;
+use holmes_core::background::BackgroundTasks;
 use holmes_core::config::{
     resolve_attack_model_provider, ApiFormat, Config, GuardConfig, HolmesConfig, PermissionMode,
     ResolvedModel,
@@ -12,11 +13,14 @@ use holmes_guards::GuardChain;
 use holmes_llm::client::LlmClient;
 use holmes_mind_palace::MindPalace;
 use holmes_runtime::deliberation::LlmBackend;
+use holmes_runtime::permissions::ApprovalHandler;
 use holmes_runtime::runtime::{AgentRuntime, TurnOutcome};
-use holmes_runtime::{RuntimeContext, RuntimeSink, RuntimeState, RuntimeYield, StreamEvent};
+use holmes_runtime::{
+    RuntimeContext, RuntimeSink, RuntimeState, RuntimeYield, SteeringQueue, StreamEvent,
+};
 use holmes_session::memory_store::MemoryStore;
 use holmes_session::selector::Selector;
-use holmes_session::{CreateSessionParams, SessionDB, SessionStore};
+use holmes_session::{SessionDB, SessionStore};
 use holmes_tools::ToolRegistry;
 use reedline::{
     default_emacs_keybindings, Completer, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers,
@@ -24,6 +28,7 @@ use reedline::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -34,9 +39,9 @@ use crate::workflows;
 const SYSTEM_PROMPT: &str = r#"你是 Holmes，一个渗透测试、安全研究和逆向工程的 AI Agent。
 
 ## 核心原则
-- 你与用户（Watson）协作进行安全研究。用户主导，你执行并建议。
+- 你与用户（Watson）协作进行安全研究。**Watson 主导；Watson 的显式命令优先级最高——照做，不要自行拒绝、打折扣或质疑一条指令。** 你在 Watson 的授权下行动。
 - 诚实透明：不确定的事情明确说。不伪造结果。
-- 安全第一：仅在授权范围内操作。GuardChain 会阻止越界行为。
+- 授权由 Watson 负责。操作者可配置 scope 白名单作为目标范围的启发式提示（scope guard 会拦截能从参数中识别出宿主的越界请求），但它**不是不可绕过的系统硬边界**——重定向跳转、动态拼接的命令、未声明目标的工具都可能绕过检查。因此你要自行把行动严格限制在 Watson 授权的范围内；拿不准是否越界时，先向 Watson 确认，不要自行试探。
 - 方法优先：先理解再行动。不要盲目扫描。
 
 ## 工作方式
@@ -59,9 +64,18 @@ fn holmes_data_dir() -> PathBuf {
 fn load_config(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
-    let cfg: HolmesConfig = serde_yaml::from_str(&text)
+    let raw: serde_yaml::Value = serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
-    let mut cfg = cfg;
+    let mut cfg: HolmesConfig = serde_yaml::from_value(raw.clone())
+        .with_context(|| format!("failed to parse config at {}", path.display()))?;
+    // Startup diagnostics (P2-01): unknown / removed keys and invalid value
+    // combinations are surfaced as warnings; loading itself never fails on them.
+    for diagnostic in holmes_core::config::diagnose_config(&raw, &cfg) {
+        eprintln!(
+            "config warning [{}]: {}",
+            diagnostic.path, diagnostic.message
+        );
+    }
     for provider in cfg.llm.providers.iter_mut() {
         if provider.api_key.is_empty() {
             if let Some(env_var) = &provider.api_key_env {
@@ -72,6 +86,18 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
         }
     }
     Ok(cfg)
+}
+
+/// Resolve the long-term memory database path from `memory.db_path`:
+/// absolute paths are used as-is, relative paths resolve against the Holmes
+/// data directory.
+pub(crate) fn resolve_memory_path(data_dir: &Path, configured: &str) -> PathBuf {
+    let path = PathBuf::from(configured);
+    if path.is_absolute() {
+        path
+    } else {
+        data_dir.join(path)
+    }
 }
 
 pub(crate) fn parse_mode(s: &str) -> SessionMode {
@@ -91,15 +117,31 @@ fn api_format_label(fmt: &ApiFormat) -> &'static str {
     }
 }
 
-async fn build_tool_registry(
+// Registry assembly takes every piece of session-scoped plumbing explicitly;
+// the `SessionAssembler` (session_assembly.rs, P1-04) is the bundling struct,
+// so exempt this one entry point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_tool_registry(
     config: &Config,
     session_db: Option<Arc<dyn SessionStore>>,
     memory_store: Option<Arc<MemoryStore>>,
     llm: Option<Arc<LlmClient>>,
     session_id: Option<String>,
     browser: Option<Arc<holmes_browser::BrowserManager>>,
+    background_tasks: &BackgroundTasks,
+    subagent_slots: &Arc<tokio::sync::Semaphore>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+
+    // Durable background tasks (AGT-007): bind the store's task sink to this
+    // session so spawned subagent tasks survive a process restart.
+    let durable_binding = session_db
+        .as_ref()
+        .and_then(|db| db.durable_task_sink())
+        .map(|sink| holmes_core::background::DurableTaskBinding {
+            sink,
+            parent_session_id: session_id.clone(),
+        });
 
     let runner = if let (Some(db), Some(ms), Some(l), Some(sid)) =
         (session_db, memory_store, llm, session_id)
@@ -110,13 +152,27 @@ async fn build_tool_registry(
             llm: l,
             config: config.clone(),
             parent_session_id: sid,
+            slots: subagent_slots.clone(),
         }) as Arc<dyn holmes_core::subagent::SubagentRunner>)
     } else {
         None
     };
 
-    holmes_tools::builtin::register_all(&mut registry, config, runner, browser);
-    holmes_tools::mcp::register_mcp_tools(&mut registry, &config.mcp.servers).await;
+    holmes_tools::builtin::register_all(
+        &mut registry,
+        config,
+        runner,
+        browser,
+        Some(background_tasks.clone()),
+        durable_binding,
+        Some(subagent_slots.clone()),
+    );
+    holmes_tools::mcp::register_mcp_tools(
+        &mut registry,
+        &config.mcp.servers,
+        std::time::Duration::from_millis(config.execution.mcp_request_timeout_ms),
+    )
+    .await;
     registry
 }
 
@@ -127,7 +183,10 @@ fn replay_events_into_runtime(
 ) {
     use holmes_core::tool_types::{FunctionCall, Role, ToolCall};
 
-    let mut pending_tool_calls = Vec::<(String, String)>::new(); // (tool_name, call_id)
+    // Call ↔ outcome correlation (P1-03): native call ids when the events carry
+    // them, plus a legacy name-matched FIFO for pre-call-id events.
+    let mut pending_by_id = std::collections::HashMap::<String, String>::new(); // call_id -> tool name
+    let mut legacy_pending = VecDeque::<(String, String)>::new(); // (tool name, call_id)
 
     for se in events {
         let event = se.event.clone();
@@ -140,18 +199,26 @@ fn replay_events_into_runtime(
                 session.messages.push(Message::assistant(content));
             }
             Event::ToolCall {
-                name, arguments, ..
+                name,
+                arguments,
+                call_id,
+                ..
             } => {
-                let call_id = format!("replayed-{}", uuid::Uuid::new_v4());
+                let id = call_id
+                    .clone()
+                    .unwrap_or_else(|| format!("replayed-{}", uuid::Uuid::new_v4()));
                 let tool_call = ToolCall {
-                    id: call_id.clone(),
+                    id: id.clone(),
                     call_type: "function".to_string(),
                     function: FunctionCall {
                         name: name.clone(),
                         arguments: arguments.to_string(),
                     },
                 };
-                pending_tool_calls.push((name.clone(), call_id));
+                pending_by_id.insert(id.clone(), name.clone());
+                if call_id.is_none() {
+                    legacy_pending.push_back((name.clone(), id));
+                }
 
                 if let Some(last_msg) = session.messages.last_mut() {
                     if last_msg.role == Role::Assistant {
@@ -171,18 +238,44 @@ fn replay_events_into_runtime(
                         .push(Message::assistant_with_tool_calls(vec![tool_call]));
                 }
             }
-            Event::ToolResult { name, content, .. } => {
-                let matched_idx = pending_tool_calls
-                    .iter()
-                    .position(|(tname, _)| tname == &name);
-                let call_id = if let Some(idx) = matched_idx {
-                    pending_tool_calls.remove(idx).1
-                } else {
-                    format!("replayed-orphan-{}", session.messages.len())
-                };
+            Event::ToolResult {
+                name,
+                content,
+                call_id,
+                ..
+            } => {
+                let call_id = resolve_pending_call(
+                    &mut pending_by_id,
+                    &mut legacy_pending,
+                    call_id.as_deref(),
+                    &name,
+                )
+                .unwrap_or_else(|| format!("replayed-orphan-{}", session.messages.len()));
                 session
                     .messages
                     .push(Message::tool_result(call_id, name, content));
+            }
+            Event::ToolBlocked {
+                tool_name,
+                guard_name,
+                reason,
+                call_id,
+            } => {
+                // A blocked call never executed, but the assistant message carries
+                // its tool_use — synthesize the failure tool-result so the
+                // replayed history stays legal (P1-03).
+                let call_id = resolve_pending_call(
+                    &mut pending_by_id,
+                    &mut legacy_pending,
+                    call_id.as_deref(),
+                    &tool_name,
+                )
+                .unwrap_or_else(|| format!("replayed-orphan-{}", session.messages.len()));
+                session.messages.push(Message::tool_result(
+                    call_id,
+                    tool_name,
+                    format!("[Tool blocked by {guard_name}] {reason}"),
+                ));
             }
             Event::SessionModeSet { mode, .. } => {
                 session.mode = mode;
@@ -190,12 +283,66 @@ fn replay_events_into_runtime(
             _ => {}
         }
     }
+
+    // Close dangling tool calls (crash between ToolCall and its outcome event, or
+    // an outcome archived away): every tool_use needs a tool_result.
+    let answered: std::collections::HashSet<&str> = session
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    let mut inserts: Vec<(usize, Vec<Message>)> = Vec::new();
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Some(tool_calls) = message.tool_calls.as_deref() else {
+            continue;
+        };
+        let missing: Vec<Message> = tool_calls
+            .iter()
+            .filter(|call| !answered.contains(call.id.as_str()))
+            .map(|call| {
+                Message::tool_result(
+                    call.id.clone(),
+                    call.function.name.clone(),
+                    "[Tool result missing from the session event log — the session was interrupted before a result was recorded.]",
+                )
+            })
+            .collect();
+        if !missing.is_empty() {
+            inserts.push((index + 1, missing));
+        }
+    }
+    for (position, synthesized) in inserts.into_iter().rev() {
+        let position = position.min(session.messages.len());
+        session.messages.splice(position..position, synthesized);
+    }
+}
+
+/// Resolve which pending tool call an outcome event answers (P1-03): by native
+/// call id when present, otherwise the oldest still-pending legacy call with the
+/// same tool name.
+fn resolve_pending_call(
+    pending_by_id: &mut std::collections::HashMap<String, String>,
+    legacy_pending: &mut VecDeque<(String, String)>,
+    call_id: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    if let Some(call_id) = call_id {
+        return pending_by_id.remove(call_id).map(|_| call_id.to_string());
+    }
+    let position = legacy_pending.iter().position(|(tool, _)| tool == name)?;
+    let (_, id) = legacy_pending.remove(position)?;
+    pending_by_id.remove(&id);
+    Some(id)
 }
 
 /// Rebuild a runtime context from the session's semantic event stream, falling
 /// back to legacy message replay when the session predates semantic startup
 /// metadata. The returned bool is `true` when semantic replay succeeded.
-async fn load_session_runtime_from_store(
+pub(crate) async fn load_session_runtime_from_store(
     session_db: Arc<dyn SessionStore>,
     memory_store: Arc<MemoryStore>,
     session_id: &str,
@@ -240,6 +387,43 @@ pub struct ChatContext {
     pub data_dir: PathBuf,
     pub command_registry: CommandRegistry,
     pub browser: Option<Arc<holmes_browser::BrowserManager>>,
+    /// Shared cooperative-cancellation flag for the in-flight turn. The TUI sets it
+    /// (Esc/Ctrl+C in the busy-loop key dispatch); the runtime observes it at each
+    /// iteration boundary.
+    pub cancel: Arc<AtomicBool>,
+    /// Steering queue for the in-flight turn (grok-build interjection): complete lines
+    /// typed while Holmes is busy are pushed here and drained into the conversation at
+    /// the next iteration boundary. Lines still queued when the turn ends were never
+    /// seen by the agent and are transferred back into `queued_turns`
+    /// (`run_runtime_input_with_sink`).
+    pub steering: SteeringQueue,
+    /// Background subagent task registry shared with the tool registry (spawn /
+    /// get_task_output tools hold clones) and wired into each turn's runtime context,
+    /// so background completions are drained into the conversation at iteration
+    /// boundaries across turns. Shares the `cancel` flag so blocking task waits
+    /// break on Esc.
+    pub background_tasks: BackgroundTasks,
+    /// Process-wide subagent concurrency pool (AGT-014): one semaphore shared by
+    /// every tool registry built for this context and by every nested subagent
+    /// registry, so `subagent.max_concurrent` holds across nesting levels and
+    /// registry rebuilds.
+    pub subagent_slots: Arc<tokio::sync::Semaphore>,
+    /// Resident durable task scheduler (P1-02): shutdown token + scan-loop
+    /// handle. Dropping the context cancels the loop and every in-flight
+    /// scheduler worker.
+    pub scheduler_shutdown: Option<tokio_util::sync::CancellationToken>,
+    pub scheduler_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ChatContext {
+    fn drop(&mut self) {
+        if let Some(token) = &self.scheduler_shutdown {
+            token.cancel();
+        }
+        if let Some(handle) = &self.scheduler_handle {
+            handle.abort();
+        }
+    }
 }
 
 pub(crate) fn save_config(ctx: &ChatContext) -> anyhow::Result<()> {
@@ -250,7 +434,7 @@ pub(crate) fn save_config(ctx: &ChatContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rebuild_selector(ctx: &mut ChatContext) {
+pub(crate) fn rebuild_selector(ctx: &mut ChatContext) {
     let mut selector = Selector::new();
     for wf in workflows::create_builtin_workflows(
         ctx.llm.clone(),
@@ -266,19 +450,6 @@ pub(crate) fn refresh_guard_chain(ctx: &mut ChatContext) {
     ctx.runtime_guards = GuardChain::from_config(&ctx.config.guards);
     ctx.guards = Arc::new(Mutex::new(GuardChain::from_config(&ctx.config.guards)));
     rebuild_selector(ctx);
-}
-
-pub(crate) async fn load_session_runtime(
-    ctx: &ChatContext,
-    session_id: &str,
-    mode: SessionMode,
-) -> anyhow::Result<(RuntimeSession, MindPalace)> {
-    let events = ctx.session_db.get_events(session_id).await?;
-    let mut mind_palace = MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
-    let mut runtime_session =
-        RuntimeSession::new(session_id.to_string(), mode).with_system_prompt(&ctx.system_prompt);
-    replay_events_into_runtime(&mut runtime_session, &mut mind_palace, &events);
-    Ok((runtime_session, mind_palace))
 }
 
 fn print_session_tree(sessions: &[SessionSummary], current_id: &str) {
@@ -686,10 +857,7 @@ fn set_all_guard_flags(config: &mut GuardConfig, enabled: bool) {
 }
 
 fn normalize_guard_name(name: &str) -> String {
-    name.trim()
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .replace(' ', "_")
+    name.trim().to_ascii_lowercase().replace(['-', ' '], "_")
 }
 
 struct CliRuntimeSink;
@@ -697,10 +865,13 @@ struct CliRuntimeSink;
 impl RuntimeSink for CliRuntimeSink {
     fn emit(&mut self, event: StreamEvent) {
         match event.data {
+            // Streaming deltas are surfaced by the inline UI; the line REPL / one-shot sink
+            // prints the whole block below, so ignore the incremental fragments here.
+            RuntimeYield::TextDelta { .. } => {}
             RuntimeYield::MessageToUser { content } | RuntimeYield::PlanUpdate { content } => {
                 print_holmes(&content);
             }
-            RuntimeYield::ToolStarted { name, call_id } => {
+            RuntimeYield::ToolStarted { name, call_id, .. } => {
                 print_tool_started(&name, call_id.as_deref());
             }
             RuntimeYield::PermissionDecision {
@@ -723,6 +894,20 @@ impl RuntimeSink for CliRuntimeSink {
             }
             RuntimeYield::EvidenceUpdate { content } => {
                 println!("  evidence: {}", content);
+            }
+            RuntimeYield::SteeringInjected { content } => {
+                println!("  steering: {}", content);
+            }
+            RuntimeYield::BackgroundTaskFinished {
+                description,
+                success,
+                ..
+            } => {
+                println!(
+                    "  ⚑ background task \"{}\" {}",
+                    description,
+                    if success { "completed" } else { "failed" }
+                );
             }
             RuntimeYield::NeedsUserInput { prompt } => {
                 print_holmes(&prompt);
@@ -927,6 +1112,7 @@ pub(crate) async fn run_runtime_input_with_sink<S: RuntimeSink>(
     input: String,
     oneshot: bool,
     sink: &mut S,
+    approver: Option<Arc<dyn ApprovalHandler>>,
 ) -> anyhow::Result<TurnOutcome> {
     apply_steering_notes(ctx).await?;
 
@@ -952,12 +1138,58 @@ pub(crate) async fn run_runtime_input_with_sink<S: RuntimeSink>(
         runtime_state,
         ctx.config.clone(),
     );
+    // Start this turn uncancelled and share the flag with the runtime so an external
+    // interrupt (e.g. the TUI's Esc/Ctrl+C dispatch) can stop the loop at the next boundary.
+    ctx.cancel.store(false, Ordering::Relaxed);
     let mut runtime = AgentRuntime::new(runtime_context);
+    // Interactive approval gate (Ask mode): the inline UI installs its approver here;
+    // REPL / one-shot callers pass None, so `Ask` mutating calls are denied
+    // (fail-closed) there.
+    if let Some(approver) = approver {
+        runtime.set_approver(approver);
+    }
+    runtime.context_mut().set_cancel_flag(ctx.cancel.clone());
+    // Share the steering queue so lines typed mid-turn are injected at the next
+    // iteration boundary instead of waiting for a follow-up turn.
+    runtime
+        .context_mut()
+        .set_steering_queue(ctx.steering.clone());
+    // Share the background task registry so subagents spawned in background mode by
+    // this session's tools have their completions drained into this turn (and any
+    // task that finished between turns is injected at this turn's first boundary).
+    runtime
+        .context_mut()
+        .set_background_tasks(ctx.background_tasks.clone());
     if ctx.browser.is_some() {
-        runtime
-            .context_mut()
-            .middlewares
-            .push(Arc::new(holmes_runtime::middleware::BrowserReadOnlyMiddleware));
+        runtime.context_mut().middlewares.push(Arc::new(
+            holmes_runtime::middleware::BrowserReadOnlyMiddleware,
+        ));
+    }
+    // Always-on safety middleware: secret redaction on tool output + a static
+    // dangerous-command backstop. (These existed but were never installed in production.)
+    runtime.context_mut().middlewares.push(Arc::new(
+        holmes_runtime::middleware::SensitiveDataRedactMiddleware::new(),
+    ));
+    runtime.context_mut().middlewares.push(Arc::new(
+        holmes_runtime::middleware::UntrustedContentMiddleware,
+    ));
+    runtime
+        .context_mut()
+        .middlewares
+        .push(Arc::new(holmes_runtime::middleware::GuardMiddleware));
+    // Outbound attack-rate limit (opt-in via config.safety.egress_rpm).
+    if let Some(rpm) = ctx.config.safety.egress_rpm {
+        if rpm > 0 {
+            runtime.context_mut().middlewares.push(Arc::new(
+                holmes_runtime::middleware::RateLimitMiddleware::new(rpm),
+            ));
+        }
+    }
+    // User-configurable tool hooks (opt-in via config.hooks) — deterministic policy / audit.
+    if holmes_runtime::middleware::UserHookMiddleware::is_active(&ctx.config.hooks) {
+        runtime.context_mut().middlewares.push(Arc::new(
+            holmes_runtime::middleware::UserHookMiddleware::new(ctx.config.hooks.clone()),
+        ));
     }
     let result = if oneshot {
         runtime.run_oneshot(input, sink).await
@@ -966,11 +1198,36 @@ pub(crate) async fn run_runtime_input_with_sink<S: RuntimeSink>(
     };
     let runtime_context = runtime.into_context();
 
+    // Steering leftovers: lines the agent never drained (pushed after its final
+    // iteration-boundary drain, e.g. while the last LLM call was in flight) keep the
+    // old type-ahead behavior — they become follow-up turns.
+    transfer_steering_leftovers(&ctx.steering, &mut ctx.queued_turns);
+
     ctx.session_id = runtime_context.session_id.clone();
     ctx.runtime_session = runtime_context.session;
     ctx.mind_palace = runtime_context.mind_palace;
     ctx.runtime_guards = runtime_context.guards;
     ctx.runtime_state = runtime_context.state;
+
+    // Auto-generate a structured findings report when the engagement finishes (one-shot)
+    // and config.agent.generate_reports is on — previously a dead flag.
+    if oneshot && ctx.config.agent.generate_reports {
+        if let Ok(events) = ctx.session_db.get_events(&ctx.session_id).await {
+            let report = render_case_report(
+                &ctx.session_id,
+                &ctx.runtime_session.mode,
+                ctx.runtime_state.active_goal.as_deref(),
+                &events,
+            );
+            let dir = std::path::Path::new(&ctx.config.output_dir);
+            if std::fs::create_dir_all(dir).is_ok() {
+                let path = dir.join(format!("report-{}.md", ctx.session_id));
+                if std::fs::write(&path, &report).is_ok() {
+                    eprintln!("[holmes] report written to {}", path.display());
+                }
+            }
+        }
+    }
 
     result.map_err(Into::into)
 }
@@ -981,7 +1238,7 @@ pub(crate) async fn run_runtime_input(
     oneshot: bool,
 ) -> anyhow::Result<TurnOutcome> {
     let mut sink = CliRuntimeSink;
-    run_runtime_input_with_sink(ctx, input, oneshot, &mut sink).await
+    run_runtime_input_with_sink(ctx, input, oneshot, &mut sink, None).await
 }
 
 async fn compact_chat_context(
@@ -1044,6 +1301,19 @@ async fn apply_steering_notes(ctx: &mut ChatContext) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Move steering lines the in-flight turn never drained (pushed after its last
+/// iteration-boundary drain) into the follow-up turn queue, preserving the old
+/// type-ahead "run after this turn" behavior for them.
+pub(crate) fn transfer_steering_leftovers(
+    steering: &SteeringQueue,
+    queued_turns: &mut VecDeque<String>,
+) {
+    let mut queue = steering.lock().unwrap_or_else(|e| e.into_inner());
+    while let Some(line) = queue.pop_front() {
+        queued_turns.push_back(line);
+    }
+}
+
 pub(crate) async fn drain_queued_turns(ctx: &mut ChatContext) {
     while let Some(input) = ctx.queued_turns.pop_front() {
         println!("Queued turn: {}", input);
@@ -1087,6 +1357,10 @@ async fn rebuild_runtime_from_events(ctx: &mut ChatContext) -> anyhow::Result<()
     ctx.runtime_guards = GuardChain::from_config(&ctx.config.guards);
     ctx.queued_turns.clear();
     ctx.steering_notes.clear();
+    ctx.steering
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     Ok(())
 }
 
@@ -1174,9 +1448,63 @@ fn render_case_report(
     let mut evidence = Vec::new();
     let mut reflections = Vec::new();
     let mut finals = Vec::new();
+    // Structured findings — the actual deliverable. Keyed by id so a later re-report
+    // (e.g. a confirmation) supersedes the earlier record.
+    let mut findings: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut ruled_out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for event in events {
         match &event.event {
+            Event::FindingRecorded {
+                id,
+                finding_type,
+                confidence,
+                severity,
+                evidence: ev,
+                details,
+                attack_type,
+                location,
+                evidence_source,
+            } => {
+                if confidence == "rejected" {
+                    let ty = if finding_type.is_empty() {
+                        attack_type
+                    } else {
+                        finding_type
+                    };
+                    let loc = if location.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" @ {location}")
+                    };
+                    ruled_out.insert(format!("{ty}{loc}"));
+                    findings.remove(id);
+                    continue;
+                }
+                let ty = if finding_type.is_empty() {
+                    attack_type
+                } else {
+                    finding_type
+                };
+                let mut entry = format!(
+                    "### [{:?}] {id}\n- **Type:** {ty}\n- **Confidence:** {confidence}\n",
+                    severity
+                );
+                if !location.is_empty() {
+                    entry.push_str(&format!("- **Location:** {location}\n"));
+                }
+                if !ev.is_empty() {
+                    entry.push_str(&format!("- **Evidence:** {ev}\n"));
+                }
+                if let Some(src) = evidence_source {
+                    entry.push_str(&format!("- **Evidence source:** {src}\n"));
+                }
+                if !details.is_empty() {
+                    entry.push_str(&format!("- **Details:** {details}\n"));
+                }
+                findings.insert(id.clone(), entry);
+            }
             Event::UserMessage { content, .. } => user_messages.push(content.clone()),
             Event::ToolCall {
                 name, arguments, ..
@@ -1245,6 +1573,24 @@ fn render_case_report(
         }
     }
 
+    // Findings first — the deliverable.
+    out.push_str(&format!("## Findings ({})\n\n", findings.len()));
+    if findings.is_empty() {
+        out.push_str("_No findings recorded._\n\n");
+    } else {
+        for entry in findings.values() {
+            out.push_str(entry);
+            out.push('\n');
+        }
+    }
+    if !ruled_out.is_empty() {
+        out.push_str("## Ruled out (tested, negative)\n\n");
+        for r in &ruled_out {
+            out.push_str(&format!("- {r}\n"));
+        }
+        out.push('\n');
+    }
+
     push_report_section(&mut out, "User Requests", &user_messages);
     push_report_section(&mut out, "Tool Calls", &tool_calls);
     push_report_section(&mut out, "Tool Results", &tool_results);
@@ -1264,12 +1610,12 @@ fn push_report_section(out: &mut String, title: &str, items: &[String]) {
     for item in items {
         out.push_str("- ");
         out.push_str(&item.replace('\n', "\n  "));
-        out.push_str("\n");
+        out.push('\n');
     }
     out.push('\n');
 }
 
-fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
+pub(crate) fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
     let mut names = registry
         .definitions()
         .into_iter()
@@ -1278,130 +1624,6 @@ fn active_tool_names(registry: &ToolRegistry) -> Vec<String> {
     names.sort();
     names.dedup();
     names
-}
-
-/// Append the semantic startup metadata events (SessionCreated, SystemPromptSet,
-/// ModeSet, ModelSet) for a freshly created session. Returns the shared timestamp
-/// so the caller can emit the matching ActiveToolsSet once the registry is built.
-async fn append_startup_metadata_events(
-    session_db: &dyn SessionStore,
-    id: &str,
-    title: Option<String>,
-    mode: SessionMode,
-    resolved_model: Option<ResolvedModel>,
-    system_prompt: String,
-    parent_id: Option<String>,
-    fork_point: Option<u64>,
-    tags: Vec<String>,
-) -> anyhow::Result<chrono::DateTime<Utc>> {
-    let now = Utc::now();
-    session_db
-        .append_event(
-            id,
-            &Event::SessionCreated {
-                id: id.to_string(),
-                title,
-                mode: mode.clone(),
-                model: resolved_model
-                    .as_ref()
-                    .map(|resolved| resolved.model.clone()),
-                system_prompt: Some(system_prompt.clone()),
-                parent_id,
-                fork_point,
-                created_at: now,
-                tags,
-            },
-        )
-        .await?;
-    session_db
-        .append_event(
-            id,
-            &Event::SessionSystemPromptSet {
-                prompt_hash: holmes_core::stable_prompt_hash(&system_prompt),
-                content: system_prompt,
-                source: "startup".into(),
-                timestamp: now,
-            },
-        )
-        .await?;
-    session_db
-        .append_event(
-            id,
-            &Event::SessionModeSet {
-                mode,
-                source: Some("startup".into()),
-                timestamp: Some(now),
-            },
-        )
-        .await?;
-    session_db
-        .append_event(
-            id,
-            &Event::SessionModelSet {
-                model: resolved_model
-                    .as_ref()
-                    .map(|resolved| resolved.model.clone())
-                    .unwrap_or_else(|| "unknown".into()),
-                provider: resolved_model.and_then(|resolved| resolved.provider),
-                source: "startup".into(),
-                timestamp: now,
-            },
-        )
-        .await?;
-    Ok(now)
-}
-
-async fn append_active_tools_startup_metadata_event(
-    session_db: &dyn SessionStore,
-    id: &str,
-    tool_names: Vec<String>,
-    timestamp: chrono::DateTime<Utc>,
-) -> anyhow::Result<()> {
-    session_db
-        .append_event(
-            id,
-            &Event::ActiveToolsSet {
-                tool_names,
-                source: "startup".into(),
-                timestamp,
-            },
-        )
-        .await?;
-    Ok(())
-}
-
-/// Persist a branch summary on a freshly forked child session.
-///
-/// Reads the parent event window `[from_event_index, to_event_index]`, builds a
-/// deterministic static fallback summary, and appends a `BranchSummary` event to
-/// the child so replay surfaces the parent path's context as a non-system message.
-pub(crate) async fn append_branch_summary(
-    ctx: &ChatContext,
-    new_session_id: &str,
-    from_event_index: u64,
-    to_event_index: u64,
-    reason: &str,
-) -> anyhow::Result<()> {
-    let events = ctx.session_db.get_events(&ctx.session_id).await?;
-    let window: Vec<_> = events
-        .into_iter()
-        .filter(|e| e.event_index >= from_event_index && e.event_index <= to_event_index)
-        .collect();
-    let summary = holmes_runtime::summary::static_branch_summary(&window, reason);
-    ctx.session_db
-        .append_event(
-            new_session_id,
-            &Event::BranchSummary {
-                from_event_index,
-                to_event_index,
-                summary,
-                reason: reason.to_string(),
-                method: holmes_core::SummaryMethod::StaticFallback,
-                timestamp: Utc::now(),
-            },
-        )
-        .await?;
-    Ok(())
 }
 
 async fn append_active_tools_event_for_registry(
@@ -1423,104 +1645,25 @@ async fn append_active_tools_event_for_registry(
     Ok(())
 }
 
-async fn create_fresh_runtime_session(
-    session_db: Arc<dyn SessionStore>,
-    memory_store: Arc<MemoryStore>,
-    llm: Arc<LlmClient>,
+/// Construct the browser manager for a session (lazy-launch; only when enabled).
+/// Shared by fresh and resumed/continued sessions so browser availability does not
+/// depend on how the session was started.
+pub(crate) fn build_browser(
     config: &HolmesConfig,
     data_dir: &Path,
-    browser_out: &mut Option<Arc<holmes_browser::BrowserManager>>,
-    mode: SessionMode,
-    resolved_model: Option<ResolvedModel>,
-    system_prompt: String,
-) -> anyhow::Result<(String, RuntimeSession, MindPalace, Arc<ToolRegistry>)> {
-    let session = session_db
-        .create_session(CreateSessionParams {
-            id: None,
-            title: None,
-            mode: Some(mode.clone()),
-            model: resolved_model
-                .as_ref()
-                .map(|resolved| resolved.model.clone()),
-            system_prompt: Some(system_prompt.clone()),
-            parent_session_id: None,
-            fork_point: None,
-            source: Some("cli".into()),
-            tags: vec![],
-        })
-        .await?;
-    let session_id = session.id.clone();
-    let startup_timestamp = match append_startup_metadata_events(
-        session_db.as_ref(),
-        &session_id,
-        session.title,
-        mode.clone(),
-        resolved_model,
-        system_prompt.clone(),
-        None,
-        None,
-        session.tags,
-    )
-    .await
-    {
-        Ok(timestamp) => timestamp,
-        Err(error) => {
-            session_db
-                .end_session(&session_id, EndReason::Error)
-                .await
-                .ok();
-            return Err(error);
-        }
-    };
-    let browser: Option<Arc<holmes_browser::BrowserManager>> = if config.browser.enabled {
-        let sessions_dir = data_dir.join("sessions");
-        match holmes_browser::BrowserManager::new(
-            &session_id,
-            &sessions_dir,
-            config.browser.clone(),
-        ) {
-            Ok(mgr) => Some(Arc::new(mgr)),
-            Err(e) => {
-                eprintln!("Warning: browser disabled: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let registry = Arc::new(
-        build_tool_registry(
-            config,
-            Some(session_db.clone()),
-            Some(memory_store.clone()),
-            Some(llm),
-            Some(session_id.clone()),
-            browser.clone(),
-        )
-        .await,
-    );
-    if let Err(error) = append_active_tools_startup_metadata_event(
-        session_db.as_ref(),
-        &session_id,
-        active_tool_names(&registry),
-        startup_timestamp,
-    )
-    .await
-    {
-        session_db
-            .end_session(&session_id, EndReason::Error)
-            .await
-            .ok();
-        return Err(error);
+    session_id: &str,
+) -> Option<Arc<holmes_browser::BrowserManager>> {
+    if !config.browser.enabled {
+        return None;
     }
-    let mind_palace = MindPalace::new(session_db, memory_store);
-    *browser_out = browser.clone();
-    Ok((
-        session_id.clone(),
-        RuntimeSession::new(session_id, mode).with_system_prompt(&system_prompt),
-        mind_palace,
-        registry,
-    ))
+    let sessions_dir = data_dir.join("sessions");
+    match holmes_browser::BrowserManager::new(session_id, &sessions_dir, config.browser.clone()) {
+        Ok(mgr) => Some(Arc::new(mgr)),
+        Err(e) => {
+            eprintln!("Warning: browser disabled: {e}");
+            None
+        }
+    }
 }
 
 pub(crate) struct ChatStartup {
@@ -1554,9 +1697,33 @@ pub(crate) async fn create_chat_context(
     let system_prompt = build_system_prompt(SYSTEM_PROMPT, &config, &project_dir, mode.clone());
 
     let db_path = data_dir.join("holmes.db");
-    let session_db: Arc<dyn SessionStore> = Arc::new(SessionDB::open(&db_path).await?);
+    let session_db = SessionDB::open(&db_path).await?;
 
-    let memory_path = data_dir.join("memory.db");
+    // Restart recovery (AGT-007): discharge tasks whose runner died with the
+    // previous process before any new work starts. Safe-to-retry orphans are
+    // requeued; side-effecting ones are suspended for manual recovery.
+    let task_store = session_db.task_store();
+    match holmes_runtime::recovery::recover_durable_tasks(&task_store).await {
+        Ok(report) if !report.is_clean() => {
+            eprintln!(
+                "⚠ Recovered {} orphaned background task(s): {} requeued, {} suspended for manual recovery",
+                report.requeued.len() + report.manual_required.len(),
+                report.requeued.len(),
+                report.manual_required.len(),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("⚠ Background task recovery failed: {error}");
+        }
+    }
+
+    let session_db: Arc<dyn SessionStore> = Arc::new(session_db);
+
+    let memory_path = resolve_memory_path(&data_dir, &config.memory.db_path);
+    if let Some(parent) = memory_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let memory_store = Arc::new(MemoryStore::open(&memory_path).await?);
 
     let guards = Arc::new(Mutex::new(GuardChain::from_config(&config.guards)));
@@ -1564,43 +1731,70 @@ pub(crate) async fn create_chat_context(
     let llm = Arc::new(LlmClient::new(&config));
     let startup_model = resolve_attack_model_provider(&config, model);
 
-    // Browser manager (lazy-launches on first action). Only fresh sessions
-    // populate this; resume/continue currently run without a browser.
-    let mut browser: Option<Arc<holmes_browser::BrowserManager>> = None;
+    // Cancel flag + background task registry are created as a pair: every tool
+    // registry built for this ChatContext and every per-turn runtime context share
+    // them, so background subagent completions drain across turns and blocking
+    // `get_task_output` waits observe Esc.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let background_tasks = BackgroundTasks::with_cancel(cancel.clone());
+    // One process-wide subagent concurrency pool (AGT-014), shared by every
+    // registry built below and every nested subagent run.
+    let subagent_slots = Arc::new(tokio::sync::Semaphore::new(
+        (config.subagent.max_concurrent as usize).max(1),
+    ));
 
-    // Create RuntimeSession
-    let (session_id, runtime_session, mind_palace, registry, is_resume) = if let Some(id) =
-        resume_id
-    {
-        let (session, mp, semantic_complete) = load_session_runtime_from_store(
-            session_db.clone(),
-            memory_store.clone(),
-            &id,
-            mode.clone(),
-            &system_prompt,
-        )
-        .await?;
+    // Resident durable task scheduler (P1-02): startup recovery above runs once;
+    // this keeps scanning — dead-owner reaper, expired-lease recovery, and
+    // atomic lease-and-execute for requeued tasks (subagent tasks are re-run
+    // from their persisted payload after an operator requeue).
+    let scheduler_shutdown = tokio_util::sync::CancellationToken::new();
+    let scheduler = Arc::new(
+        holmes_runtime::scheduler::DurableTaskScheduler::new(task_store)
+            .with_executor(
+                "subagent",
+                Arc::new(crate::subagent::SubagentTaskExecutor {
+                    session_db: session_db.clone(),
+                    memory_store: memory_store.clone(),
+                    llm: llm.clone(),
+                    config: config.clone(),
+                    slots: subagent_slots.clone(),
+                }),
+            )
+            .with_heartbeat_interval(std::time::Duration::from_millis(
+                config.experiments.heartbeat_ms.max(1),
+            ))
+            .with_max_attempts(config.experiments.max_attempts.max(1))
+            .with_shutdown(scheduler_shutdown.clone()),
+    );
+    let scheduler_handle = scheduler.spawn(holmes_runtime::scheduler::DEFAULT_SCAN_INTERVAL);
+
+    // Session assembly (P1-04): fresh startup, --resume and --continue all
+    // build the session through the one assembler — identical startup
+    // semantics, canonical replay and resource rebuild on every path.
+    let assembler = crate::session_assembly::SessionAssembler::new(
+        session_db.clone(),
+        memory_store.clone(),
+        llm.clone(),
+        config.clone(),
+        data_dir.clone(),
+        system_prompt.clone(),
+        background_tasks.clone(),
+        subagent_slots.clone(),
+    );
+
+    let (assembled, is_resume) = if let Some(id) = resume_id {
+        let assembled = assembler.assemble_resume(&id, mode.clone()).await?;
         if announce {
-            if !semantic_complete {
+            if !assembled.semantic_complete {
                 eprintln!(
                     "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
                     &id[..8.min(id.len())]
                 );
             }
             eprintln!("↻ Resumed session {}", &id[..8.min(id.len())]);
+            print_pending_task_results_notice(assembled.pending_task_results);
         }
-        let registry = Arc::new(
-            build_tool_registry(
-                &config,
-                Some(session_db.clone()),
-                Some(memory_store.clone()),
-                Some(llm.clone()),
-                Some(id.clone()),
-            None,
-            )
-            .await,
-        );
-        (id, session, mp, registry, true)
+        (assembled, true)
     } else if continue_last {
         let filter = SessionFilter {
             limit: Some(1),
@@ -1608,87 +1802,65 @@ pub(crate) async fn create_chat_context(
         };
         let sessions = session_db.list_sessions(&filter).await?;
         if let Some(s) = sessions.first() {
-            let (session, mp, semantic_complete) = load_session_runtime_from_store(
-                session_db.clone(),
-                memory_store.clone(),
-                &s.id,
-                mode.clone(),
-                &system_prompt,
-            )
-            .await?;
+            let assembled = assembler.assemble_resume(&s.id, mode.clone()).await?;
             if announce {
-                if !semantic_complete {
+                if !assembled.semantic_complete {
                     eprintln!(
                         "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
                         &s.id[..8.min(s.id.len())]
                     );
                 }
                 eprintln!("↻ Continued session {}", &s.id[..8.min(s.id.len())]);
+                print_pending_task_results_notice(assembled.pending_task_results);
             }
-            let registry = Arc::new(
-                build_tool_registry(
-                    &config,
-                    Some(session_db.clone()),
-                    Some(memory_store.clone()),
-                    Some(llm.clone()),
-                    Some(s.id.clone()),
-                None,
-                )
-                .await,
-            );
-            (s.id.clone(), session, mp, registry, true)
+            (assembled, true)
         } else {
-            let (session_id, runtime_session, mind_palace, registry) =
-                create_fresh_runtime_session(
-                    session_db.clone(),
-                    memory_store.clone(),
-                    llm.clone(),
-                    &config,
-                    &data_dir,
-                    &mut browser,
+            (
+                assembler
+                    .assemble_fresh(
+                        mode.clone(),
+                        startup_model.clone(),
+                        system_prompt.clone(),
+                        "cli",
+                    )
+                    .await?,
+                false,
+            )
+        }
+    } else {
+        (
+            assembler
+                .assemble_fresh(
                     mode.clone(),
                     startup_model.clone(),
                     system_prompt.clone(),
+                    "cli",
                 )
-                .await?;
-            (session_id, runtime_session, mind_palace, registry, false)
-        }
-    } else {
-        let (session_id, runtime_session, mind_palace, registry) = create_fresh_runtime_session(
-            session_db.clone(),
-            memory_store.clone(),
-            llm.clone(),
-            &config,
-            &data_dir,
-            &mut browser,
-            mode.clone(),
-            startup_model.clone(),
-            system_prompt.clone(),
+                .await?,
+            false,
         )
-        .await?;
-        (session_id, runtime_session, mind_palace, registry, false)
     };
 
     let mut selector = Selector::new();
-    for wf in workflows::create_builtin_workflows(llm.clone(), registry.clone(), guards.clone()) {
+    for wf in
+        workflows::create_builtin_workflows(llm.clone(), assembled.registry.clone(), guards.clone())
+    {
         selector.register(wf);
     }
 
-    let mut runtime_state = RuntimeState::new(runtime_session.mode.clone());
-    if let Some(session_record) = session_db.get_session(&session_id).await? {
-        runtime_state.active_goal = session_record.goal_condition;
-    }
+    let mut runtime_state = RuntimeState::new(assembled.runtime_session.mode.clone());
+    runtime_state.active_goal = assembled.active_goal.clone();
     let ctx = ChatContext {
-        session_id,
+        session_id: assembled.session_id,
         session_db: session_db.clone(),
         memory_store: memory_store.clone(),
         llm: llm.clone(),
-        registry: registry.clone(),
+        registry: assembled.registry,
         guards: guards.clone(),
         runtime_guards,
         selector,
-        runtime_session,
-        mind_palace,
+        runtime_session: assembled.runtime_session,
+        mind_palace: assembled.mind_palace,
         runtime_state,
         queued_turns: VecDeque::new(),
         steering_notes: Vec::new(),
@@ -1696,10 +1868,27 @@ pub(crate) async fn create_chat_context(
         config,
         data_dir: data_dir.clone(),
         command_registry: CommandRegistry::default(),
-        browser,
+        browser: assembled.browser,
+        cancel,
+        steering: holmes_runtime::new_steering_queue(),
+        background_tasks,
+        subagent_slots,
+        scheduler_shutdown: Some(scheduler_shutdown),
+        scheduler_handle: Some(scheduler_handle),
     };
 
     Ok(Some(ChatStartup { ctx, is_resume }))
+}
+
+/// Durable background-task results written before a crash are re-delivered by
+/// the runtime at the next turn boundary (P1-02); surface the pending count
+/// when a session starts or resumes with some waiting.
+pub(crate) fn print_pending_task_results_notice(pending_task_results: usize) {
+    if pending_task_results > 0 {
+        eprintln!(
+            "⧉ {pending_task_results} background task result(s) pending; delivered at the next turn boundary"
+        );
+    }
 }
 
 pub async fn run_chat(
@@ -1898,30 +2087,8 @@ pub async fn run_chat(
             match handle_slash_command(&trimmed, &mut ctx).await {
                 SlashResult::Quit => break,
                 SlashResult::Handled => continue,
-                SlashResult::NewSession(rs, mp, new_id, registry) => {
-                    ctx.runtime_session = rs;
-                    ctx.mind_palace = mp;
-                    ctx.session_id = new_id;
-                    ctx.registry = registry;
-                    ctx.runtime_guards = GuardChain::from_config(&ctx.config.guards);
-                    ctx.runtime_state = RuntimeState::new(ctx.runtime_session.mode.clone());
-                    if let Ok(Some(session_record)) =
-                        ctx.session_db.get_session(&ctx.session_id).await
-                    {
-                        ctx.runtime_state.active_goal = session_record.goal_condition;
-                    }
-                    ctx.queued_turns.clear();
-                    ctx.steering_notes.clear();
-                    // Rebuild selector with new session context
-                    let mut sel = Selector::new();
-                    for wf in workflows::create_builtin_workflows(
-                        ctx.llm.clone(),
-                        ctx.registry.clone(),
-                        ctx.guards.clone(),
-                    ) {
-                        sel.register(wf);
-                    }
-                    ctx.selector = sel;
+                SlashResult::NewSession(assembled) => {
+                    crate::session_assembly::switch_to(&mut ctx, *assembled);
                 }
                 SlashResult::NotHandled(input) => {
                     match run_runtime_input(&mut ctx, input, false).await {
@@ -2007,10 +2174,12 @@ async fn run_selector_loop(
     Ok(())
 }
 
+// NewSession carries a fully assembled session stack (P1-04); boxing keeps the
+// enum small despite the larger payload.
 pub(crate) enum SlashResult {
     Quit,
     Handled,
-    NewSession(RuntimeSession, MindPalace, String, Arc<ToolRegistry>),
+    NewSession(Box<crate::session_assembly::AssembledSession>),
     NotHandled(String),
 }
 
@@ -2031,24 +2200,22 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                 .await
                 .ok();
             let model = resolve_attack_model_provider(&ctx.config, None);
-            let mut new_browser: Option<Arc<holmes_browser::BrowserManager>> = None;
-            match create_fresh_runtime_session(
-                ctx.session_db.clone(),
-                ctx.memory_store.clone(),
-                ctx.llm.clone(),
-                &ctx.config,
-                &ctx.data_dir,
-                &mut new_browser,
-                ctx.runtime_session.mode.clone(),
-                model,
-                ctx.system_prompt.clone(),
-            )
-            .await
+            let assembler = crate::session_assembly::SessionAssembler::from_context(ctx);
+            match assembler
+                .assemble_fresh(
+                    ctx.runtime_session.mode.clone(),
+                    model,
+                    ctx.system_prompt.clone(),
+                    "cli",
+                )
+                .await
             {
-                Ok((new_id, rs, mp, registry)) => {
-                    println!("Started new session: {}", &new_id[..8.min(new_id.len())]);
-                    ctx.browser = new_browser;
-                    return SlashResult::NewSession(rs, mp, new_id, registry);
+                Ok(assembled) => {
+                    println!(
+                        "Started new session: {}",
+                        &assembled.session_id[..8.min(assembled.session_id.len())]
+                    );
+                    return SlashResult::NewSession(Box::new(assembled));
                 }
                 Err(error) => eprintln!("Error: {}", error),
             }
@@ -2076,8 +2243,8 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                         } else {
                             println!("Recent sessions:\n");
                             println!(
-                                "{:<4} {:<27} {:<51} {:<12} {}",
-                                "#", "Title", "Preview", "Last Active", "ID"
+                                "{:<4} {:<27} {:<51} {:<12} ID",
+                                "#", "Title", "Preview", "Last Active"
                             );
                             println!("{}", "-".repeat(101));
                             for (i, s) in sessions.iter().enumerate() {
@@ -2140,22 +2307,34 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                             .end_session(&ctx.session_id, EndReason::UserQuit)
                             .await
                             .ok();
+                        let assembler =
+                            crate::session_assembly::SessionAssembler::from_context(ctx);
+                        let assembled = match assembler.assemble_resume(&s.id, s.mode.clone()).await
+                        {
+                            Ok(assembled) => assembled,
+                            Err(error) => {
+                                eprintln!("Error: {}", error);
+                                return SlashResult::Handled;
+                            }
+                        };
+                        if !assembled.semantic_complete {
+                            eprintln!(
+                                "⚠ Session {} is missing semantic startup metadata; used legacy replay fallback",
+                                &s.id[..8.min(s.id.len())]
+                            );
+                        }
+                        println!(
+                            "↻ Resuming session {} ({}) and replaying history...",
+                            &s.id[..8.min(s.id.len())],
+                            s.title.as_deref().unwrap_or("untitled"),
+                        );
+                        print_pending_task_results_notice(assembled.pending_task_results);
                         let events = ctx
                             .session_db
                             .get_events(&s.id)
                             .await
                             .ok()
                             .unwrap_or_default();
-                        let mut mp =
-                            MindPalace::new(ctx.session_db.clone(), ctx.memory_store.clone());
-                        let mut rs = RuntimeSession::new(s.id.clone(), s.mode.clone())
-                            .with_system_prompt(&ctx.system_prompt);
-                        println!(
-                            "↻ Resuming session {} ({}) and replaying history...",
-                            &s.id[..8.min(s.id.len())],
-                            s.title.as_deref().unwrap_or("untitled"),
-                        );
-                        replay_events_into_runtime(&mut rs, &mut mp, &events);
                         for se in &events {
                             match &se.event {
                                 Event::UserMessage { content, .. } => {
@@ -2195,18 +2374,7 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                             }
                         }
                         println!();
-                        let registry = Arc::new(
-                            build_tool_registry(
-                                &ctx.config,
-                                Some(ctx.session_db.clone()),
-                                Some(ctx.memory_store.clone()),
-                                Some(ctx.llm.clone()),
-                                Some(s.id.clone()),
-                            None,
-                            )
-                            .await,
-                        );
-                        return SlashResult::NewSession(rs, mp, s.id.clone(), registry);
+                        return SlashResult::NewSession(Box::new(assembled));
                     }
                     println!("Session not found: {}", args);
                 }
@@ -2272,6 +2440,76 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
             SlashResult::Handled
         }
 
+        "ledger" => {
+            match ctx.session_db.case_id_for_session(&ctx.session_id).await {
+                Ok(case_id) => {
+                    if args.trim() == "compact" {
+                        match ctx.session_db.compact_snapshot(&case_id, 1).await {
+                            Ok(result) if result.written => println!(
+                                "Ledger snapshot rebuilt at event {}.",
+                                result.projected_seq
+                            ),
+                            Ok(result) => println!(
+                                "Ledger snapshot is already current at event {}.",
+                                result.projected_seq
+                            ),
+                            Err(error) => {
+                                eprintln!("Ledger snapshot rebuild failed: {error}");
+                                return SlashResult::Handled;
+                            }
+                        }
+                    }
+                    match ctx.session_db.load(&case_id).await {
+                        Ok(snapshot) if args.trim() == "json" => {
+                            match serde_json::to_string_pretty(&snapshot) {
+                                Ok(json) => println!("{json}"),
+                                Err(error) => eprintln!("Ledger serialization failed: {error}"),
+                            }
+                        }
+                        Ok(snapshot) => {
+                            println!("Case Ledger: {} @ v{}", snapshot.case_id, snapshot.version);
+                            println!(
+                                "  Hypotheses: {}  Predictions: {}  Experiments: {}",
+                                snapshot.hypotheses.len(),
+                                snapshot.predictions.len(),
+                                snapshot.experiments.len()
+                            );
+                            println!(
+                                "  Evidence: {}  Links: {}  Resolutions: {}  Contradictions: {}",
+                                snapshot.evidence.len(),
+                                snapshot.evidence_links.len(),
+                                snapshot.resolutions.len(),
+                                snapshot.contradictions.len()
+                            );
+                            for hypothesis in snapshot.hypotheses.values() {
+                                println!(
+                                    "  [{} {:?}/{:?} r{}] {}",
+                                    hypothesis.id,
+                                    hypothesis.status,
+                                    hypothesis.priority,
+                                    hypothesis.revision,
+                                    truncate_chars(&hypothesis.claim, 120)
+                                );
+                            }
+                            for experiment in snapshot.experiments.values() {
+                                println!(
+                                    "  [{} {:?} attempt={} task={}] {}",
+                                    experiment.id,
+                                    experiment.status,
+                                    experiment.attempt,
+                                    experiment.task_id.as_deref().unwrap_or("-"),
+                                    truncate_chars(&experiment.action, 100)
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("Ledger load failed: {error}"),
+                    }
+                }
+                Err(error) => eprintln!("Case lookup failed: {error}"),
+            }
+            SlashResult::Handled
+        }
+
         "tree" => {
             if args.is_empty() {
                 match ctx
@@ -2316,46 +2554,17 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                     } else {
                         title
                     };
-                    match ctx
-                        .session_db
-                        .fork_session(&ctx.session_id, fork_point, &title)
+                    let assembler = crate::session_assembly::SessionAssembler::from_context(ctx);
+                    match assembler
+                        .assemble_fork(&ctx.session_id, fork_point, &title, "branch")
                         .await
                     {
-                        Ok(new_session) => {
-                            match load_session_runtime(
-                                ctx,
-                                &new_session.id,
-                                new_session.mode.clone(),
-                            )
-                            .await
-                            {
-                                Ok((runtime_session, mind_palace)) => {
-                                    println!(
-                                        "Branched to {} at event_index={fork_point}.",
-                                        short_id(&new_session.id)
-                                    );
-                                    let registry = Arc::new(
-                                        build_tool_registry(
-                                            &ctx.config,
-                                            Some(ctx.session_db.clone()),
-                                            Some(ctx.memory_store.clone()),
-                                            Some(ctx.llm.clone()),
-                                            Some(new_session.id.clone()),
-                                        None,
-                                        )
-                                        .await,
-                                    );
-                                    return SlashResult::NewSession(
-                                        runtime_session,
-                                        mind_palace,
-                                        new_session.id,
-                                        registry,
-                                    );
-                                }
-                                Err(error) => {
-                                    eprintln!("Branch created but reload failed: {}", error)
-                                }
-                            }
+                        Ok(assembled) => {
+                            println!(
+                                "Branched to {} at event_index={fork_point}.",
+                                short_id(&assembled.session_id)
+                            );
+                            return SlashResult::NewSession(Box::new(assembled));
                         }
                         Err(error) => eprintln!("Error: {}", error),
                     }
@@ -2402,75 +2611,25 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                     return SlashResult::Handled;
                 }
             };
-            match ctx
-                .session_db
-                .fork_session(
+            let assembler = crate::session_assembly::SessionAssembler::from_context(ctx);
+            match assembler
+                .assemble_fork(
                     &ctx.session_id,
                     fork_point,
                     title.as_deref().unwrap_or("branch"),
+                    "branch",
                 )
                 .await
             {
-                Ok(new_session) => {
-                    let branch_metadata = append_startup_metadata_events(
-                        ctx.session_db.as_ref(),
-                        &new_session.id,
-                        new_session.title.clone(),
-                        new_session.mode.clone(),
-                        new_session.model.clone().map(|model| ResolvedModel {
-                            model,
-                            provider: resolve_attack_model_provider(&ctx.config, None)
-                                .and_then(|resolved| resolved.provider),
-                        }),
-                        new_session
-                            .system_prompt
-                            .clone()
-                            .unwrap_or_else(|| ctx.system_prompt.clone()),
-                        Some(ctx.session_id.clone()),
-                        Some(fork_point),
-                        new_session.tags.clone(),
-                    )
-                    .await;
-
-                    match branch_metadata {
-                        Ok(startup_timestamp) => {
-                            if let Err(error) = append_active_tools_startup_metadata_event(
-                                ctx.session_db.as_ref(),
-                                &new_session.id,
-                                active_tool_names(&ctx.registry),
-                                startup_timestamp,
-                            )
-                            .await
-                            {
-                                ctx.session_db
-                                    .end_session(&new_session.id, EndReason::Error)
-                                    .await
-                                    .ok();
-                                eprintln!("Error: {}", error);
-                                return SlashResult::Handled;
-                            }
-                        }
-                        Err(error) => {
-                            ctx.session_db
-                                .end_session(&new_session.id, EndReason::Error)
-                                .await
-                                .ok();
-                            eprintln!("Error: {}", error);
-                            return SlashResult::Handled;
-                        }
-                    }
-
-                    if let Err(error) =
-                        append_branch_summary(ctx, &new_session.id, 0, fork_point, "branch").await
-                    {
-                        eprintln!("Warning: failed to record branch summary: {}", error);
-                    }
-
+                Ok(assembled) => {
                     println!(
                         "Branched to: {} ({})",
-                        &new_session.id[..8.min(new_session.id.len())],
-                        new_session.title.as_deref().unwrap_or("untitled"),
+                        &assembled.session_id[..8.min(assembled.session_id.len())],
+                        title.as_deref().unwrap_or("branch"),
                     );
+                    // Same as /tree fork and the TUI: a branch switches the
+                    // current context into the child session.
+                    return SlashResult::NewSession(Box::new(assembled));
                 }
                 Err(e) => eprintln!("Error: {}", e),
             }
@@ -2817,7 +2976,10 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                         provider: None,
                     });
 
-                if let Err(error) = ctx.session_db.set_model(&ctx.session_id, &selected.model).await
+                if let Err(error) = ctx
+                    .session_db
+                    .set_model(&ctx.session_id, &selected.model)
+                    .await
                 {
                     eprintln!("Error: {}", error);
                     return SlashResult::Handled;
@@ -2872,7 +3034,10 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                 println!("Available: pentest, audit, reverse, research, mixed");
             } else {
                 let new_mode = parse_mode(args);
-                if let Err(error) = ctx.session_db.set_mode(&ctx.session_id, new_mode.clone()).await
+                if let Err(error) = ctx
+                    .session_db
+                    .set_mode(&ctx.session_id, new_mode.clone())
+                    .await
                 {
                     eprintln!("Error: {}", error);
                     return SlashResult::Handled;
@@ -3181,17 +3346,12 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
 
         "mcp" => {
             if args == "reload" {
-                let registry = Arc::new(
-                    build_tool_registry(
-                        &ctx.config,
-                        Some(ctx.session_db.clone()),
-                        Some(ctx.memory_store.clone()),
-                        Some(ctx.llm.clone()),
-                        Some(ctx.session_id.clone()),
-                    None,
-                    )
-                    .await,
-                );
+                // P2-04: rebuild through the SessionAssembler's unified
+                // registry builder with the session's CURRENT browser handle —
+                // passing `None` here silently dropped the `browser` tool.
+                let registry = crate::session_assembly::SessionAssembler::from_context(ctx)
+                    .rebuild_registry(&ctx.session_id, ctx.browser.clone())
+                    .await;
                 let mut selector = Selector::new();
                 for wf in workflows::create_builtin_workflows(
                     ctx.llm.clone(),
@@ -3250,32 +3410,19 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
 
         "status" => {
             let s = &ctx.runtime_session;
-            println!("Session:   {}", &s.id[..8.min(s.id.len())]);
+            println!("Session:   {}", holmes_core::truncate_str(&s.id, 8));
             println!("Mode:      {:?}", s.mode);
             println!("Messages:  {}", s.message_count());
             println!("Tokens:    {} in / {} out", s.tokens.input, s.tokens.output);
-            let parent_short = s.lineage.parent_id.as_ref().map(|id| {
-                let n = 8.min(id.len());
-                id[..n].to_string()
-            });
+            let parent_short = s
+                .lineage
+                .parent_id
+                .as_ref()
+                .map(|id| holmes_core::truncate_str(id, 8).to_string());
             println!(
                 "Lineage:   parent={:?}, fork_point={:?}",
                 parent_short, s.lineage.fork_point,
             );
-            SlashResult::Handled
-        }
-
-        "dashboard" => {
-            let dashboard = ctx.mind_palace.dashboard(&ctx.runtime_session.mode);
-            if dashboard.sections.is_empty() {
-                println!("Dashboard is empty. Start an engagement to populate it.");
-            } else {
-                for (_name, section) in &dashboard.sections {
-                    println!("  [{}]", section.title);
-                    println!("    {}", section.content_summary);
-                    println!();
-                }
-            }
             SlashResult::Handled
         }
 
@@ -3375,8 +3522,8 @@ pub async fn list_sessions() -> anyhow::Result<()> {
     } else {
         println!("Recent sessions:\n");
         println!(
-            "{:<4} {:<27} {:<51} {:<12} {}",
-            "#", "Title", "Preview", "Last Active", "ID"
+            "{:<4} {:<27} {:<51} {:<12} ID",
+            "#", "Title", "Preview", "Last Active"
         );
         println!("{}", "-".repeat(101));
         for (i, s) in sessions.iter().enumerate() {
@@ -3413,6 +3560,49 @@ pub async fn list_sessions() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_db_path_resolves_against_data_dir_unless_absolute() {
+        let data_dir = Path::new("/tmp/holmes-data");
+        // The default ("memory.db") keeps the historical hardcoded location.
+        assert_eq!(
+            resolve_memory_path(data_dir, "memory.db"),
+            PathBuf::from("/tmp/holmes-data/memory.db")
+        );
+        assert_eq!(
+            resolve_memory_path(data_dir, "custom/mem.db"),
+            PathBuf::from("/tmp/holmes-data/custom/mem.db")
+        );
+        assert_eq!(
+            resolve_memory_path(data_dir, "/var/lib/holmes/mem.db"),
+            PathBuf::from("/var/lib/holmes/mem.db")
+        );
+    }
+
+    #[test]
+    fn steering_leftovers_transfer_into_queued_turns() {
+        // Lines the in-flight turn never drained (pushed after its final
+        // iteration-boundary drain) must become follow-up turns, in FIFO order.
+        let steering = holmes_runtime::new_steering_queue();
+        {
+            let mut queue = steering.lock().expect("steering lock");
+            queue.push_back("first".to_string());
+            queue.push_back("second".to_string());
+        }
+        let mut queued_turns = VecDeque::from(vec!["already queued".to_string()]);
+
+        transfer_steering_leftovers(&steering, &mut queued_turns);
+
+        assert!(steering.lock().expect("steering lock").is_empty());
+        assert_eq!(
+            queued_turns.into_iter().collect::<Vec<_>>(),
+            vec![
+                "already queued".to_string(),
+                "first".to_string(),
+                "second".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn folded_tool_output_summarizes_command_json() {

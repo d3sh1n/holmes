@@ -122,6 +122,13 @@ impl Default for CommandRegistry {
             args_hint: None,
         });
         registry.register(CommandDef {
+            name: "ledger",
+            aliases: &[],
+            description: "查看当前案件 Hypothesis Ledger，或校验并重建快照",
+            category: "会话管理",
+            args_hint: Some("[json|compact]"),
+        });
+        registry.register(CommandDef {
             name: "tree",
             aliases: &[],
             description: "显示会话树、事件时间线，或从指定事件分叉",
@@ -296,13 +303,6 @@ impl Default for CommandRegistry {
             name: "status",
             aliases: &[],
             description: "当前会话状态（ID、模式、轮次、token）",
-            category: "信息",
-            args_hint: None,
-        });
-        registry.register(CommandDef {
-            name: "dashboard",
-            aliases: &[],
-            description: "显示当前画报",
             category: "信息",
             args_hint: None,
         });

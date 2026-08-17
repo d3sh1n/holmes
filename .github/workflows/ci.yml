@@ -1,0 +1,94 @@
+# Phase 0 baseline quality gates (see .hermes/plans/2026-08-11_200617-agent-production-readiness-remediation.md).
+# Every push and PR must pass fmt, clippy (-D warnings), the full test suite,
+# a whitespace check, and a dependency vulnerability audit. Ignored
+# (nightly/env-dependent) tests are covered by
+# .github/workflows/nightly-reliability.yml instead.
+#
+# Gate mapping (workflow H / AGT-016, AGT-020): the default `cargo test` path
+# already contains the Provider/MCP fault-injection tests (holmes-llm,
+# holmes-tools), the SQLite crash-recovery tests (holmes-session
+# durability_tests/concurrency_tests), and the harness reliability scenarios —
+# so a reliability regression fails the test job below and blocks merge. The
+# project does not use Loom; concurrency coverage is deterministic integration
+# tests (process groups, parallel python, write contention, concurrent writers).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test (workspace, all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+
+  audit:
+    name: cargo audit (dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo deny (licenses / bans / advisories / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Policy lives in deny.toml (P2-02): license allowlist, crates.io-only
+      # sources, duplicate/wildcard warnings, and the six registered advisory
+      # exemptions with review dates.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  diff-check:
+    name: git diff --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Whitespace check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "origin/${{ github.base_ref }}...HEAD"
+          else
+            # Push: check the commits introduced by this push. Falls back to the
+            # working tree check when the before-SHA is unavailable (e.g. tags).
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ]; then
+              git diff --check "$before"..HEAD
+            else
+              git diff --check
+            fi
+          fi

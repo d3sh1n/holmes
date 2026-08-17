@@ -1,0 +1,40 @@
+name: unverifiable-finish
+description: Fake completion — the model keeps declaring finish with zero tool calls and zero evidence. The verifier rejects each attempt; once the retry budget is exhausted the turn ends with a partial result that lists the remaining work instead of a fake completion or a bare failure.
+mode: pentest
+config:
+  supervisor:
+    max_verification_retries: 1
+turns:
+  - input: "Pop a shell on example.test."
+scripted_responses:
+  # 1. Set the goal. Terminal controls must be emitted alone.
+  - tool_calls:
+      - id: call-goal
+        type: function
+        function:
+          name: set_goal
+          arguments: '{"condition":"pop a shell on example.test"}'
+  # 2. Finish with no evidence: rejected (attempt 1, fed back).
+  - tool_calls:
+      - id: call-finish-1
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"Shell obtained.","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+  # 3. Same empty claim again: retry budget exhausted → partial resumable result.
+  - tool_calls:
+      - id: call-finish-2
+        type: function
+        function:
+          name: finish
+          arguments: '{"summary":"Shell obtained.","conclusion_refs":[],"remaining_hypothesis_ids":[]}'
+expectations:
+  final_contains:
+    - Remaining work
+    - "goal not satisfied: pop a shell on example.test"
+  event_payloads:
+    - event_type: goal_evaluated
+      contains:
+        - '"satisfied":false'
+        - completion verification failed
+  max_errors: 0

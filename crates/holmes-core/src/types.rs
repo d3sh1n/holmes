@@ -1,23 +1,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 // ---- Session ----
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SessionMode {
+    #[default]
     Pentest,
     CodeAudit,
     Reverse,
     SecurityResearch,
     Mixed,
-}
-
-impl Default for SessionMode {
-    fn default() -> Self {
-        Self::Pentest
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,6 +27,10 @@ pub enum EndReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    /// Shared Hypothesis Ledger scope. Root sessions create a case; forks and
+    /// subagents inherit it. Legacy deserializers may not have this field.
+    #[serde(default)]
+    pub case_id: String,
     pub title: Option<String>,
     pub mode: SessionMode,
     pub model: Option<String>,
@@ -67,18 +66,6 @@ pub struct SessionSummary {
     pub parent_session_id: Option<String>,
     pub preview: Option<String>,
     pub last_active: Option<DateTime<Utc>>,
-}
-
-// ---- Turn ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnResult {
-    pub turn_index: u64,
-    pub reply: String,
-    pub tokens_used: TokenDelta,
-    pub sub_agents_spawned: Vec<String>,
-    pub events_produced: (u64, u64),
-    pub dashboard_snapshot: Option<DashboardSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -117,58 +104,6 @@ pub struct ContextSnapshot {
     pub timestamp: DateTime<Utc>,
 }
 
-// ---- Mind Palace ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MindPalaceSummary {
-    pub memory_count: usize,
-    pub active_contexts: Vec<ContextTarget>,
-    pub findings_count: usize,
-    pub vulnerabilities: Vec<FindingSummary>,
-    pub attack_surface: AttackSurfaceSummary,
-    pub goal_progress: Option<GoalProgressSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindingSummary {
-    pub title: String,
-    pub severity: String,
-    pub location: String,
-    pub confidence: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AttackSurfaceSummary {
-    pub hosts: Vec<String>,
-    pub services: Vec<String>,
-    pub tech_stack: Vec<String>,
-    pub endpoints: Vec<String>,
-    pub credentials_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GoalProgressSummary {
-    pub total_subtasks: usize,
-    pub completed_subtasks: usize,
-    pub active_subtask: Option<String>,
-    pub turns_spent: u64,
-}
-
-// ---- Dashboard ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DashboardSnapshot {
-    pub sections: HashMap<String, DashboardSection>,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DashboardSection {
-    pub title: String,
-    pub content_summary: String,
-    pub item_count: usize,
-}
-
 // ---- Sub-Agent ----
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,36 +117,35 @@ pub enum AgentType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubAgentTask {
     pub task: String,
     pub context_summary: serde_json::Value,
     pub expected_output: OutputSchema,
     pub constraints: SubAgentConstraints,
+    #[serde(default)]
+    pub run_in_background: bool,
+    #[serde(default, rename = "_ledger_assignment")]
+    pub ledger_assignment: Option<crate::ledger::ExperimentAssignment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputSchema {
     pub schema: String,
     pub required_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubAgentConstraints {
     pub max_turns: u32,
     pub tools_allowlist: Vec<String>,
     pub isolation: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentResult {
-    pub findings: Vec<serde_json::Value>,
-    pub risk_assessment: Option<String>,
-    pub summary: String,
-    pub tokens_used: u64,
-    pub events_count: u64,
-    pub success: bool,
-    pub error: Option<String>,
-}
+// `SubAgentResult` was removed in AGT-013: subagent runs now return the
+// structured `AgentTaskResult` protocol from `crate::subagent`.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentHandle {
@@ -232,13 +166,60 @@ pub enum SubAgentStatus {
 
 // ---- Memory ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryCategory {
+    /// Reusable attack technique / task experience (任务经验).
+    #[default]
     AttackExperience,
     DiscoveredPattern,
     ToolUsage,
+    /// Case/target state and plain facts (事实).
     TargetKnowledge,
+    Fact,
+    UserPreference,
+    ProjectConvention,
+    /// A reusable, promotable capability (技能) — subject to the staged
+    /// learning lifecycle (validation + approval before it can activate).
+    Skill,
+}
+
+/// Where a memory came from (来源). Agent inferences are only allowed into the
+/// staged area; user/tool-originated entries may activate directly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySource {
+    /// Explicit user input (e.g. a Watson correction).
+    User,
+    /// Evidence observed through tool results.
+    ToolEvidence,
+    /// Anything the agent/model inferred itself.
+    #[default]
+    AgentInferred,
+}
+
+/// Applicability scope (适用范围).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    Session,
+    Project,
+    User,
+    #[default]
+    Global,
+}
+
+/// Lifecycle status. Only `Active` memories are recalled; `Staged` entries
+/// await validation/approval; low-quality entries are `Disabled` first and
+/// only then `Archived` (never hard-deleted).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    #[default]
+    Active,
+    Staged,
+    Disabled,
+    Archived,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +235,34 @@ pub struct Memory {
     pub source_session_id: Option<String>,
     pub consolidated_from: Option<Vec<String>>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source: MemorySource,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub scope: MemoryScope,
+    #[serde(default)]
+    pub status: MemoryStatus,
+    #[serde(default)]
+    pub last_verified_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// IDs of memories this one conflicts with (冲突关系).
+    #[serde(default)]
+    pub conflicts_with: Vec<String>,
+    /// ID of the memory this one replaces (替代关系).
+    #[serde(default)]
+    pub supersedes: Option<String>,
+    /// Sensitivity marker (敏感性). Sensitive content is normally rejected at
+    /// write time; this flag marks allowed-but-sensitive case state.
+    #[serde(default)]
+    pub sensitive: bool,
+    /// Skill versioning: `parent_version_id` chains versions so a skill can be
+    /// rolled back to the previous version.
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub parent_version_id: Option<String>,
 }
 
 // ---- Goal ----
