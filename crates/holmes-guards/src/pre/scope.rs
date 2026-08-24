@@ -16,6 +16,9 @@
 //! within the authorized scope.
 
 use crate::traits::PreGuard;
+use holmes_core::bounty::{
+    host_of_url as bounty_host_of_url, host_verdict, url_matches_any_prefix,
+};
 use holmes_core::config::ScopeConfig;
 use holmes_core::state::AttackState;
 use holmes_core::{GuardVerdict, ToolCall};
@@ -42,68 +45,71 @@ impl ScopeGuard {
         !self.allow.is_empty()
     }
 
-    fn host_verdict(&self, host: &str) -> Result<(), String> {
-        let host = host.trim().trim_end_matches('.').to_lowercase();
-        if host.is_empty() {
-            return Ok(());
-        }
-        if self.deny.iter().any(|d| matches_entry(&host, d)) {
-            return Err(format!(
-                "host '{host}' is explicitly out of scope (deny list)"
-            ));
-        }
-        // Private / metadata addresses are blocked unless explicitly permitted.
-        if is_private_or_metadata(&host) && !self.allow_private {
-            // still require it to be in the allowlist AND allow_private to pass
-            return Err(format!(
-                "host '{host}' is a private/loopback/link-local/metadata address; blocked \
-                 (set guards.scope.allow_private to permit)"
-            ));
-        }
-        if !self.allow.iter().any(|a| matches_entry(&host, a)) {
-            return Err(format!(
-                "host '{host}' is not in the engagement scope allowlist — only assigned \
-                 targets may be touched"
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl PreGuard for ScopeGuard {
-    fn name(&self) -> &str {
-        "scope"
-    }
-
-    async fn check(&self, call: &ToolCall, _state: &AttackState) -> GuardVerdict {
-        if !self.enforcing() {
+    async fn check(&self, call: &ToolCall, state: &AttackState) -> GuardVerdict {
+        let program = state.bounty.program.as_ref();
+        let (allow, deny, allow_private, prefixes, deny_prefixes) = match program {
+            Some(program) => {
+                let mut deny = program.deny_hosts();
+                for extra in &self.deny {
+                    if !deny.iter().any(|d| d == extra) {
+                        deny.push(extra.clone());
+                    }
+                }
+                (
+                    program.allow_hosts(),
+                    deny,
+                    program.allow_private,
+                    program.url_prefixes(),
+                    program.deny_url_prefixes(),
+                )
+            }
+            None => (
+                self.allow.clone(),
+                self.deny.clone(),
+                self.allow_private,
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+        if allow.is_empty() && prefixes.is_empty() {
             return GuardVerdict::allow();
         }
         let args = &call.function.arguments;
         let parsed: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
 
-        let hosts: Vec<String> = match call.function.name.as_str() {
-            "http_request" | "web_fetch" => parsed
-                .get("url")
-                .and_then(|v| v.as_str())
-                .and_then(host_of_url)
-                .into_iter()
-                .collect(),
+        let url = match call.function.name.as_str() {
+            "http_request" | "web_fetch" => parsed.get("url").and_then(|v| v.as_str()),
             "browser" => {
-                // Only navigation introduces a new host; other actions stay on the page.
                 let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 if action == "navigate" {
-                    parsed
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .and_then(host_of_url)
-                        .into_iter()
-                        .collect()
+                    parsed.get("url").and_then(|v| v.as_str())
                 } else {
-                    Vec::new()
+                    None
                 }
             }
+            _ => None,
+        };
+
+        if let Some(url) = url {
+            if url_matches_any_prefix(url, &deny_prefixes) {
+                return GuardVerdict::block(format!(
+                    "url '{url}' matches an out-of-scope URL prefix"
+                ));
+            }
+            if let Some(host) = bounty_host_of_url(url) {
+                if let Err(reason) = host_verdict(&host, &allow, &deny, allow_private) {
+                    return GuardVerdict::block(reason);
+                }
+            }
+            if !prefixes.is_empty() && !url_matches_any_prefix(url, &prefixes) {
+                return GuardVerdict::block(format!(
+                    "url '{url}' is not under an in-scope URL prefix"
+                ));
+            }
+            return GuardVerdict::allow();
+        }
+
+        let hosts: Vec<String> = match call.function.name.as_str() {
             "execute_command" => {
                 extract_hosts(parsed.get("command").and_then(|v| v.as_str()).unwrap_or(""))
             }
@@ -114,7 +120,7 @@ impl PreGuard for ScopeGuard {
         };
 
         for host in hosts {
-            if let Err(reason) = self.host_verdict(&host) {
+            if let Err(reason) = host_verdict(&host, &allow, &deny, allow_private) {
                 return GuardVerdict::block(reason);
             }
         }
@@ -124,6 +130,7 @@ impl PreGuard for ScopeGuard {
 
 /// Does `host` match an allow/deny entry? Supports exact host, domain-suffix
 /// (`example.com` matches `api.example.com`), bare IP, and IPv4 CIDR (`10.0.0.0/8`).
+#[allow(dead_code)]
 fn matches_entry(host: &str, entry: &str) -> bool {
     if entry.is_empty() {
         return false;
@@ -150,6 +157,7 @@ fn matches_entry(host: &str, entry: &str) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn parse_cidr(entry: &str) -> Option<(u32, u8)> {
     let (addr, bits) = entry.split_once('/')?;
     let ip: Ipv4Addr = addr.parse().ok()?;
@@ -203,6 +211,7 @@ fn extract_hosts(text: &str) -> Vec<String> {
     out
 }
 
+#[allow(dead_code)]
 fn is_private_or_metadata(host: &str) -> bool {
     if host == "localhost" {
         return true;
@@ -361,6 +370,37 @@ mod tests {
             !v.allowed,
             "cloud metadata must be blocked without allow_private"
         );
+    }
+
+
+    #[tokio::test]
+    async fn active_program_drives_scope_even_when_config_allow_is_empty() {
+        let g = guard(&[], &[], false);
+        let mut state = dummy_state();
+        state.bounty.program = Some(holmes_core::bounty::ProgramScope {
+            name: "VDP".into(),
+            in_scope: vec![holmes_core::bounty::ScopeEntry::new(
+                holmes_core::bounty::ScopeAssetKind::DomainSuffix,
+                "example.com",
+            )],
+            out_of_scope: vec![],
+            policy_notes: String::new(),
+            allow_private: false,
+        });
+        let blocked = g
+            .check(
+                &call("http_request", r#"{"url":"http://evil.com/x"}"#),
+                &state,
+            )
+            .await;
+        assert!(!blocked.allowed, "program scope must fail closed");
+        let allowed = g
+            .check(
+                &call("http_request", r#"{"url":"https://api.example.com/login"}"#),
+                &state,
+            )
+            .await;
+        assert!(allowed.allowed, "{}", allowed.guidance);
     }
 
     #[tokio::test]

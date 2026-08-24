@@ -120,6 +120,49 @@ impl PostGuard for SkepticGate {
                 "[note: requested strong confidence lacked Runtime Resolution attestation and was recorded as Candidate]",
             );
         }
+        let resolution_ids: Vec<String> = report
+            .get("_ledger_validation")
+            .and_then(|v| v.get("resolution_ids"))
+            .or_else(|| report.get("resolution_ids"))
+            .and_then(|v| v.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let affected_asset = report
+            .get("affected_asset")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                if location.is_empty() {
+                    None
+                } else {
+                    Some(location.clone())
+                }
+            });
+        let strings = |key: &str| -> Vec<String> {
+            report
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let evidence_artifacts = holmes_core::bounty::EvidenceArtifacts {
+            ledger_evidence_ids: strings("ledger_evidence_ids"),
+            screenshot_paths: strings("screenshot_paths"),
+            request_response_hashes: strings("request_response_hashes"),
+            log_excerpts: strings("log_excerpts"),
+        };
         let finding = Finding {
             id: title.clone(),
             finding_type: attack_type.clone(),
@@ -130,6 +173,9 @@ impl PostGuard for SkepticGate {
             severity,
             location,
             evidence_source,
+            resolution_ids,
+            affected_asset,
+            evidence_artifacts,
         };
         // Record + queue for durable persistence (monotonic: won't demote a Confirmed).
         state.record_and_persist_finding(finding);

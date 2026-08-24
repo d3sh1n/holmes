@@ -14,6 +14,19 @@ pub struct ReconReport {
     pub endpoints: Vec<EndpointInfo>,
     pub interesting_findings: Vec<String>,
     pub attack_hypotheses: Vec<HypothesisProposal>,
+    #[serde(default)]
+    pub assets: Vec<ReconAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconAsset {
+    pub identifier: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub how_found: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +60,7 @@ impl Tool for ReportReconTool {
             tool_type: "function".into(),
             function: FunctionDefinition {
                 name: "report_recon".into(),
-                description: "Submit structured reconnaissance report. Call this after completing initial recon to transition to hypothesis-driven attack phase. Include all discovered endpoints, tech stack, and ranked attack hypotheses.".into(),
+                description: "Submit structured reconnaissance report. Call this after completing initial recon to transition to hypothesis-driven attack phase. Include all discovered endpoints, tech stack, and ranked attack hypotheses. Optional `assets` entries are recorded in the in-scope inventory with provenance; out-of-scope identifiers are refused when a bounty program is active.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -79,6 +92,20 @@ impl Tool for ReportReconTool {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Notable observations (e.g. test credentials in HTML comments, soft-404 behavior)"
+                        },
+                        "assets": {
+                            "type": "array",
+                            "description": "In-scope assets discovered during recon, with provenance. Out-of-scope identifiers are refused.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "identifier": { "type": "string" },
+                                    "kind": { "type": "string", "enum": ["host", "domain_suffix", "url_prefix", "cidr"] },
+                                    "how_found": { "type": "string" },
+                                    "notes": { "type": "string" }
+                                },
+                                "required": ["identifier"]
+                            }
                         },
                         "attack_hypotheses": {
                             "type": "array",

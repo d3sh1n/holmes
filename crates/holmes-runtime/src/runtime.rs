@@ -1649,6 +1649,42 @@ impl AgentRuntime {
                     }
                 }
             }
+            if self
+                .context
+                .state
+                .compatibility_state
+                .bounty
+                .program
+                .is_some()
+            {
+                let asset = args
+                    .get("affected_asset")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| args.get("location").and_then(serde_json::Value::as_str));
+                let status_of = |id: &str| -> Option<String> {
+                    let resolution_id = holmes_core::ledger::ResolutionId::new(id.to_string());
+                    ledger.resolutions.get(&resolution_id).map(|resolution| {
+                        match resolution.status {
+                            ResolvedStatus::Confirmed => "confirmed".to_string(),
+                            ResolvedStatus::Rejected => "rejected".to_string(),
+                            other => format!("{other:?}").to_lowercase(),
+                        }
+                    })
+                };
+                if let Err(err) = holmes_core::bounty::gate_finding(
+                    self.context
+                        .state
+                        .compatibility_state
+                        .bounty
+                        .program
+                        .as_ref(),
+                    &resolution_ids,
+                    status_of,
+                    asset,
+                ) {
+                    return Err(err.to_string());
+                }
+            }
             let validation = match required {
                 Some(ResolvedStatus::Confirmed) => "confirmed",
                 Some(ResolvedStatus::Rejected) => "rejected",

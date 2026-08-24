@@ -715,7 +715,13 @@ async fn persist_pending_findings(context: &mut RuntimeContext) -> Result<(), Ru
             attack_type: f.attack_type,
             location: f.location,
             evidence_source: f.evidence_source,
+            resolution_ids: f.resolution_ids,
+            affected_asset: f.affected_asset,
+            evidence_artifacts: f.evidence_artifacts,
         };
+        append_and_ingest(context, event).await?;
+    }
+    for event in context.state.compatibility_state.take_pending_bounty_events() {
         append_and_ingest(context, event).await?;
     }
     Ok(())
@@ -726,34 +732,51 @@ async fn persist_pending_findings(context: &mut RuntimeContext) -> Result<(), Ru
 pub fn seed_findings_from_events(state: &mut holmes_core::state::AttackState, events: &[Event]) {
     use holmes_core::state::validated::{Finding, FindingConfidence};
     for event in events {
-        if let Event::FindingRecorded {
-            id,
-            finding_type,
-            confidence,
-            severity,
-            evidence,
-            details,
-            attack_type,
-            location,
-            evidence_source,
-        } = event
-        {
-            let confidence = match confidence.as_str() {
-                "confirmed" => FindingConfidence::Confirmed,
-                "rejected" => FindingConfidence::Rejected,
-                _ => FindingConfidence::Candidate,
-            };
-            state.record_finding(Finding {
-                id: id.clone(),
-                finding_type: finding_type.clone(),
+        match event {
+            Event::FindingRecorded {
+                id,
+                finding_type,
                 confidence,
-                evidence: evidence.clone(),
-                details: details.clone(),
-                attack_type: attack_type.clone(),
-                severity: severity.clone(),
-                location: location.clone(),
-                evidence_source: evidence_source.clone(),
-            });
+                severity,
+                evidence,
+                details,
+                attack_type,
+                location,
+                evidence_source,
+                resolution_ids,
+                affected_asset,
+                evidence_artifacts,
+            } => {
+                let confidence = match confidence.as_str() {
+                    "confirmed" => FindingConfidence::Confirmed,
+                    "rejected" => FindingConfidence::Rejected,
+                    _ => FindingConfidence::Candidate,
+                };
+                state.record_finding(Finding {
+                    id: id.clone(),
+                    finding_type: finding_type.clone(),
+                    confidence,
+                    evidence: evidence.clone(),
+                    details: details.clone(),
+                    attack_type: attack_type.clone(),
+                    severity: severity.clone(),
+                    location: location.clone(),
+                    evidence_source: evidence_source.clone(),
+                    resolution_ids: resolution_ids.clone(),
+                    affected_asset: affected_asset.clone(),
+                    evidence_artifacts: evidence_artifacts.clone(),
+                });
+            }
+            Event::ProgramScopeSet { program } => {
+                state.bounty.program = Some(program.clone());
+            }
+            Event::AssetRecorded { asset } => {
+                state.bounty.upsert_asset(asset.clone());
+            }
+            Event::ReportGenerated { .. } => {
+                // last_report is regenerated on demand; nothing to seed.
+            }
+            _ => {}
         }
     }
 }
