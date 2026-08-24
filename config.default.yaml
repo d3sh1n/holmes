@@ -19,37 +19,60 @@ permissions:
 llm:
   stream: true              # true = stream assistant text token-by-token to the inline UI (SSE)
   thinking_budget: 0        # >0 = enable extended thinking (tokens); signed thinking blocks are echoed on round-trips
+  # Provider reliability (failover state machine): each provider is attempted at
+  # most once per call. A terminal transient failure (timeout / connect error /
+  # 429 / 5xx / interrupted stream) puts the provider into cooldown for
+  # `provider_cooldown_base_ms`, doubling per consecutive failure (±20% jitter)
+  # up to `provider_cooldown_max_ms`, then it is probed half-open; a
+  # `Retry-After` response header overrides the computed window.
+  # 401/403/billing/unknown-model errors disable the provider until restart.
   provider_cooldown_base_ms: 5000   # base cooldown after a terminal transient failure
   provider_cooldown_max_ms: 300000  # cap for the exponential cooldown window
   call_deadline_ms: 300000          # total budget for one LLM call across all failovers
+                                    # and cooldown waits; exceeded = deterministic failure
   providers:
+    # Configure at least one Anthropic-native provider below.
+    # For Anthropic (Claude):
+    #   name: claude
+    #   base_url: "https://api.anthropic.com"
+    #   api_key: "sk-ant-..."
+    #   model: "claude-sonnet-4-6"
+    #   api_format: anthropic
+    #   priority: 0
     - name: default
       base_url: "https://api.anthropic.com"
       api_key: "YOUR_API_KEY_HERE"
       model: "claude-sonnet-4-6"
       api_format: anthropic
-      priority: 0
-      rpm_limit: 50
+      priority: 0               # lower = preferred when no role binding matches
+      rpm_limit: 50             # per-provider outbound rate limit (0 = unlimited)
 
   roles:
     attack_agent: default
     supervisor: default
     compressor: default
     skill_evolver: default
-    goal_evaluator: default
+    goal_evaluator: default   # independent completion verifier (P0-02). Pin to a
+                              # different provider to isolate verdicts from the agent's
+                              # own model; unconfigured/empty falls back to priority order.
 
 compressor:
-  context_limit: 128000
+  context_limit: 128000       # token budget; compaction triggers at context_limit * threshold
   threshold: 0.75
-  protected_head: 3
-  protected_tail_tokens: 4000
-  llm_summary: false
+  protected_head: 3           # leading messages never compacted
+  protected_tail_tokens: 4000 # trailing token budget never compacted
+  llm_summary: false          # true = summarize the middle with an LLM instead of a static template
+                              # (llm_summary mode also flushes must-survive case state to long-term
+                              # memory + summary head before compacting; pre_compact_flush: false
+                              # opts out — it has no effect with the static template)
+  # Optional tuning (defaults shown): protect_last_n: 20, target_ratio: 0.25,
+  # max_summary_tokens: 12000 — all consumed by the compaction planner.
 
 guards:
   immutable_field: true
   dangerous_command: true
   repetition: true
-  repetition_window: 10
+  repetition_window: 10       # recent calls tracked by the repetition guard
   attack_surface: true
   evidence_extractor: true
   skeptic_gate: true
@@ -73,49 +96,74 @@ guards:
     allow_private: false  # permit private/loopback/link-local/metadata inside scope
 
 memory:
+  # Long-term memory database. Relative paths resolve against the Holmes data
+  # directory (~/.local/share/holmes); "memory.db" is the historical location.
   db_path: memory.db
+  # Hybrid recall (AGT-011): FTS lexical candidates fused with local-embedding
+  # cosine similarity, re-ranked by confidence/freshness/scope. false = pure FTS.
   hybrid_recall: true
+  # Bounded wait for recall inside a turn; on timeout the turn continues
+  # without memories instead of blocking. 0 = skip turn-time recall.
   recall_timeout_ms: 250
+  # Character budget for memory content injected into a turn.
   recall_max_chars: 1500
 
+# Controlled learning (AGT-012): Watson corrections become learning candidates;
+# agent inferences and skills only ever enter long-term memory as `staged` and
+# activate solely through recorded validation + approval (with versioning and
+# rollback). Sensitive content (credentials, keys, prompt injection) is refused
+# at the write boundary and audited. The review runs inline at end of turn.
 learning:
   enabled: true
-  review_interval_turns: 1
+  review_interval_turns: 1    # run the end-of-turn learning review every N turns
   max_candidates_per_turn: 5
-  memory_write_approval: false
-  skill_write_approval: true
-  skill_extraction: true
+  memory_write_approval: false  # true = even user corrections are staged first
+  skill_write_approval: true    # true = staged skills activate only via manual approval;
+                                # false = auto-promote once a passed validation is recorded
+  skill_extraction: true        # verified goal completions yield staged skill candidates
 
 skills:
-  dir: skills
-  auto_inject: true
+  dir: skills                 # scanned for SKILL.md at startup
+  auto_inject: true           # inject discovered skills into the system prompt
 
 mcp:
-  servers: []
+  servers: []                 # stdio/http MCP servers; tools register at session start
 
 browser:
-  enabled: true
-  content_limit: 5000
-  timeout: 30
-  proxy: null
+  enabled: true            # tool + prompt guidance register; Chrome launches lazily on first use
+                           # (launched mode is always headed — the operator must see the window)
+  content_limit: 5000      # max chars returned per page-read action
+  timeout: 30              # per-action timeout (seconds), incl. launch/CDP attach
+  proxy: null              # e.g. "http://127.0.0.1:8080" (Chrome launch flag)
   ignore_https_errors: true
-  executable_path: null
-  extra_launch_args: []
-  screenshot_dir: null
-  cdp_endpoint: null
+  executable_path: null     # set a Chromium/Chrome binary path to override auto-detection
+  extra_launch_args: []     # NOTE: --no-sandbox / --disable-web-security are rejected
+  screenshot_dir: null      # default: sessions/<id>/browser-screenshots
+  cdp_endpoint: null        # e.g. "http://127.0.0.1:9222" to attach to your real Chrome (defeats anti-bot)
 
 safety:
+  # Max outbound egress tool calls per minute (http_request/web_fetch/browser/
+  # execute_command/execute_python), throttled within a turn. null = unlimited.
+  # Set this in real engagements to avoid DoS-ing the target with a runaway loop.
   egress_rpm: null
 
+# Unified execution boundary (AGT-002): every tool/MCP/hook call is bounded and
+# cancellable, and timed-out processes are killed as a group and reaped.
 execution:
-  turn_deadline_ms: null
-  tool_deadline_ms: 300000
-  mcp_request_timeout_ms: 30000
+  turn_deadline_ms: null        # wall-clock budget for a whole turn; null/0 = unlimited.
+                                # Tool deadlines are always capped by the remaining turn time.
+  tool_deadline_ms: 300000      # default per-tool deadline when a call requests none tighter
+  mcp_request_timeout_ms: 30000 # per-request timeout for MCP stdio reads and HTTP calls
+                                # (connect/read/total). A timed-out stdio server is killed
+                                # and its transport fails fast on every later call.
 
+# Hypothesis Ledger v2 private cognitive loop. `max_rounds` counts every LLM
+# call including the final Commit. Proposal/Critique bodies stay in memory and
+# are never written to transcripts, events, memories, or logs.
 cognition:
   enabled: true
-  mode: adaptive
-  max_rounds: 3
+  mode: adaptive             # fast | adaptive | deep
+  max_rounds: 3              # supported range: 1..3
   max_candidates: 4
   max_think_tokens: 6000
   max_think_time_ms: 45000
@@ -126,8 +174,9 @@ cognition:
   deep_on_high_risk_action: true
   deep_on_stagnation: true
   persist_commit_summary: true
-  persist_raw_reasoning: false
+  persist_raw_reasoning: false # true is rejected during deserialization
 
+# Public, bounded Ledger projection and independent resolution policy.
 ledger:
   enabled: true
   max_active_hypotheses_in_context: 8
@@ -138,28 +187,54 @@ ledger:
   semantic_verifier: true
   require_prediction_for_high_priority: true
 
+# Cairn-inspired durable Experiment search plane. Per-case concurrency is
+# additionally capped by subagent.max_concurrent; the smaller limit wins.
 experiments:
   max_concurrent_per_case: 4
   default_lease_ms: 60000
-  heartbeat_ms: 20000
+  heartbeat_ms: 20000       # must be < default_lease_ms / 2
   max_attempts: 3
 
+# Turn supervision and completion verification (AGT-009/010, P0-02): the supervisor
+# watches for repeated failing calls and stalled progress; the unified completion gate
+# verifies EVERY terminal outcome — a `finish` call or a plain-text answer on any task
+# with a standing goal, a derived task contract, or tool activity — before it becomes
+# a verified completion. Pure chat (none of the three triggers) is exempt.
 supervisor:
-  max_repeat_action: 3
-  stagnation_limit: 4
-  max_verification_retries: 2
-  model_verification: true
+  max_repeat_action: 3        # identical failing tool calls (same args) before a forced
+                              # strategy change; repeating again stops the turn and asks the operator
+  stagnation_limit: 4         # iterations without progress before a reflection prompt;
+                              # a second full window ends the turn with a resumable partial result
+  max_verification_retries: 2 # rejected completion claims fed back into the loop before the
+                              # turn ends listing the remaining work
+  model_verification: true    # model review (goal_evaluator role) for semantic goals/objectives
+                              # AFTER deterministic checks pass
 
+# Subagent protocol and resource isolation (AGT-013/014): every subagent run returns a
+# structured AgentTaskResult (status/findings/evidence/validations/remaining_work/usage/
+# checkpoint) that the parent verifies deterministically, and runs isolated — own temp
+# directory, own cancellation token derived from the parent, and the budgets below.
 subagent:
-  max_depth: 2
-  max_concurrent: 4
-  max_tool_calls: null
-  max_wall_clock_ms: null
+  max_depth: 2            # maximum nesting depth; a spawn attempted at this depth is refused
+  max_concurrent: 4       # process-wide cap on concurrent subagent runs (one shared semaphore
+                          # across all nesting levels); spawns beyond the cap are refused
+  max_tool_calls: null    # per-subagent tool-call budget; null/0 = unlimited
+  max_wall_clock_ms: null # wall-clock cap per subagent run, always capped by the parent
+                          # turn's deadline; null/0 = no subagent-specific cap
 
+# User-configurable shell hooks fired around every tool call — a deterministic escape hatch
+# for policy, auditing, or side effects. Each hook is run with `sh -c <command>`; the tool name
+# is in $HOLMES_TOOL_NAME and the arguments as JSON in $HOLMES_TOOL_ARGS and on stdin.
+# `before_tool` hooks with `blocking: true` that exit non-zero VETO the call (stderr = reason);
+# `after_tool` hooks are advisory (exit ignored). `matcher`: exact tool name, "*"/empty = all,
+# or "prefix*". Empty lists (the default) install nothing.
+# Every hook run is bounded by `timeout_ms` (its process group is killed on timeout).
+# If a before_tool hook cannot deliver a verdict (timeout/spawn/wait failure), `on_failure`
+# decides: deny (default, fail closed before side effects) | warn | skip.
 hooks:
   timeout_ms: 10000
   on_failure: deny
   before_tool: []
   after_tool: []
 
-output_dir: output
+output_dir: output            # reports generated by agent.generate_reports land here
