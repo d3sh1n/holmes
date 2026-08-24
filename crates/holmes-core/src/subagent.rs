@@ -393,6 +393,9 @@ mod tests {
             attack_type: "sqli".into(),
             location: "https://example.test/login".into(),
             evidence_source: Some("http_request".into()),
+            resolution_ids: Vec::new(),
+            affected_asset: None,
+            evidence_artifacts: Default::default(),
         }
     }
 

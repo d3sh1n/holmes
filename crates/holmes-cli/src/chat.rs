@@ -1173,6 +1173,9 @@ pub(crate) async fn run_runtime_input_with_sink<S: RuntimeSink>(
     runtime.context_mut().middlewares.push(Arc::new(
         holmes_runtime::middleware::UntrustedContentMiddleware,
     ));
+    runtime.context_mut().middlewares.push(Arc::new(
+        holmes_runtime::bounty::BountyWorkflowMiddleware,
+    ));
     runtime
         .context_mut()
         .middlewares
@@ -1466,6 +1469,7 @@ fn render_case_report(
                 attack_type,
                 location,
                 evidence_source,
+                ..
             } => {
                 if confidence == "rejected" {
                     let ty = if finding_type.is_empty() {
@@ -2506,6 +2510,43 @@ pub(crate) async fn handle_slash_command(input: &str, ctx: &mut ChatContext) -> 
                     }
                 }
                 Err(error) => eprintln!("Case lookup failed: {error}"),
+            }
+            SlashResult::Handled
+        }
+
+        "bounty" => {
+            let bounty = &ctx.runtime_state.compatibility_state.bounty;
+            match &bounty.program {
+                Some(program) => {
+                    println!("Authorized program: {}", program.name);
+                    if !program.policy_notes.trim().is_empty() {
+                        println!("  Policy: {}", program.policy_notes.trim());
+                    }
+                    println!("  In scope:");
+                    for entry in &program.in_scope {
+                        println!("    - {:?} {}", entry.kind, entry.value);
+                    }
+                    if program.out_of_scope.is_empty() {
+                        println!("  Out of scope: (none)");
+                    } else {
+                        println!("  Out of scope:");
+                        for entry in &program.out_of_scope {
+                            println!("    - {:?} {}", entry.kind, entry.value);
+                        }
+                    }
+                    println!("  Assets: {}", bounty.assets.len());
+                    for asset in &bounty.assets {
+                        println!(
+                            "    - {} ({:?}, {})",
+                            asset.identifier,
+                            asset.kind,
+                            asset.how_found.label()
+                        );
+                    }
+                }
+                None => println!(
+                    "No authorized bounty/VDP program is attached. Ask the agent to call set_program_scope."
+                ),
             }
             SlashResult::Handled
         }

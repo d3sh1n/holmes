@@ -7,6 +7,7 @@ Holmes is an autonomous, Rust-native AI agent for security research, penetration
 - **Unified Agent Runtime** — every turn flows through one engine (`AgentRuntime::run_turn`): budget/compaction → bounded Fast/Adaptive/Deep cognitive pass → commit validation → permission/guard/middleware → tool batch → typed Evidence → memory.
 - **Six-Way Decision Model** — `Answer`, `Finish`, `AskWatson` (human handoff), `UseTools`, `SetGoal`, and fail-closed `ProtocolViolation` are first-class loop outcomes.
 - **Hypothesis Ledger v2** — case-scoped append-only Hypotheses, Predictions, Experiments, Evidence, Resolutions, and bounded deliberation commits. Strong findings and finishes cite verified Resolution IDs; delegated Experiments use durable leases, heartbeat, fencing, and evidence-bound structured results.
+- **Authorized bounty research workflow** — case-level program scope, in-scope asset inventory with provenance, findings gated on verified Ledger Resolution IDs, and a bounty-ready markdown report. Research workflow only (no exploit capability). See [docs/architecture/bounty-workflow.md](docs/architecture/bounty-workflow.md).
 - **Three Independent Safety Layers** — `PermissionPolicy` (user authorization, 6 modes), `GuardChain` (system-level pre/post tool hooks; `SkepticGate` is the sole writer to the validated state zone), and `RuntimeMiddleware` (cross-cutting command blocklist, sensitive-data redaction, token budget).
 - **Event-Sourced Sessions + Semantic Kernel** — every state change is an immutable `Event` in SQLite (FTS5 + WAL). Sessions replay from events; the Semantic Kernel persists prompt/model/mode/tools metadata so a session resumes with full context. Forking is a transactional event copy; compaction is archived and replayable.
 - **Mind Palace** — event-backed and long-term lexical (FTS5/LIKE) memory with staged learning and conflict handling; live case state is projected by the Runtime and Ledger.
@@ -26,8 +27,8 @@ The workspace is split into focused crates. `holmes-core` is the base (everythin
 | `holmes-core` | Base layer: types, `Event`, `Config`, `RuntimeSession`, `AgentHook` / `SubagentRunner` traits, four-zone `AttackState`. |
 | `holmes-session` | SQLite + FTS5 + WAL event store; `SessionStore` trait; semantic replay, fork, compaction archive. |
 | `holmes-llm` | Multi-provider client over the Anthropic Messages wire format; failover, rate limit, role routing, error classification. |
-| `holmes-tools` | Extensible tool registry: command exec, Python, HTTP, web fetch, file read/write/edit, grep, glob, todo plan, PDF reading, reporting, optional subagent + MCP, browser. Hypothesis state is owned by the Runtime-intercepted case Ledger protocol. |
-| `holmes-guards` | Pre/Post-tool guard chain: `immutable_field`, `dangerous_command`, `repetition`, `attack_surface`, `evidence_extractor`, `skeptic_gate`, `failure_tracker`, `soft404`. |
+| `holmes-tools` | Extensible tool registry: command exec, Python, HTTP, web fetch, file read/write/edit, grep, glob, todo plan, PDF reading, reporting, bounty research tools, optional subagent + MCP, browser. Hypothesis state is owned by the Runtime-intercepted case Ledger protocol. |
+| `holmes-guards` | Pre/Post-tool guard chain: `immutable_field`, `dangerous_command`, `repetition`, `attack_surface`, `evidence_extractor`, `skeptic_gate`, `failure_tracker`, `soft404`, plus always-on heuristic `scope` and bounty research gates. |
 | `holmes-mind-palace` | Event-backed and long-term memory with staged learning. |
 | `holmes-runtime` | Agent loop, bounded cognition, Hypothesis Ledger protocol, compaction, middleware, permissions, supervision, and completion gates. |
 | `holmes-browser` | Native CDP browser automation (`chromiumoxide`): lazy launch, per-session profile, read-only gating, stealth, sandbox-safe. |
@@ -92,6 +93,7 @@ Useful slash commands:
 /browser close                # close the long-lived browser (if open)
 /ledger                       # inspect the current case Ledger
 /ledger compact               # verify/rebuild the checksum snapshot
+/bounty                       # inspect the authorized program scope and asset inventory
 ```
 
 ## 🌐 Browser Automation
@@ -125,6 +127,8 @@ cargo test -p holmes-harness                  # deterministic scenario tests (sc
 ```
 
 Add a YAML to `scenarios/` with scripted LLM responses + mocked tools + expectations, and the harness exercises it through a real `AgentRuntime`.
+
+Bounty-workflow unit tests live in `holmes-core`, `holmes-guards`, `holmes-tools`, and `holmes-runtime`. The operator should run `cargo test --workspace` (the GitHub MCP path cannot run the suite).
 
 ## 🤝 Contributing
 

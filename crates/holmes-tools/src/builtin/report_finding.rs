@@ -29,6 +29,16 @@ pub struct FindingReport {
     pub evidence_source: Option<String>,
     #[serde(default)]
     pub resolution_ids: Vec<String>,
+    #[serde(default)]
+    pub affected_asset: Option<String>,
+    #[serde(default)]
+    pub ledger_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub screenshot_paths: Vec<String>,
+    #[serde(default)]
+    pub request_response_hashes: Vec<String>,
+    #[serde(default)]
+    pub log_excerpts: Vec<String>,
     #[serde(default, rename = "_ledger_validation")]
     pub ledger_validation: Option<LedgerValidationAttestation>,
 }
@@ -44,9 +54,7 @@ impl Tool for ReportFindingTool {
             tool_type: "function".into(),
             function: FunctionDefinition {
                 name: "report_finding".into(),
-                description: "Report a security finding. Recorded by SkepticGate into the \
-                    validated zone and persisted so it survives resume. Provide severity \
-                    and location for a usable report."
+                description: "Report a security finding. Recorded by SkepticGate into the                     validated zone and persisted so it survives resume. Provide severity                     and location for a usable report. When an authorized bounty program is                     active, a verified Hypothesis Ledger Resolution ID and an in-scope                     affected_asset are required. Evidence fields are artifacts already                     collected — never payloads or exploit recipes."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -59,8 +67,13 @@ impl Tool for ReportFindingTool {
                         "location": { "type": "string", "description": "Affected endpoint/parameter/component" },
                         "evidence": { "type": "string", "description": "Evidence supporting the finding (request/response excerpt)" },
                         "evidence_source": { "type": "string", "description": "Reference to the tool call / URL that produced the evidence" },
-                        "resolution_ids": { "type": "array", "items": {"type":"string"}, "description": "Persisted Ledger Resolution IDs. Required by Runtime for confirmed or not_vulnerable claims." },
-                        "details": { "type": "string", "description": "Additional details" }
+                        "resolution_ids": { "type": "array", "items": {"type":"string"}, "description": "Persisted Ledger Resolution IDs. Required by Runtime for confirmed or not_vulnerable claims. Required for every finding while a bounty program is active." },
+                        "affected_asset": { "type": "string", "description": "In-scope asset this finding affects (host or URL). Required while a bounty program is active." },
+                        "ledger_evidence_ids": { "type": "array", "items": {"type":"string"}, "description": "Ledger evidence record IDs already collected" },
+                        "screenshot_paths": { "type": "array", "items": {"type":"string"}, "description": "Paths of screenshots already collected" },
+                        "request_response_hashes": { "type": "array", "items": {"type":"string"}, "description": "Hashes of request/response artifacts already collected" },
+                        "log_excerpts": { "type": "array", "items": {"type":"string"}, "description": "Short log excerpts already collected (not payloads)" },
+                        "details": { "type": "string", "description": "Business/security impact. Not an exploit writeup." }
                     },
                     "required": ["title", "attack_type", "confidence", "evidence"]
                 }),

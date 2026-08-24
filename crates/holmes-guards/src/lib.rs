@@ -38,6 +38,9 @@ impl GuardChain {
         chain
             .pre
             .push(Box::new(pre::scope::ScopeGuard::new(&config.scope)));
+        // Bounty research workflow: self-disables unless a case-level program is
+        // active (except set_program_scope validation). Does not weaken other guards.
+        chain.pre.push(Box::new(pre::bounty::BountyPreGuard));
 
         if config.immutable_field {
             chain
@@ -92,6 +95,8 @@ impl GuardChain {
         }
         // Always on: captures the `write_todos` plan into AttackState for the frame.
         chain.post.push(Box::new(post::plan_tracker::PlanTracker));
+        // Always on: records authorized program scope + in-scope assets (free zone).
+        chain.post.push(Box::new(post::bounty::BountyPostGuard));
 
         chain
     }
@@ -140,13 +145,15 @@ mod tests {
 
         let chain = GuardChain::from_config(&config);
 
-        // ScopeGuard is always installed (self-disables without an allowlist); every
-        // other pre-guard is config-gated and disabled here.
-        assert_eq!(chain.pre.len(), 1);
+        // ScopeGuard + BountyPreGuard are always installed (self-disable without a
+        // program / allowlist); every other pre-guard is config-gated and disabled here.
+        assert_eq!(chain.pre.len(), 2);
         assert_eq!(chain.pre[0].name(), "scope");
-        // PlanTracker is always installed (not config-gated).
-        assert_eq!(chain.post.len(), 1);
+        assert_eq!(chain.pre[1].name(), "bounty");
+        // PlanTracker + BountyPostGuard are always installed (not config-gated).
+        assert_eq!(chain.post.len(), 2);
         assert_eq!(chain.post[0].name(), "plan_tracker");
+        assert_eq!(chain.post[1].name(), "bounty");
     }
 
     #[test]
@@ -159,8 +166,8 @@ mod tests {
         let chain = GuardChain::from_config(&config);
 
         // 4 config-gated (immutable_field, dangerous_command, repetition, file_tracker)
-        // + always-on scope guard.
-        assert_eq!(chain.pre.len(), 5);
-        assert_eq!(chain.post.len(), 7); // 6 config-gated + always-on plan_tracker
+        // + always-on scope + bounty pre-guards.
+        assert_eq!(chain.pre.len(), 6);
+        assert_eq!(chain.post.len(), 8); // 6 config-gated + plan_tracker + bounty
     }
 }

@@ -1,4 +1,5 @@
 pub mod background;
+pub mod bounty;
 pub mod config;
 pub mod error;
 pub mod event;

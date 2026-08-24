@@ -129,6 +129,13 @@ impl Default for CommandRegistry {
             args_hint: Some("[json|compact]"),
         });
         registry.register(CommandDef {
+            name: "bounty",
+            aliases: &[],
+            description: "查看当前案件授权 bounty/VDP 程序范围与资产清单",
+            category: "会话管理",
+            args_hint: None,
+        });
+        registry.register(CommandDef {
             name: "tree",
             aliases: &[],
             description: "显示会话树、事件时间线，或从指定事件分叉",
