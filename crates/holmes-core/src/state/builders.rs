@@ -1,6 +1,8 @@
 use super::immutable::ImmutableFields;
 use super::tool_truth::{AttackSurface, EvidenceBundle};
 use super::validated::Finding;
+use crate::bounty::BountyCase;
+use crate::event::Event;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -67,6 +69,11 @@ pub struct AttackState {
     /// Findings recorded this step that the runtime should persist as `FindingRecorded`
     /// events (drained after PostGuards run, so findings survive turn boundaries/resume).
     pub pending_findings: Vec<Finding>,
+    /// Authorized bounty/VDP program + in-scope asset inventory (free zone).
+    /// Findings are NOT stored here — SkepticGate remains the sole validated-zone writer.
+    pub bounty: BountyCase,
+    /// Program/asset/report events queued this step for durable persistence.
+    pub pending_bounty_events: Vec<Event>,
 }
 
 impl AttackState {
@@ -100,6 +107,8 @@ impl AttackState {
             last_progress_at: 0,
             file_access_tracker: HashMap::new(),
             pending_findings: Vec::new(),
+            bounty: BountyCase::default(),
+            pending_bounty_events: Vec::new(),
         }
     }
 
@@ -181,6 +190,11 @@ impl AttackState {
     /// Drain findings awaiting persistence (called by the runtime after PostGuards).
     pub fn take_pending_findings(&mut self) -> Vec<Finding> {
         std::mem::take(&mut self.pending_findings)
+    }
+
+    /// Drain bounty workflow events awaiting persistence.
+    pub fn take_pending_bounty_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.pending_bounty_events)
     }
 
     /// Raw mutable access to the validated zone.
