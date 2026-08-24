@@ -1,4 +1,5 @@
 pub mod background;
+pub mod bounty;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -25,7 +26,7 @@ pub use background::{BackgroundTasks, FinishedTask, TaskId, TaskState, TaskStatu
 pub fn stable_prompt_hash(prompt: &str) -> String {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(prompt.as_bytes());
+    let digest = Sha256.digest(prompt.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -34,7 +35,7 @@ pub fn stable_prompt_hash(prompt: &str) -> String {
 pub fn content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(content.as_bytes());
+    let digest = Sha256.digest(content.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
