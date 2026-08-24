@@ -6,7 +6,6 @@ use crate::types::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    // === Session Lifecycle ===
     SessionCreated {
         id: String,
         title: Option<String>,
@@ -46,8 +45,6 @@ pub enum Event {
         source: String,
         timestamp: DateTime<Utc>,
     },
-
-    // === Turn Boundaries ===
     UserMessage {
         content: String,
         timestamp: DateTime<Utc>,
@@ -57,8 +54,6 @@ pub enum Event {
         tokens_used: TokenDelta,
         sub_agents_spawned: Vec<String>,
     },
-
-    // === Goal System ===
     GoalSet {
         condition: String,
         plan: Option<String>,
@@ -83,8 +78,6 @@ pub enum Event {
         status: SubTaskStatus,
         note: Option<String>,
     },
-
-    // === Agent Thought & Action ===
     Thinking {
         content: String,
         reasoning_type: Option<String>,
@@ -93,43 +86,27 @@ pub enum Event {
         name: String,
         arguments: serde_json::Value,
         purpose: Option<String>,
-        /// Native tool-call id from the model response (P1-03). Correlates this
-        /// call with its `ToolResult`/`ToolBlocked` regardless of event ordering
-        /// or parallelism. `None` only in events written before call-id
-        /// persistence (serde default keeps old event payloads readable).
         #[serde(default)]
         call_id: Option<String>,
     },
     ToolResult {
         name: String,
-        /// Legacy compatibility projection. New code must derive success from
-        /// `outcome`; old events without it fall back to this boolean.
         success: bool,
-        /// Typed execution status added after schema v6. Optional so every historic
-        /// JSON event remains readable; `None` maps to Succeeded/Failed via `success`.
         #[serde(default)]
         outcome: Option<crate::tool_types::ToolOutcomeStatus>,
         content: String,
         error: Option<String>,
         artifacts: Vec<String>,
-        /// Native tool-call id of the call this result answers (P1-03).
         #[serde(default)]
         call_id: Option<String>,
     },
-    /// Audit record for a call that was never executed (permission / approval /
-    /// hook / guard / cancellation / budget denial). Replay synthesizes a
-    /// failure tool-result message from this event so the model history stays
-    /// legal; the guard name and reason stay here as audit metadata.
     ToolBlocked {
         tool_name: String,
         guard_name: String,
         reason: String,
-        /// Native tool-call id of the blocked call (P1-03).
         #[serde(default)]
         call_id: Option<String>,
     },
-
-    // === Situational Awareness ===
     TargetDiscovered {
         kind: TargetKind,
         details: serde_json::Value,
@@ -154,9 +131,6 @@ pub enum Event {
         poc: Option<String>,
         status: FindingStatus,
     },
-    /// A finding recorded by `SkepticGate` into the validated zone. Durable so findings
-    /// survive turn boundaries and session resume (the in-memory `AttackState` is rebuilt
-    /// each turn; these events are replayed back into it).
     FindingRecorded {
         id: String,
         finding_type: String,
@@ -216,8 +190,6 @@ pub enum Event {
         trust_paths: Vec<Vec<String>>,
         domain_info: Option<DomainInfo>,
     },
-
-    // === Deduction Ledger ===
     EvidenceObserved {
         evidence_id: String,
         summary: String,
@@ -278,8 +250,6 @@ pub enum Event {
         supporting_hypotheses: Vec<String>,
         evidence_ids: Vec<String>,
     },
-
-    // === Strategy & Reflection ===
     DirectiveSet {
         attack_type: Option<String>,
         objective: String,
@@ -306,8 +276,6 @@ pub enum Event {
         reasoning: String,
         auto_applied: bool,
     },
-
-    // === Mind Palace Operations ===
     MemoryStored {
         category: MemoryCategory,
         content: String,
@@ -340,8 +308,6 @@ pub enum Event {
         content_summary: String,
         timestamp: DateTime<Utc>,
     },
-
-    // === Context Management ===
     CompressionApplied {
         before_count: usize,
         after_count: usize,
@@ -369,8 +335,6 @@ pub enum Event {
         method: SummaryMethod,
         timestamp: DateTime<Utc>,
     },
-
-    // === Skill & Knowledge Injection ===
     SkillInjected {
         skill_name: String,
         source: InjectionSource,
@@ -403,30 +367,21 @@ pub enum Event {
         content: String,
         reason: String,
     },
-    /// Audit event: a long-term memory write was refused (e.g. sensitive
-    /// content, prompt injection). The content itself is never persisted —
-    /// only a short summary and the rejection reason.
     MemoryRejected {
         content_summary: String,
         reason: String,
     },
-    /// Two recalled memories are linked as conflicting (or one supersedes the
-    /// other); only the preferred one was injected.
     MemoryConflictDetected {
         suppressed_id: String,
         chosen_id: String,
         reason: String,
     },
-    /// Lifecycle transition of a memory/skill (staged → active, disabled,
-    /// archived, rolled back, validation recorded).
     MemoryStatusChanged {
         memory_id: String,
         from_status: String,
         to_status: String,
         reason: String,
     },
-
-    // === Sub-Agent ===
     SubAgentSpawned {
         sub_session_id: String,
         agent_type: AgentType,
@@ -450,16 +405,12 @@ pub enum Event {
         current_turn: u32,
         summary: Option<String>,
     },
-
-    // === Authorized bounty research workflow ===
     ProgramScopeSet {
         program: crate::bounty::ProgramScope,
     },
     AssetRecorded {
         asset: crate::bounty::DiscoveredAsset,
     },
-
-    // === Report ===
     ReportGenerated {
         report_type: ReportType,
         file_path: String,
@@ -467,3 +418,5 @@ pub enum Event {
         generated_by: ReportGenerator,
     },
 }
+
+include!("event_rest.rs");
