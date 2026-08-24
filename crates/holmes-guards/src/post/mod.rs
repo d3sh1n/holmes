@@ -1,4 +1,5 @@
 pub mod attack_surface;
+pub mod bounty;
 pub mod evidence_extractor;
 pub mod failure_tracker;
 pub mod file_tracker;

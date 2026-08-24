@@ -29,6 +29,16 @@ pub struct Finding {
     /// payload, restorable from the `blobs` tables alone).
     #[serde(default)]
     pub evidence_source: Option<String>,
+    /// Verified Hypothesis Ledger Resolution IDs that back this finding.
+    #[serde(default)]
+    pub resolution_ids: Vec<String>,
+    /// In-scope asset this finding affects (host / URL). Defaults to `location`.
+    #[serde(default)]
+    pub affected_asset: Option<String>,
+    /// Already-collected artifacts (ledger evidence IDs, screenshots, hashes, logs).
+    /// Not an exploit recipe.
+    #[serde(default)]
+    pub evidence_artifacts: crate::bounty::EvidenceArtifacts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

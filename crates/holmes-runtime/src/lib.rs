@@ -1,4 +1,5 @@
 pub mod action;
+pub mod bounty;
 pub mod cognition;
 pub mod compaction;
 pub mod completion;
