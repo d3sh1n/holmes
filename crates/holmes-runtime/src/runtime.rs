@@ -1664,7 +1664,7 @@ impl AgentRuntime {
                 let status_of = |id: &str| -> Option<String> {
                     let resolution_id = holmes_core::ledger::ResolutionId::new(id.to_string());
                     ledger.resolutions.get(&resolution_id).map(|resolution| {
-                        match resolution.status {
+                        match &resolution.status {
                             ResolvedStatus::Confirmed => "confirmed".to_string(),
                             ResolvedStatus::Rejected => "rejected".to_string(),
                             other => format!("{other:?}").to_lowercase(),

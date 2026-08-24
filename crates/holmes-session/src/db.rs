@@ -1828,6 +1828,8 @@ pub(crate) fn event_type_str(event: &Event) -> &'static str {
         Event::SubAgentCompleted { .. } => "subagent_completed",
         Event::SubAgentProgress { .. } => "subagent_progress",
         Event::ReportGenerated { .. } => "report_generated",
+        Event::ProgramScopeSet { .. } => "program_scope_set",
+        Event::AssetRecorded { .. } => "asset_recorded",
     }
 }
 

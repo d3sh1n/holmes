@@ -136,25 +136,22 @@ pub fn url_in_program_scope(program: &ProgramScope, url: &str) -> bool {
     if url_matches_any_prefix(url, &program.deny_url_prefixes()) {
         return false;
     }
-    if let Some(host) = host_of_url(url) {
-        if host_verdict(
-            &host,
-            &program.allow_hosts(),
-            &program.deny_hosts(),
-            program.allow_private,
-        )
-        .is_err()
-        {
-            return false;
+    if url_matches_any_prefix(url, &program.url_prefixes()) {
+        // A matching in-scope prefix is enough; still honor host-level denies.
+        if let Some(host) = host_of_url(url) {
+            if program
+                .deny_hosts()
+                .iter()
+                .any(|d| matches_entry(&host.to_lowercase(), d))
+            {
+                return false;
+            }
         }
+        return true;
     }
-    let prefixes = program.url_prefixes();
-    if prefixes.is_empty() {
-        return host_of_url(url)
-            .map(|h| host_in_program_scope(program, &h))
-            .unwrap_or(false);
-    }
-    url_matches_any_prefix(url, &prefixes)
+    host_of_url(url)
+        .map(|h| host_in_program_scope(program, &h))
+        .unwrap_or(false)
 }
 
 /// Host allow/deny matching used by ScopeGuard (exact host, domain suffix, IPv4 CIDR).

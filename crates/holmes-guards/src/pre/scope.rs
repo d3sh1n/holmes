@@ -44,6 +44,13 @@ impl ScopeGuard {
     pub fn enforcing(&self) -> bool {
         !self.allow.is_empty()
     }
+}
+
+#[async_trait::async_trait]
+impl PreGuard for ScopeGuard {
+    fn name(&self) -> &str {
+        "scope"
+    }
 
     async fn check(&self, call: &ToolCall, state: &AttackState) -> GuardVerdict {
         let program = state.bounty.program.as_ref();

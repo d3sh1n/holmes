@@ -119,15 +119,12 @@ impl ProgramScope {
     pub fn deny_hosts(&self) -> Vec<String> {
         let mut out = Vec::new();
         for entry in &self.out_of_scope {
+            // URL prefixes deny paths, not the whole host.
             match entry.kind {
                 ScopeAssetKind::Host | ScopeAssetKind::DomainSuffix | ScopeAssetKind::Cidr => {
                     out.push(normalize_entry(&entry.value));
                 }
-                ScopeAssetKind::UrlPrefix => {
-                    if let Some(host) = host_of_url(&entry.value) {
-                        out.push(normalize_entry(&host));
-                    }
-                }
+                ScopeAssetKind::UrlPrefix => {}
             }
         }
         out.sort();

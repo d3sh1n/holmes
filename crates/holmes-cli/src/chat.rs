@@ -1469,6 +1469,7 @@ fn render_case_report(
                 attack_type,
                 location,
                 evidence_source,
+                ..
             } => {
                 if confidence == "rejected" {
                     let ty = if finding_type.is_empty() {
