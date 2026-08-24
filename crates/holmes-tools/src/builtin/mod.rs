@@ -1,3 +1,4 @@
+pub mod bounty;
 pub mod browser;
 pub mod codec;
 pub mod execute_command;
@@ -43,6 +44,11 @@ pub fn register_all(
     registry.register(Box::new(report_finding::ReportFindingTool));
     registry.register(Box::new(report_progress::ReportProgressTool));
     registry.register(Box::new(report_recon::ReportReconTool));
+    registry.register(Box::new(bounty::SetProgramScopeTool));
+    registry.register(Box::new(bounty::GetProgramScopeTool));
+    registry.register(Box::new(bounty::RecordAssetTool));
+    registry.register(Box::new(bounty::ListAssetsTool));
+    registry.register(Box::new(bounty::GenerateBountyReportTool));
     if let Some(r) = runner {
         // The background task registry must be the SAME handle the surface wires into
         // the runtime context, or completions would never be drained/injected. A
